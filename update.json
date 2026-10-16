@@ -1,0 +1,26 @@
+{
+  "version": "2.1.0",
+  "notes": "واجهة جديدة: لوحة الملفات، الرد على جزء، شجرة التفكير، الرصيد التلقائي",
+  "files": [
+    {
+      "name": "deepseek_chat.py",
+      "sha256": "720fcf59f495a73423c58614b13daa61f17b7764218f468f509e29f3325d232f"
+    },
+    {
+      "name": "guard.py",
+      "sha256": "32991d18fed1df9d8aea45bc80534a20fdb3e657be7db1b7b76b6af02ef48421"
+    },
+    {
+      "name": "5belan.png",
+      "sha256": "2995b3e9e25c37d0a3bb7221b0b2dae3b9b998cf6b715ac240f5ae1659f9ce46"
+    },
+    {
+      "name": "5belan.ico",
+      "sha256": "69cc2607cb22abe07f81d19a88d0243610e253d2e33b712e75eda211147d7343"
+    },
+    {
+      "name": "requirements.txt",
+      "sha256": "1f6b78861c746c1f477d0dc9210f833e281de8472bf86d56b8ddc8df2a8bba98"
+    }
+  ]
+}
