@@ -121,6 +121,9 @@ IMAGE_MIME = {
 }
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_TEXT_CHARS = 1_500_000
+DOC_INLINE_MAX = 70_000   # longer documents are digested instead of being pasted whole
+DOC_CHUNK = 16_000
+DOC_MAX_PARTS = 70
 
 SYSTEM_PROMPT = (
     "You are خبيلان (5belan), a helpful AI assistant and agent running inside a desktop app that can save files, "
@@ -2557,6 +2560,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QGridLayout,
     QSpinBox,
+    QSystemTrayIcon,
+    QProgressDialog,
     QStyle,
     QApplication,
     QSizePolicy,
@@ -2774,7 +2779,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.12.4"
+APP_VERSION = "2.13.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -2968,6 +2973,7 @@ def restart_app(key=""):
     if os.name == "nt":
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
     env = dict(os.environ)
+    env["BELAN_RESTART"] = "1"  # tells the new process to wait for this one to leave (single-instance check)
     if key:
         env["BELAN_TMP_KEY"] = key  # survives the restart even if "remember the key" is off; never written to disk
     subprocess.Popen(args, cwd=BASE_DIR, creationflags=flags, close_fds=True, env=env)
@@ -4611,9 +4617,25 @@ class ActivityDialog(QDialog):
             "ok" if e.get("ok") else "failed") for e in self.shown))
 
 
-TRIGGERS = (("يدوي فقط", "manual"), ("كل ساعة", "hourly"), ("يومياً", "daily"), ("أسبوعياً", "weekly"), ("عند ظهور ملف جديد في مجلد", "watch"))
+TRIGGERS = (("يدوي فقط", "manual"), ("كل ساعة", "hourly"), ("يومياً", "daily"), ("أسبوعياً", "weekly"), ("عند ظهور ملف جديد في مجلد", "watch"), ("عند تغيّر صفحة ويب", "page"))
+PAGE_EVERY = (("كل 15 دقيقة", 15), ("كل 30 دقيقة", 30), ("كل ساعة", 60), ("كل 6 ساعات", 360), ("يومياً", 1440))
 WEEKDAYS = ("الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد")
 
+
+
+def page_text(url, limit=30000):
+    """Downloads a web page and returns its visible text (scripts/styles/tags removed)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (5belan page watch)", "Accept-Language": "ar,en;q=0.8"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        raw = r.read(3_000_000)
+        cs = r.headers.get_content_charset() or "utf-8"
+    h = raw.decode(cs, errors="replace")
+    h = re.sub(r"(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>", " ", h)
+    h = re.sub(r"(?s)<!--.*?-->", " ", h)
+    h = re.sub(r"(?s)<[^>]+>", "\n", h)
+    h = html.unescape(h)
+    lines = [re.sub(r"[ \t\u00a0]+", " ", x).strip() for x in h.split("\n")]
+    return "\n".join(x for x in lines if x)[:limit]
 
 
 # ---------- Telegram bot link ----------
@@ -4938,6 +4960,16 @@ class TasksDialog(QDialog):
         wrow.addWidget(self.watch_btn)
         right.addWidget(self.watch_lbl)
         right.addLayout(wrow)
+        self.url_lbl = QLabel("رابط الصفحة")
+        self.url = QLineEdit()
+        self.url.setLayoutDirection(Qt.LeftToRight)
+        self.url.setPlaceholderText("https://...")
+        self.every = QComboBox()
+        for t_, _m in PAGE_EVERY:
+            self.every.addItem(t_)
+        right.addWidget(self.url_lbl)
+        right.addWidget(self.url)
+        right.addWidget(self.every)
         right.addWidget(head("المجلدات اللي يقدر يقرأها"))
         self.dirs = QListWidget()
         self.dirs.setLayoutDirection(Qt.LeftToRight)
@@ -4995,6 +5027,8 @@ class TasksDialog(QDialog):
         self.weekday.setVisible(k == "weekly")
         for w in (self.watch_lbl, self.watch, self.watch_btn):
             w.setVisible(k == "watch")
+        for w in (self.url_lbl, self.url, self.every):
+            w.setVisible(k == "page")
 
     def refill(self, sel=0):
         self.cur = -1
@@ -5024,6 +5058,8 @@ class TasksDialog(QDialog):
         t["time"] = self.time.time().toString("HH:mm")
         t["weekday"] = self.weekday.currentIndex()
         t["watch"] = self.watch.text().strip()
+        t["url"] = self.url.text().strip()
+        t["every"] = PAGE_EVERY[max(0, self.every.currentIndex())][1]
         t["avoid_peak"] = self.avoid.isChecked()
         t["think"] = self.think.currentText()
         if t["trigger"] == "watch" and t["watch"] and t["watch"] not in t["dirs"]:
@@ -5042,7 +5078,7 @@ class TasksDialog(QDialog):
         self.cur = row
         on = 0 <= row < len(self.tasks)
         for w in (self.enabled, self.name, self.prompt, self.dirs, self.write, self.trigger, self.time, self.weekday,
-                  self.watch, self.watch_btn, self.avoid, self.think):
+                  self.watch, self.watch_btn, self.url, self.every, self.avoid, self.think):
             w.setEnabled(on)
         t = self.tasks[row] if on else {}
         self.enabled.setChecked(t.get("enabled", True))
@@ -5058,6 +5094,9 @@ class TasksDialog(QDialog):
         self.time.setTime(self._QTime(int(hh or 9), int(mm or 0)))
         self.weekday.setCurrentIndex(int(t.get("weekday", 0)) % 7)
         self.watch.setText(t.get("watch", ""))
+        self.url.setText(t.get("url", ""))
+        mins = [m_ for _t, m_ in PAGE_EVERY]
+        self.every.setCurrentIndex(mins.index(t.get("every", 60)) if t.get("every", 60) in mins else 2)
         self.avoid.setChecked(bool(t.get("avoid_peak")))
         i = self.think.findText(t.get("think", "off"))
         self.think.setCurrentIndex(max(0, i))
@@ -5730,6 +5769,7 @@ class App(QMainWindow):
         self.update_peak()
         self._bg_running = set()
         self._bg_pending = []
+        self._page_busy = set()
         self._watch_sizes = {}
         self.task_timer = QTimer(self)
         self.task_timer.timeout.connect(self.tick_tasks)
@@ -5738,6 +5778,7 @@ class App(QMainWindow):
         self.refresh_projects()
         self.proj_box.currentIndexChanged.connect(self.on_project_changed)
         self._tg_busy = False
+        self.setup_tray()
         self.tg_bridge = TgBridge(lambda: self.cfg.get("tg") or {})
         self.tg_bridge.got.connect(self.on_tg_msg)
         self.tg_bridge.paired.connect(self.on_tg_paired)
@@ -7364,6 +7405,92 @@ class App(QMainWindow):
     def open_activity(self):
         self.open_dock("activity", "سجل النشاط", lambda: ActivityDialog(self), width=560)
 
+    # ---------- system tray: closing the window keeps the app (and its tasks) running ----------
+    def setup_tray(self):
+        self.tray = None
+        self._quitting = False
+        self._tray_hinted = False
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = QIcon(ICON_PATH) if os.path.exists(ICON_PATH) else self.style().standardIcon(QStyle.SP_ComputerIcon)
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip("خبيلان")
+        m = QMenu()
+        m.addAction("فتح خبيلان", self.show_from_tray)
+        self.act_tray = m.addAction("الإغلاق بزر × يخفيه بالخلفية")
+        self.act_tray.setCheckable(True)
+        self.act_tray.setChecked(self.cfg.get("close_to_tray", True) is not False)
+        self.act_tray.toggled.connect(lambda on: (self.cfg.__setitem__("close_to_tray", bool(on)), self.save_cfg()))
+        m.addSeparator()
+        m.addAction("خروج", self.quit_app)
+        self._tray_menu = m
+        self.tray.setContextMenu(m)
+        self.tray.activated.connect(lambda r: self.show_from_tray() if r in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None)
+        self.tray.show()
+        QApplication.setQuitOnLastWindowClosed(False)
+        try:  # the computer is shutting down / the user is signing out
+            QApplication.instance().commitDataRequest.connect(self.on_session_end)
+        except Exception:
+            pass
+
+    def show_from_tray(self):
+        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def work_running(self):
+        return bool(self.busy or self._bg_running)
+
+    def on_session_end(self, mgr):
+        try:
+            if self.work_running() and mgr.allowsInteraction():
+                if QMessageBox.question(self, "إغلاق الجهاز",
+                                        "فيه رد أو مهمة تشتغل الحين. لو انطفى الجهاز تتوقف.\nتبي تلغي الإغلاق؟") == YES:
+                    mgr.cancel()
+                    return
+        except Exception:
+            pass
+        self._quitting = True
+        try:
+            self.persist()
+        except Exception:
+            pass
+
+    def quit_app(self):
+        if self.work_running() and QMessageBox.question(
+                self, "خروج", "فيه رد أو مهمة تشتغل الحين. لو طلعت تتوقف.\nتطلع؟") != YES:
+            return
+        self._quitting = True
+        try:
+            self.persist()
+        except Exception:
+            pass
+        QApplication.quit()
+
+    def closeEvent(self, e):
+        if self.tray is not None and not self._quitting and self.cfg.get("close_to_tray", True) is not False:
+            e.ignore()
+            self.hide()
+            if not self._tray_hinted:
+                self._tray_hinted = True
+                try:
+                    self.tray.showMessage("خبيلان يشتغل بالخلفية", "المهام تكمل شغلها. اضغط الأيقونة لفتحه، أو كليك يمين ثم «خروج».",
+                                          QSystemTrayIcon.Information, 6000)
+                except Exception:
+                    pass
+            return
+        if not self._quitting and self.work_running() and QMessageBox.question(
+                self, "خروج", "فيه رد أو مهمة تشتغل الحين. لو طلعت تتوقف.\nتطلع؟") != YES:
+            e.ignore()
+            return
+        self._quitting = True
+        try:
+            self.persist()
+        except Exception:
+            pass
+        e.accept()
+
     # ---------- side panels on the left ----------
     def open_dock(self, key, title, make_dialog, on_accept=None, width=420):
         """Shows a tool (memory, usage, tasks...) as a column next to the chat instead of a pop-up window."""
@@ -7494,6 +7621,12 @@ class App(QMainWindow):
             elif trig == "watch":
                 files = self.scan_watch(t)
                 due = bool(files)
+            elif trig == "page":
+                if t.get("url") and now - t.get("last_check", 0) >= int(t.get("every", 60)) * 60 and t["id"] not in self._page_busy:
+                    t["last_check"] = now
+                    self._page_busy.add(t["id"])
+                    threading.Thread(target=self.page_worker, args=(dict(t),), daemon=True).start()
+                continue
             if not due:
                 continue
             if t.get("avoid_peak") and is_peak():
@@ -7615,6 +7748,33 @@ class App(QMainWindow):
         tg = self.tg_ready()
         if tg:
             threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], out2), daemon=True).start()
+
+    def page_worker(self, t):
+        """Background thread: downloads the page and compares it with the last copy."""
+        try:
+            d_ = os.path.join(DATA_DIR, "pages")
+            os.makedirs(d_, exist_ok=True)
+            fp = os.path.join(d_, re.sub(r"[^A-Za-z0-9_-]", "_", t["id"]) + ".txt")
+            new = page_text(t["url"])
+            if not new.strip():
+                raise RuntimeError("the page has no readable text")
+            old = None
+            if os.path.exists(fp):
+                with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                    old = f.read()
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(new)
+            if old is None:
+                self.q.put(("page_note", "بدأت أراقب الصفحة: " + t["url"]))
+            elif old != new:
+                import difflib
+                diff = [x for x in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=0)
+                        if (x.startswith("+") or x.startswith("-")) and not x.startswith(("+++", "---"))]
+                self.q.put(("page_changed", (t, "\n".join(diff)[:6000])))
+        except Exception as e:
+            log_event("page watch failed (%s): %s" % (t.get("url"), e))
+        finally:
+            self.q.put(("page_done", t["id"]))
 
     def start_bg(self, task, files=None, manual=False):
         key = self.key_edit.text().strip()
@@ -7818,6 +7978,16 @@ class App(QMainWindow):
         if not self.current:
             return
         self.current["project"] = pid
+        proj = self.get_project(pid)
+        dirs = [d for d in ((proj or {}).get("dirs") or []) if os.path.isdir(d)]
+        if dirs:  # the project's folders become available in this chat too
+            st = self.current.setdefault("settings", {})
+            have = list(st.get("allowed_dirs") or [])
+            st["allowed_dirs"] = have + [d for d in dirs if d not in have]
+            st["tools_enabled"] = True
+            self.allowed_dirs = list(st["allowed_dirs"])
+            self.tools_enabled = True
+            self.update_settings_summary()
         self.persist()
         self.refresh_list()
 
@@ -8220,6 +8390,72 @@ class App(QMainWindow):
         self.refresh_files_label()
 
     # ---------- sending ----------
+    def digest_big(self, path, name, body, question):
+        """A very long document is read part by part (in parallel) and the model gets an outline plus what is relevant
+        to the user's question, instead of one huge paste."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        key = self.key_edit.text().strip()
+        if not key:
+            raise RuntimeError("اكتب مفتاح API أول.")
+        parts = [body[i:i + DOC_CHUNK] for i in range(0, len(body), DOC_CHUNK)]
+        if len(parts) > DOC_MAX_PARTS:
+            raise RuntimeError("الملف %s ضخم جداً (%d حرف). قسّمه أو اقتطع الجزء اللي يهمك." % (name, len(body)))
+        q = (question or "").strip()[:1500]
+        sysmsg = ("You read ONE part of a long document. Reply in exactly this format, in the document's own language:\n"
+                  "TITLE: <3-8 word heading of this part>\nSUMMARY: <1-2 sentences with key names and figures>\n"
+                  "RELEVANT: <details from this part that matter for the user's question, with exact figures, or NONE>")
+        done = {"n": 0}
+
+        def one(i):
+            try:
+                u = ("User's question: %s\n\n" % q if q else "") + "Part %d of %d:\n%s" % (i + 1, len(parts), parts[i])
+                msg, _u = api_chat(key, MODELS[0], [{"role": "system", "content": sysmsg}, {"role": "user", "content": u}], timeout=240)
+                return msg.get("content") or ""
+            except Exception as e:
+                return "TITLE: part %d\nSUMMARY: [could not be read: %s]\nRELEVANT: NONE" % (i + 1, str(e)[:80])
+            finally:
+                done["n"] += 1
+
+        dlg = QProgressDialog("أقرأ الملف الكبير %s جزء بجزء..." % name, "إلغاء", 0, len(parts), self)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowTitle("قراءة ملف كبير")
+        ex = ThreadPoolExecutor(max_workers=4)
+        futs = [ex.submit(one, i) for i in range(len(parts))]
+        try:
+            while not all(f.done() for f in futs):
+                dlg.setValue(done["n"])
+                QApplication.processEvents()
+                if dlg.wasCanceled():
+                    for f in futs:
+                        f.cancel()
+                    raise RuntimeError("تم إلغاء قراءة الملف %s." % name)
+                time.sleep(0.05)
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+            dlg.close()
+        res = [f.result() for f in futs]
+        outline, rel = [], []
+        for i, r in enumerate(res):
+            m_t = re.search(r"TITLE:\s*(.+)", r)
+            m_s = re.search(r"SUMMARY:\s*(.+)", r)
+            m_r = re.search(r"RELEVANT:\s*(.+?)(?=\n[A-Z]+:|\Z)", r, re.S)
+            outline.append("Part %d (chars %d-%d) %s: %s" % (i + 1, i * DOC_CHUNK, min(len(body), (i + 1) * DOC_CHUNK),
+                                                            m_t.group(1).strip() if m_t else "", m_s.group(1).strip() if m_s else r.strip()[:200]))
+            if m_r and m_r.group(1).strip().upper() != "NONE":
+                rel.append("[Part %d] %s" % (i + 1, m_r.group(1).strip()))
+        out = ["[This file is very long (%d characters, %d parts), so it was read part by part. Below: the start of the file, an outline, %s]"
+               % (len(body), len(parts), "and the details relevant to the user's question." if q else "and no question to focus on yet.")]
+        out.append("== Start of the file ==\n" + body[:2500])
+        out.append("== Outline ==\n" + "\n".join(outline))
+        if rel:
+            out.append("== Relevant to the question ==\n" + "\n\n".join(rel)[:40000])
+        elif q:
+            out.append("== Relevant to the question ==\nNothing in the file matched the question.")
+        out.append("(If the user needs exact text from a specific part, tell them the part number and ask them to attach or quote it.)")
+        return "\n\n".join(out)
+
     def build_user_content(self, text, model):
         """Returns (content, shown_names). content is str or list of blocks."""
         doc_parts = []
@@ -8245,6 +8481,8 @@ class App(QMainWindow):
                     raise RuntimeError("%s: %s" % (name, e))
                 except Exception as e:
                     raise RuntimeError("تعذّرت قراءة %s: %s" % (name, e))
+                if len(body) > DOC_INLINE_MAX:
+                    body = self.digest_big(path, name, body, text)
                 doc_parts.append("--- File: %s ---\n%s\n--- End of %s ---" % (name, body, name))
             names.append(name)
         full_text = text
@@ -8823,6 +9061,17 @@ class App(QMainWindow):
                     self.balance_btn.setText("الرصيد " + str(val))
             elif kind == "bg_done":
                 self.on_bg_done(*val)
+            elif kind == "page_done":
+                self._page_busy.discard(val)
+            elif kind == "page_note":
+                self.statusBar().showMessage(val, 5000)
+            elif kind == "page_changed":
+                t_, diff_ = val
+                self.tg_notify("تغيّرت الصفحة: %s" % t_.get("url"))
+                t2 = dict(t_)
+                t2["prompt"] = (t_.get("prompt", "").strip() + "\n\nالصفحة %s تغيّرت. هذا الفرق (السطور اللي تبدأ بـ - انحذفت، واللي تبدأ بـ + انضافت):\n%s"
+                                % (t_.get("url"), diff_))
+                self.start_bg(t2)
             elif kind == "journal":
                 if self.current is not None:
                     j_ = self.current.setdefault("journal", [])
@@ -9056,7 +9305,37 @@ def main():
                 pass
 
     sys.excepthook = hook
+    # only one copy: a second launch just brings the first one back (it may be hidden in the tray)
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    srv_name = "5belan-" + hashlib.md5(DATA_DIR.encode("utf-8", "replace")).hexdigest()[:10]
+    restarting = bool(os.environ.pop("BELAN_RESTART", ""))
+    deadline = time.time() + (12 if restarting else 0)
+    while True:
+        sock = QLocalSocket()
+        sock.connectToServer(srv_name)
+        if sock.waitForConnected(400):
+            if restarting and time.time() < deadline:
+                sock.disconnectFromServer()
+                time.sleep(0.5)
+                continue
+            sock.write(b"show")
+            sock.flush()
+            sock.waitForBytesWritten(800)
+            sys.exit(0)
+        break
+    QLocalServer.removeServer(srv_name)
+    server = QLocalServer()
+    server.listen(srv_name)
     win = App()
+    win._single_server = server
+
+    def on_other_launch():
+        c = server.nextPendingConnection()
+        if c is not None:
+            c.close()
+        win.show_from_tray()
+
+    server.newConnection.connect(on_other_launch)
     win.show()
     sys.exit(app.exec())
 
