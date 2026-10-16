@@ -3019,7 +3019,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.15.1"
+APP_VERSION = "2.15.2"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -8336,16 +8336,22 @@ class App(QMainWindow):
             return
         send = lambda t: threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], t), daemon=True).start()
         cmd = text.split()[0].lower() if text.startswith("/") else ""
+        if getattr(self, "_tg_pick", False):
+            if text.strip().isdigit():
+                text, cmd = "/open " + text.strip(), "/open"  # right after the list, just the number picks a chat
+            else:
+                self._tg_pick = False
         if cmd in ("/help", "/start"):
-            send("الأوامر:\n/chats محادثاتك اللي بالتطبيق\n/open عرض المحادثات، و/open رقم لاختيار وحدة وكمّلها من هنا\n/read [عدد] قراءة آخر رسائل المحادثة المختارة\n"
+            send("الأوامر:\n/chats محادثاتك اللي بالتطبيق\n/open عرض المحادثات ثم اكتب رقم وحدة منها بس\n/read [عدد] قراءة آخر رسائل المحادثة المختارة\n"
                  "/where أي محادثة مختارة الحين\n/new محادثة تليقرام جديدة (منفصلة)\n/status حالة التطبيق\n/tasks مهامك\n/run رقم_أو_اسم تشغيل مهمة\n"
                  "وأي نص ثاني يروح للمحادثة المختارة (بدون اختيار: محادثة تليقرام الخاصة).")
             return
         if cmd in ("/chats", "/open") and not (cmd == "/open" and text[5:].strip()):
             lst = sorted([c for c in self.chats if c.get("id") != "telegram" and c.get("msgs")], key=lambda c: -float(c.get("updated", 0)))[:12]
             self._tg_map = [c["id"] for c in lst]
+            self._tg_pick = bool(lst)
             send(("\n".join("%d) %s" % (i + 1, (c.get("title") or "بدون عنوان")[:45]) for i, c in enumerate(lst))
-                  + "\n\nاكتب /open ورقم المحادثة، مثال: /open 1") if lst else "ما فيه محادثات.")
+                  + "\n\nاكتب رقم المحادثة بس عشان تختارها.") if lst else "ما فيه محادثات.")
             return
         if cmd == "/open":
             arg = text[5:].strip()
@@ -8358,6 +8364,7 @@ class App(QMainWindow):
                 send("المحادثة ما عادت موجودة.")
                 return
             self._tg_target = ch_["id"]
+            self._tg_pick = False
             send("اخترت: %s\n\n%s\n\nأي رسالة تكتبها الحين تكمل هذي المحادثة." % (ch_.get("title") or "", self._tg_tail(ch_, 2)))
             return
         if cmd == "/read":
