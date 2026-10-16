@@ -933,6 +933,7 @@ def strip_for_save(msg):
 TOOL_READ_CHUNK = 40000
 TOOL_MAX_ROUNDS = 400
 RENDER_LAST_MSGS = 40      # messages drawn in the window (older ones stay saved)
+DETAIL_BOX_MAX = 300      # tallest the thinking box gets before it scrolls inside
 LIVE_DETAIL_STEPS = 30     # steps drawn while a reply is running
 DETAIL_TEXT_CAP = 4000     # characters of one step shown in the details
 CONTEXT_TRIM_CHARS = 350000   # above this, old tool results get shortened before each request
@@ -2846,6 +2847,70 @@ def _clean_title(text, limit=58):
     return t
 
 
+_SUMMARY_KEYS = {
+    "read_file": "read", "analyze_file": "analyze", "list_folder": "list", "search_files": "search",
+    "write_file": "write", "edit_file": "write", "save_notes": "write", "make_dir": "mkdir",
+    "move_path": "delete", "delete_path": "delete", "run_command": "cmd", "run_python": "py", "pip_install": "pip",
+    "browser_open": "browse", "browser_read": "browse_x", "browser_click": "browse_x", "browser_type": "browse_x", "browser_back": "browse_x",
+    "open_program": "open", "open_in_chrome": "open", "submit_plan": "plan",
+}
+_SUMMARY_TEXT = {
+    "read": ("قرأ ملف", "قرأ %d ملفات"), "analyze": ("حلّل ملف", "حلّل %d ملفات"),
+    "list": ("استعرض مجلد", "استعرض %d مجلدات"), "search": ("بحث في الملفات", "بحث في الملفات %d مرات"),
+    "write": ("كتب أو عدّل ملف", "كتب أو عدّل %d ملفات"), "mkdir": ("أنشأ مجلد", "أنشأ %d مجلدات"),
+    "delete": ("نقل أو حذف عنصر", "نقل أو حذف %d عناصر"), "cmd": ("نفّذ أمر", "نفّذ %d أوامر"),
+    "py": ("شغّل كود بايثون", "شغّل كود بايثون %d مرات"), "pip": ("ثبّت مكتبات بايثون", "ثبّت مكتبات بايثون"),
+    "browse": ("تصفّح صفحة", "تصفّح %d صفحات"), "open": ("فتح برنامج أو موقع", "فتح %d برامج أو مواقع"),
+    "plan": ("وضع خطة", "وضع خطة"),
+}
+
+
+def summarize_tools(tools):
+    """One short line saying what a group of tool steps did, e.g. 'قرأ 3 ملفات وعدّل ملف'."""
+    counts = {}
+    order = []
+    for t in tools:
+        k = _SUMMARY_KEYS.get(t.get("name"))
+        if not k:
+            continue
+        if k == "browse_x":
+            k = "browse"
+            if k not in counts:
+                counts[k] = 1
+                order.append(k)
+            continue
+        if k not in counts:
+            counts[k] = 0
+            order.append(k)
+        counts[k] += 1
+    parts = []
+    for k in order[:3]:
+        one, many = _SUMMARY_TEXT[k]
+        parts.append(one if counts[k] == 1 or "%d" not in many else many % counts[k])
+    if not parts:
+        return ""
+    return parts[0] if len(parts) == 1 else "، ".join(parts[:-1]) + " و" + parts[-1]
+
+
+def _node_tools(n):
+    out = [it for it in n["items"] if it.get("k") == "tool"]
+    for sub in n["subs"]:
+        out += _node_tools(sub)
+    return out
+
+
+def _node_sig(n):
+    return tuple(sorted({(_SUMMARY_KEYS.get(t.get("name")) or "x").replace("browse_x", "browse") for t in _node_tools(n)}))
+
+
+def _name_nodes(n):
+    t = summarize_tools(_node_tools(n))
+    if t:
+        n["title"] = t
+    for sub in n["subs"]:
+        _name_nodes(sub)
+
+
 def build_activity_tree(steps):
     """Turn the flat activity list into a tree: main topic > sub topic > sub-sub topic, each with its items.
 
@@ -2925,7 +2990,17 @@ def build_activity_tree(steps):
             else:
                 stack[-1]["items"].append(step)
     flush()
-    return mains
+    for m_ in mains:
+        _name_nodes(m_)
+    merged = []
+    for m_ in mains:  # neighbouring rounds that did the same kind of work become one topic
+        if merged and _node_tools(m_) and _node_sig(merged[-1]) == _node_sig(m_):
+            merged[-1]["items"] += m_["items"]
+            merged[-1]["subs"] += m_["subs"]
+            _name_nodes(merged[-1])
+        else:
+            merged.append(m_)
+    return merged
 
 
 def auto_direction_option():
@@ -2944,7 +3019,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.14.0"
+APP_VERSION = "2.14.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -3224,6 +3299,9 @@ class ChatView(QTextBrowser):
     def resizeEvent(self, e):
         self._apply_margin()
         super().resizeEvent(e)
+        cb = getattr(self, "on_resized", None)
+        if cb:
+            cb()
 
     # ----- coordinates
     def _to_doc(self, p):
@@ -5715,6 +5793,8 @@ class App(QMainWindow):
         self._open_slot = None
         self.live = None  # the reply that is being streamed right now
         self.open_acts = set()  # which Thinking blocks are expanded
+        self._boxes = {}
+        self._box_scroll = {}
         self.open_secs = set()  # which topics inside a Thinking block are opened
         self.quotes = []
         self._last_quotes = []
@@ -5933,6 +6013,10 @@ class App(QMainWindow):
         ml.addWidget(header)
 
         self.view = ChatView()
+        self.view.verticalScrollBar().valueChanged.connect(lambda _v: self._schedule_place())
+        self.view.verticalScrollBar().rangeChanged.connect(lambda *_a: self._schedule_place())
+        self.view.document().documentLayout().documentSizeChanged.connect(lambda *_a: self._schedule_place())
+        self.view.on_resized = self._schedule_place
         self.view.setOpenLinks(False)
         self.view.anchorClicked.connect(self.on_anchor)
         self.view.setFont(QFont(FONT["family"], TEXT_FONT_SIZE))
@@ -7211,6 +7295,7 @@ class App(QMainWindow):
     def render_chat(self, keep_scroll=False):
         sb = self.view.verticalScrollBar()
         keep = sb.value()
+        self._drop_boxes()
         self.view.clear()
         self.reply_ranges = []
         self.copy_store.clear()
@@ -7314,7 +7399,7 @@ class App(QMainWindow):
                 if live and len(steps) > LIVE_DETAIL_STEPS:
                     hidden = len(steps) - LIVE_DETAIL_STEPS
                     shown_steps = [{"k": "note", "text": "... %d earlier steps hidden while it is running; the full list appears when it finishes" % hidden}] + steps[-LIVE_DETAIL_STEPS:]
-                self._render_details(c, shown_steps, act_id, live)
+                self._render_details_box(c, shown_steps, act_id, live)
                 c = self._end_cursor()
             c.insertBlock(QTextBlockFormat(), QTextCharFormat())
         for w in warns:
@@ -7336,6 +7421,98 @@ class App(QMainWindow):
                         af.setAnchorHref("src:" + sr["url"])
                         af.setForeground(QColor(THEMES[self.theme]["accent"]))
                         c2.insertText("%d. %s" % (n_, sr.get("title") or sr["url"]), af)
+
+    def _drop_box(self, act_id):
+        ent = self._boxes.pop(act_id, None)
+        if ent is None:
+            return
+        _cur, w = ent
+        try:
+            sb = w.verticalScrollBar()
+            self._box_scroll[act_id] = (sb.value(), sb.value() >= sb.maximum() - 6)
+        except Exception:
+            pass
+        w.hide()
+        w.setParent(None)
+        w.deleteLater()
+
+    def _drop_boxes(self):
+        for k in list(self._boxes):
+            self._drop_box(k)
+
+    def _place_boxes(self):
+        vp = self.view.viewport()
+        for act_id, (cur, w) in list(self._boxes.items()):
+            try:
+                r = self.view.cursorRect(cur)
+            except Exception:
+                continue
+            x = 10
+            wd = max(120, vp.width() - 20)
+            h = w.property("boxh") or 200
+            if r.bottom() < -h or r.top() > vp.height() + h:
+                w.hide()
+                continue
+            w.setGeometry(x, r.top() + 2, wd, h)
+            w.show()
+
+    def _schedule_place(self):
+        if not getattr(self, "_place_pending", False):
+            self._place_pending = True
+            QTimer.singleShot(0, self._do_place)
+
+    def _do_place(self):
+        self._place_pending = False
+        self._place_boxes()
+
+    def _render_details_box(self, c, steps, act_id="x", live=False):
+        """The thinking outline sits in its own scrollable box, so a long outline never pushes the answer far down."""
+        vp = self.view.viewport()
+        wd = max(120, vp.width() - 20)
+        box = QTextBrowser(vp)
+        box.setOpenLinks(False)
+        box.setOpenExternalLinks(False)
+        box.setFrameShape(QFrame.NoFrame)
+        box.setLayoutDirection(Qt.RightToLeft)
+        box.setStyleSheet("QTextBrowser { background: transparent; border: none; }")
+        box.document().setDefaultTextOption(auto_direction_option())
+        box.document().setDocumentMargin(0)
+        box.anchorClicked.connect(lambda u: self.on_anchor(u))
+        cb = QTextCursor(box.document())
+        self._render_details(cb, steps, act_id, live)
+        box.document().setTextWidth(wd)
+        h = int(box.document().size().height()) + 6
+        h = max(60, min(DETAIL_BOX_MAX, h))
+        box.setProperty("boxh", h)
+        # a transparent placeholder of the same height reserves the space in the chat
+        tf = QTextTableFormat()
+        tf.setBorder(1)
+        tf.setBorderBrush(QColor(128, 128, 128, 90))
+        tf.setBorderStyle(QTextFrameFormat.BorderStyle_Solid)
+        tf.setCellPadding(2)
+        tf.setCellSpacing(0)
+        tf.setMargin(4)
+        tf.setWidth(QTextLength(QTextLength.PercentageLength, 100))
+        table = c.insertTable(1, 1, tf)
+        img = QImage(4, h, QImage.Format_ARGB32)
+        img.fill(0)
+        cell_c = table.cellAt(0, 0).firstCursorPosition()
+        cell_c.insertImage(img)
+        keep = QTextCursor(table.cellAt(0, 0).firstCursorPosition())
+        self._drop_box(act_id)
+        self._boxes[act_id] = (keep, box)
+        saved = self._box_scroll.get(act_id)
+
+        def restore(b=box, sv=saved, lv=live):
+            sb = b.verticalScrollBar()
+            if sv is None or sv[1]:
+                sb.setValue(sb.maximum() if (lv or sv is not None) else 0)
+            else:
+                sb.setValue(sv[0])
+
+        QTimer.singleShot(0, restore)
+        box.show()
+        self._schedule_place()
 
     def _render_details(self, c, steps, act_id="x", live=False):
         """The thinking outline: a soft card with one row per topic. A coloured dot shows the outcome at a glance
@@ -7587,6 +7764,7 @@ class App(QMainWindow):
         sb = self.view.verticalScrollBar()
         keep = sb.value()
         at_bottom = keep >= sb.maximum() - 24
+        self._drop_box("live")
         c = QTextCursor(self.view.document())
         c.setPosition(self.reply_start)
         c.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
