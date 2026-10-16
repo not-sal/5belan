@@ -1,10 +1,10 @@
 {
-  "version": "2.5.0",
-  "notes": "Chat width option (3 margin sizes), browser above files in one column, text labels on chat buttons",
+  "version": "2.6.0",
+  "notes": "2.6.0: الاقتباس لردود خبيلان فقط وزر الرد فوق مربع الكتابة، مشبك للإرفاق، زر إرسال واضح، المجلدات كمربعات لكل محادثة",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "5c4b30fe37368a4f8d410a578566bbf47ef78ccfdd523078b0f5358577fb8a30"
+      "sha256": "d82c30be5b583ed6ec1f5159414bd7db38440064659df6e2553691948a2f8448"
     },
     {
       "name": "guard.py",
@@ -22,5 +22,8 @@
       "name": "requirements.txt",
       "sha256": "57aa0e5a6c24527ec89139dc7c6658fb8d06077d200d6632a90e164b24758470"
     }
+  ],
+  "pip": [
+    "PySide6-WebEngine"
   ]
 }
