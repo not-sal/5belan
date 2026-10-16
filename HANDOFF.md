@@ -1,0 +1,63 @@
+# 5belan (خبيلان) — handoff for the next agent
+
+Written 2026-10-17 at version **2.16.0**. Read this first. The owner is **أبو عبدالله** (Saleh); he writes Saudi Arabic and wants answers in Saudi Arabic.
+
+## 1. What the program is
+A desktop AI agent / chat app on the **DeepSeek API**, written in **one Python file** with **PySide6** (Qt). Name: خبيلان / 5belan. Runs on Windows (main), Linux (incl. Orange Pi / ARM) and macOS. It chats, reads/edits files in folders the user allows, runs shell commands and Python, browses the web in a built-in browser, runs scheduled/background tasks, and can be driven from a Telegram bot.
+
+## 2. WHERE THE FILES ARE
+| What | Path |
+|---|---|
+| **Dev copy (main file the owner edits/tests)** | `C:\Users\Admin\Desktop\deep\deepseek_chat.py` (folder `C:\Users\Admin\Desktop\deep`) |
+| **Installed copy** (what actually runs on his PC, auto-updated from GitHub) | `C:\Users\Admin\AppData\Local\Programs\5belan` (has `.venv`, `deepseek_chat.py`, `guard.py`) |
+| **User data** (chats, config, memory, files) — NEVER commit | `%APPDATA%\5belan` (= `C:\Users\Admin\AppData\Roaming\5belan`): `config.json`, `chats.json`, `memory.md`, `activity.jsonl`, `files\<chat id>\...` (attachments, `work\` = Python outputs), `pylibs\` (pip packages for run_python), `pages\` (page-watch copies). Env `BELAN_DATA_DIR` overrides it. |
+| **GitHub repo (source of truth, public)** | `https://github.com/saleh9688/5belan` (branch `main`) |
+| Auto-update manifest | `https://raw.githubusercontent.com/saleh9688/5belan/main/update.json` |
+
+The device's connected folders (for the remote-devices tools) are: the `deep` dev folder, `Desktop`, and the installed `5belan` folder. The device shell is a Linux VM, **not** Windows: it can read/write those folders but cannot see Windows startup entries, the registry, etc.
+
+Repo layout: `deepseek_chat.py` (the whole app, ~10.4k lines), `guard.py` (safe launcher: syntax check, `_last_good` rollback, crash detection), `publish.py` (writes `update.json`), `requirements.txt`, `5belan.png/.ico`, `installers/` (NSIS script for the Windows installer, Linux `install.sh`/`run.sh`, macOS `.command`, and `build_release.sh`), `HANDOFF.md` (this file).
+
+## 3. HOW RELEASES / AUTO-UPDATE WORK
+1. Edit `deepseek_chat.py`; bump `APP_VERSION = "x.y.z"` (single line near the top, ~line 2950).
+2. `python3 -m py_compile deepseek_chat.py`.
+3. `installers/build_release.sh /tmp/out --publish "notes"` does: builds `5belan-Setup.exe` (needs `makensis`), `5belan-linux.tar.gz`, `5belan-macOS.zip`; runs `publish.py --repo saleh9688/5belan --pip PySide6-WebEngine --notes ...` (rewrites `update.json` with SHA-256 of `deepseek_chat.py guard.py 5belan.png 5belan.ico requirements.txt`, **without** pushing); then `git add -A`, commit, `git push origin HEAD:main`. Without `--publish` it only builds.
+4. Verify: `curl -s https://raw.githubusercontent.com/saleh9688/5belan/main/update.json | grep version` and compare `sha256sum` of raw `deepseek_chat.py` with the local file. raw.githubusercontent is cached up to ~5 min — wait before panicking.
+5. Copy the new `deepseek_chat.py` to the owner's dev folder (device tools: `device_stage_files` the dev file to get `mtimeMs`, then `device_commit_files` with `expectedMtimeMs`), and send him `5belan-Setup.exe` with `SendUserFile`.
+6. Commit messages end with the attribution lines the harness reminder gives (Co-Authored-By / Claude-Session).
+
+How clients update: `check_updates()` fetches `update.json` every **3 minutes** (and 4 s after start); if the version is newer, an **orange badge «نزل تحديث X» appears next to «ذاكرة»** in the top bar and, unless `cfg["auto_update"] == False`, `auto_apply()` downloads only changed files (checksum + `compile()` check, backup into `_update_backup/<old version>`), then `try_restart_after_update()` restarts via `restart_app()` **only when nothing is running** (no reply, no background task, empty input box, no attachments). Versions before 2.15.0 only check every 6 h and need a manual click, so a one-time reinstall with the installer is needed to get auto-update.
+
+Git access: the sandbox clone is made with the `add_repo` tool (push access) — there is **no token to reuse**; in a new session call `add_repo` for `saleh9688/5belan` with `access: "push"`, clone, work there. Never put API keys, `config.json`, `chats.json`, logs in the repo (`publish.py` writes a `.gitignore` for these).
+
+## 4. ARCHITECTURE MAP (`deepseek_chat.py`)
+- Top: constants, `DATA_DIR`, `THEMES`, prompts (`SYSTEM_PROMPT`, `tools_prompt(runner)`), tool schemas: `READ_TOOLS`, `WRITE_TOOLS`, `SHELL_TOOLS`, `PYTHON_TOOLS`, `COMPUTER_TOOLS`, `BROWSER_TOOLS`, `NOTES_TOOLS`.
+- `ToolRunner`: executes tools. Roots/writable folders, undo journal (`_snap`, `undo_dir`), `run_command` (PowerShell on Windows / bash), **`run_python`/`pip_install`** (work dir `files/<chat id>/work`, packages in `DATA_DIR/pylibs`, always asks unless shell_mode is "free"), `_exec` (no pipes, kill tree, stop_event), `shell_danger()` + `_guard_shell` (never touch OS files — absolute rule).
+- `ChatView(QTextBrowser)` custom selection; replies are rendered into one QTextDocument (`render_chat`, `render_reply`, `redraw_live` for streaming). Thinking/activity is a **tree** (`build_activity_tree`, titles = summary of what was done via `summarize_tools`) drawn in a **scrollable overlay box** (`_render_details_box`, `_place_boxes`).
+- Docks (left of chat in RTL — the app really runs `setLayoutDirection(Qt.RightToLeft)`; always test in RTL): `DockFrame`, `open_dock/close_dock`, `relayout()`; panels: files (المرفقات = only assistant files + python outputs), browser (`BrowserPanel`, QtWebEngine), memory, usage, tasks, activity log, Telegram, problem report, **canvas** (`CanvasDialog`, `open_canvas`, `canvas_request`, `canvas_from_reply`).
+- `App(QMainWindow)`: UI build in `__init__`; `send()` → `_launch()` (agent loop in a worker thread, events via `self.q` queue polled by a timer: kinds `tok`, `done`, `err`, `usage`, `bg_done`, `page_*`, `sugg`, `update_*`, `tg…`); `finish()`; tray (`setup_tray`, close-to-tray, `quit_app`); single-instance QLocalServer; crash recovery (`recover_after_crash`, `resume.json`).
+- Tasks: `TasksDialog` (triggers manual/hourly/daily/weekly/watch/page; watch options: file patterns, subfolders, action custom/summarize/translate/sort, move to «تمت المعالجة»; chain: «بعد ما تخلص شغّل مهمة…», Telegram toggle), `tick_tasks`, `scan_watch/_watch_list/sort_files`, `start_bg` → `bg_worker` → `on_bg_done` → `chain_next`/`merge_bg` (result is merged into the **currently open chat**, deferred while that chat streams).
+- Telegram: `tg_call/tg_send`, `TgBridge` (polling thread, pairing code), `on_tg_msg` (commands `/help /chats /open [n] /read [n] /where /new /status /tasks /run`; after `/open` list, a bare number picks; plain text continues the selected real app chat through the normal `send()` pipeline — `tg_continue`, reply forwarded in `finish()` via `_tg_wait`), `TelegramDialog`.
+- Other: page watch (`page_text`, `page_worker`), big documents (`digest_big`), follow-up suggestions (`request_suggestions`, `_insert_suggestions`, anchor `sug:`), continue-cut-reply link, memory marks (`apply_memory_marks`), balance/peak-hours banner, usage/cost (`usage_cost`).
+- Updater: `check_update`, `apply_update`, `restart_app` (with `BELAN_RESTART`, API key handed over through env `BELAN_TMP_KEY`).
+- `guard.py` is the real entry point (`pythonw guard.py deepseek_chat.py`): quick exit code 0 is treated as a normal exit.
+
+## 5. FEATURE HISTORY (latest first)
+2.16.0 follow-up suggestions · chained tasks · folder-watch options. 2.15.x update badge + instant auto-update; Telegram continues app chats (`/chats`, `/open`, `/read`, number-only pick). 2.14.x canvas panel + run Python in chat; thinking in scrollable box with summary titles; attachments show only assistant files. 2.13 tray/background mode, page watch, big-doc digest, project folders, smart exit. 2.12 and earlier: tasks in open chat, panels left, Telegram bridge/notify, tool-bar on top, Arabic UI polish.
+
+## 6. TESTING RECIPE (no real display on the sandbox)
+`QT_QPA_PLATFORM=offscreen BELAN_DATA_DIR=/tmp/data QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox"`; delete `$BELAN_DATA_DIR/run_state.json` before each run; in the script call `app.setLayoutDirection(Qt.RightToLeft)`, monkeypatch `d.App.refresh_balance`, `d.api_chat`, `d.tg_send`/`d.tg_call`, `d.check_update`, `d.apply_update`, `d.restart_app`, `App._launch`; screenshot with `w.grab().save(...)`. WebEngine pages render blank offscreen. Telegram's API and most hosts are blocked from the sandbox. **Do not** run `pkill -f "python3 deepseek_chat.py"` (it kills your own shell). A test that leaves `busy=True` hangs on exit (recover_after_crash) — set it back first.
+
+## 7. RULES AND PREFERENCES FROM THE OWNER
+- Reply in Saudi Arabic; **every script/terminal output in English only** (his terminal garbles Arabic).
+- Publish every change to GitHub directly and tell him the version; he installs from the `.exe` the first time only.
+- Never touch OS/system files; never upload `config.json`, `chats.json`, API keys, logs; don't delete stray files he did not ask about.
+- UI wording: text, not emoji/symbols; panels belong physically on the **left** of the chat; the app is RTL.
+- Keynote (.key) for decks (PowerPoint only as fallback).
+- He watches progress via the task list widget; give short status lines in Arabic while working.
+
+## 8. UNVERIFIED / KNOWN GAPS
+Everything was tested offscreen only. Not verified on a real Windows desktop: tray behavior, orange update badge, auto-restart, scrollable thinking box overlay positioning, canvas HTML preview (WebEngine), Telegram with the real bot (his bot did not answer `/help` because it was not paired yet or the app was on an old version), run_python with his installed Python, page watch on real sites, big-doc digest with the real API, Linux/macOS/Orange Pi installs (packages built but never sent to him). Replies feel slow mainly because of DeepSeek thinking mode `high` and multi-round tool calls; he was offered a per-reply timing readout (time to first token, tokens/s) — not built.
+
+## 9. BACKLOG HE HAS SEEN (not chosen yet)
+Deep research mode; MCP support; open the app from the phone browser (Tailscale); conversation branches; rewind-to-checkpoint; diff review of edits; global hotkey mini window; read-aloud/voice input; NotebookLM-style folder knowledge; project builder with local server; AGENTS.md project rules; custom `/` commands; sub-agents; screen capture; daily Telegram brief; quick notes via bot; multi-provider keys; app lock; permission rules; dry-run mode; searchable activity log; scoped memory; memory suggestions; auto-summarize long chats; themes; split view; pins; share chat as HTML; email/calendar connectors; translator/style/convert/mail-merge tools; stats; automatic backup; focus mode; Ctrl+F in chat; two-model compare; reply rating; per-sentence sources; sensitive-data warning before sending.
