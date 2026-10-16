@@ -2773,7 +2773,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.11.1"
+APP_VERSION = "2.12.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4800,7 +4800,7 @@ class TelegramDialog(QDialog):
     def tg_changed(self):
         self.tg["notify"] = self.notify.isChecked()
         self.tg["chat"] = self.chat_on.isChecked()
-        p = self.parent()
+        p = getattr(self, "app", None) or self.parent()
         if hasattr(p, "save_cfg"):
             p.cfg["tg"] = self.tg
             p.save_cfg()
@@ -4898,7 +4898,7 @@ class TasksDialog(QDialog):
         orow.addWidget(self.think)
         orow.addStretch(1)
         right.addLayout(orow)
-        right.addWidget(QLabel("النتيجة تظهر كمحادثة جديدة بعلامة 🔔 في القائمة. البرنامج لازم يكون مفتوح (ولو فاتتك مهمة تشتغل أول ما تفتحه)."))
+        _l = QLabel("المهمة تشتغل داخل المحادثة المفتوحة وقت التشغيل، ونتيجتها تنزل فيها ويعرف خبيلان اللي قبلها. البرنامج لازم يكون مفتوح (ولو فاتتك مهمة تشتغل أول ما تفتحه)."); _l.setWordWrap(True); right.addWidget(_l)
         brow = QHBoxLayout()
         run = QPushButton("شغّلها الحين")
         run.clicked.connect(self.run_now)
@@ -5086,6 +5086,10 @@ def make_qss(c):
     QWidget#side, QWidget#filespanel { background: %(side)s; }
     QToolButton#iconbtn { background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 4px 10px; }
     QToolButton#iconbtn:hover { background: %(hover)s; }
+    QToolButton#xbtn { background: transparent; border: none; border-radius: 11px; font-size: 16px; color: %(dim)s; padding: 0; }
+    QToolButton#xbtn:hover { background: %(hover)s; color: %(text)s; }
+    QWidget#dockhead { border-bottom: 1px solid %(border)s; }
+    QFrame#dockframe { border-right: 1px solid %(border)s; }
     QToolButton#toolbtn { background: transparent; border: none; border-radius: 8px; padding: 2px 12px; color: %(text)s; }
     QToolButton#toolbtn:hover { background: %(hover)s; }
     QToolButton#toolbtn:pressed { background: %(bubble)s; }
@@ -5190,6 +5194,39 @@ BROWSER_TYPE_JS = (
     "if(f){try{if(f.requestSubmit)f.requestSubmit();else f.submit();}catch(e){}}}"
     "return 'typed into '+((inp.name||inp.placeholder||inp.id||inp.tagName)+'').slice(0,60);})()"
 )
+
+
+class DockFrame(QFrame):
+    """A side column with a small close button. Used for the browser, attachments, tasks, memory, usage..."""
+    def __init__(self, title, widget, on_close, want_width=380):
+        super().__init__()
+        self.setObjectName("dockframe")
+        self.want_width = want_width
+        self.inner = widget
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        hd = QWidget()
+        hd.setObjectName("dockhead")
+        hd.setFixedHeight(32)
+        hl = QHBoxLayout(hd)
+        hl.setContentsMargins(10, 4, 6, 4)
+        self.title = QLabel(title)
+        f = self.title.font()
+        f.setBold(True)
+        self.title.setFont(f)
+        hl.addWidget(self.title, 1)
+        x = QToolButton()
+        x.setObjectName("xbtn")
+        x.setText("×")
+        x.setFixedSize(22, 22)
+        x.setToolTip("إغلاق")
+        x.setCursor(Qt.PointingHandCursor)
+        x.clicked.connect(on_close)
+        hl.addWidget(x)
+        lay.addWidget(hd)
+        lay.addWidget(widget, 1)
+        self.setMinimumWidth(300)
 
 
 class App(QMainWindow):
@@ -5417,7 +5454,7 @@ class App(QMainWindow):
         sep.setFrameShape(QFrame.VLine)
         sep.setObjectName("vsep")
         hl.addWidget(sep)
-        self.files_btn = icon_btn("الملفات", "ملفات هذي المحادثة", True)
+        self.files_btn = icon_btn("المرفقات", "مرفقات هذي المحادثة: اللي أرسلتها أنت واللي أرسلها خبيلان", True)
         self.files_btn.toggled.connect(self.toggle_files_panel)
         hl.addWidget(self.files_btn)
         self.browser_btn = icon_btn("المتصفح", "المتصفح المدمج (يشتغل بالخلفية حتى لو أخفيته)", True)
@@ -5547,14 +5584,15 @@ class App(QMainWindow):
         ml.addWidget(wrap)
         self.stop_event = threading.Event()
 
+        self.dock = QSplitter(Qt.Horizontal)
+        self.dock.setChildrenCollapsible(False)
+        self.docks = {}
+        splitter.addWidget(self.dock)
         splitter.addWidget(main)
         self.files_panel = QWidget()
         self.files_panel.setObjectName("filespanel")
         fpl = QVBoxLayout(self.files_panel)
         fpl.setContentsMargins(10, 12, 10, 10)
-        fh = QLabel("ملفات المحادثة")
-        fh.setObjectName("h2")
-        fpl.addWidget(fh)
         sa = QScrollArea()
         sa.setWidgetResizable(True)
         sa.setFrameShape(QFrame.NoFrame)
@@ -5566,17 +5604,14 @@ class App(QMainWindow):
         self.files_list.addStretch(1)
         sa.setWidget(inner)
         fpl.addWidget(sa, 1)
-        self.files_panel.setVisible(False)
-        self.right_split = QSplitter(Qt.Vertical)  # browser on top, chat files below, in one column
-        self.right_split.setMinimumWidth(280)
-        self.right_split.setMaximumWidth(700)
-        self.right_split.addWidget(self.files_panel)
-        self.right_split.setVisible(False)
-        splitter.addWidget(self.right_split)
+        self.files_dock = DockFrame("المرفقات", self.files_panel, lambda: self.files_btn.setChecked(False), 340)
+        self.files_dock.setVisible(False)
+        self.dock.addWidget(self.files_dock)
+        self.dock.setVisible(False)
         splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
-        splitter.setSizes([280, 920, 0])
+        splitter.setStretchFactor(1, 0)
+        splitter.setStretchFactor(2, 1)
+        splitter.setSizes([260, 0, 940])
 
         self.apply_settings(restrictive_settings(self.def_model, self.def_think))
         self.model_box.currentTextChanged.connect(lambda _=None: self.store_settings())
@@ -5606,6 +5641,7 @@ class App(QMainWindow):
         self.peak_timer.start(60000)
         self.update_peak()
         self._bg_running = set()
+        self._bg_pending = []
         self._watch_sizes = {}
         self.task_timer = QTimer(self)
         self.task_timer.timeout.connect(self.tick_tasks)
@@ -5760,26 +5796,29 @@ class App(QMainWindow):
 
     def toggle_files_panel(self, on):
         self._panel_user_off = not on
-        self.files_panel.setVisible(bool(on))
+        self.files_dock.setVisible(bool(on))
+        if on:
+            self._files_sig = None
+            self.refresh_files_panel()
         self.relayout()
 
     def relayout(self):
         total = max(self.splitter.width(), 1000)
         cur = self.splitter.sizes()
         side = cur[0] if cur and cur[0] > 150 else 260
-        fv = not self.files_panel.isHidden()
-        bv = bool(self.browser_container is not None and not self.browser_container.isHidden())
-        self.right_split.setVisible(fv or bv)
-        rw = 480 if bv else (320 if fv else 0)
-        self.splitter.setSizes([side, max(320, total - side - rw), rw])
-        if fv and bv:
-            h = max(self.right_split.height(), 700)
-            self.right_split.setSizes([int(h * 0.6), int(h * 0.4)])
+        frames = [self.dock.widget(i) for i in range(self.dock.count())]
+        vis = [f for f in frames if not f.isHidden()]
+        self.dock.setVisible(bool(vis))
+        want = sum(f.want_width for f in vis)
+        dw = min(want, max(300, int(total * 0.7 - side))) if vis else 0
+        self.splitter.setSizes([side, dw, max(320, total - side - dw)])
+        if vis:
+            self.dock.setSizes([max(300, int(f.want_width * dw / max(want, 1))) if not f.isHidden() else 0 for f in frames])
 
     def refresh_files_panel(self):
         entries = self.gather_files()
         sig = tuple((e["src"], e["name"], e["mi"]) for e in entries)
-        self.files_btn.setText("الملفات (%d)" % len(entries) if entries else "الملفات")
+        self.files_btn.setText("المرفقات (%d)" % len(entries) if entries else "المرفقات")
         if sig == getattr(self, "_files_sig", None):
             return
         self._files_sig = sig
@@ -5791,12 +5830,21 @@ class App(QMainWindow):
                 w.deleteLater()
         icons = {".docx": "📄", ".pdf": "📕", ".xlsx": "📊", ".csv": "📊", ".png": "🖼", ".svg": "🖼", ".jpg": "🖼",
                  ".jpeg": "🖼", ".html": "🌐", ".md": "📝", ".txt": "📝", ".py": "🐍", ".json": "🧾"}
-        if not entries:
-            lab = QLabel("لا توجد ملفات في هذي المحادثة بعد.\nالملفات اللي ترفقها أو يسوّيها خبيلان تظهر هنا.")
-            lab.setWordWrap(True)
-            lab.setObjectName("chip")
-            self.files_list.insertWidget(0, lab)
-        for idx, e in enumerate(entries):
+        seq = []
+        for gname, want_user, empty in (("أرسلتها أنت", True, "ما أرسلت ملفات بعد."), ("أرسلها خبيلان", False, "ما أرسل ملفات بعد.")):
+            grp = [e for e in entries if (e["src"] == "user") == want_user]
+            seq.append(("h", "%s (%d)" % (gname, len(grp))))
+            seq += [("e", e) for e in grp] if grp else [("n", empty)]
+        pos = 0
+        for kind, val in seq:
+            if kind != "e":
+                lab = QLabel(val)
+                lab.setObjectName("h2" if kind == "h" else "chip")
+                lab.setWordWrap(True)
+                self.files_list.insertWidget(pos, lab)
+                pos += 1
+                continue
+            e = val
             card = QFrame()
             card.setObjectName("filecard")
             v = QVBoxLayout(card)
@@ -5839,9 +5887,10 @@ class App(QMainWindow):
                 row.addWidget(b)
             row.addStretch(1)
             v.addLayout(row)
-            self.files_list.insertWidget(idx, card)
-        if entries and not getattr(self, "_panel_user_off", False) and self.files_panel.isHidden():
-            self.files_panel.setVisible(True)
+            self.files_list.insertWidget(pos, card)
+            pos += 1
+        if entries and not getattr(self, "_panel_user_off", False) and self.files_dock.isHidden():
+            self.files_dock.setVisible(True)
             self.files_btn.blockSignals(True)
             self.files_btn.setChecked(True)
             self.files_btn.blockSignals(False)
@@ -6313,9 +6362,11 @@ class App(QMainWindow):
             QApplication.instance().aboutToQuit.connect(panel.shutdown)
             panel.setVisible(bool(show))
             self.web = panel
-            self.browser_container = panel
-            self.right_split.insertWidget(0, panel)
-            panel.setVisible(bool(show))
+            panel.b_hide.setVisible(False)
+            self.browser_container = DockFrame("المتصفح", panel, lambda: self.browser_btn.setChecked(False), 520)
+            self.dock.insertWidget(0, self.browser_container)
+            self.browser_container.setVisible(bool(show))
+            panel.setVisible(True)
             self.web_ok = True
             return True
         except Exception as e:
@@ -7216,25 +7267,59 @@ class App(QMainWindow):
         webbrowser.open(url)
 
     def open_activity(self):
-        ActivityDialog(self).exec()
+        self.open_dock("activity", "سجل النشاط", lambda: ActivityDialog(self), width=560)
+
+    # ---------- side panels on the left ----------
+    def open_dock(self, key, title, make_dialog, on_accept=None, width=420):
+        """Shows a tool (memory, usage, tasks...) as a column next to the chat instead of a pop-up window."""
+        if key in self.docks:
+            self.docks[key].inner.reject()  # clicking the button again closes it
+            return
+        dlg = make_dialog()
+        dlg.setWindowFlags(Qt.Widget)
+        dlg.setSizeGripEnabled(False)
+        frame = DockFrame(title, dlg, dlg.reject, width)
+        self.docks[key] = frame
+
+        def fin(r, k=key, d=dlg):
+            try:
+                if r and on_accept:
+                    on_accept(d)
+            finally:
+                self.close_dock(k)
+
+        dlg.finished.connect(fin)
+        self.dock.addWidget(frame)
+        frame.show()
+        dlg.show()
+        self.relayout()
+
+    def close_dock(self, key):
+        frame = self.docks.pop(key, None)
+        if frame is None:
+            return
+        frame.hide()
+        frame.setParent(None)
+        frame.deleteLater()
+        self.relayout()
 
     def open_tasks(self):
-        dlg = TasksDialog(self, self.cfg.get("tasks") or [], self.default_dir(), lambda t: self.start_bg(t, manual=True))
-        if not dlg.exec():
-            return
-        new = dlg.result_tasks()
-        old = {t["id"]: t for t in (self.cfg.get("tasks") or [])}
-        for t in new:
-            o = old.get(t["id"])
-            if o:
-                t["last_run"] = o.get("last_run", t.get("last_run", 0))
-                if t.get("watch") == o.get("watch") and "seen" in o:
-                    t["seen"] = o["seen"]
-            if t.get("trigger") != "watch":
-                t.pop("seen", None)
-        self.cfg["tasks"] = new
-        self.save_cfg()
-        self.statusBar().showMessage("انحفظت المهام (%d)" % len(new), 3000)
+        def ok(dlg):
+            new = dlg.result_tasks()
+            old = {t["id"]: t for t in (self.cfg.get("tasks") or [])}
+            for t in new:
+                o = old.get(t["id"])
+                if o:
+                    t["last_run"] = o.get("last_run", t.get("last_run", 0))
+                    if t.get("watch") == o.get("watch") and "seen" in o:
+                        t["seen"] = o["seen"]
+                if t.get("trigger") != "watch":
+                    t.pop("seen", None)
+            self.cfg["tasks"] = new
+            self.save_cfg()
+            self.statusBar().showMessage("انحفظت المهام (%d)" % len(new), 3000)
+        self.open_dock("tasks", "المهام التلقائية", lambda: TasksDialog(self, self.cfg.get("tasks") or [], self.default_dir(),
+                                                                         lambda t: self.start_bg(t, manual=True)), ok, 720)
 
     def new_bg_task(self):
         key = self.key_edit.text().strip()
@@ -7242,7 +7327,7 @@ class App(QMainWindow):
             QMessageBox.warning(self, "5belan", "اكتب مفتاح API أول.")
             return
         txt, ok = QInputDialog.getMultiLineText(self, "مهمة بالخلفية",
-                                                "وش تبيه يسوي؟ يشتغل لوحده وتكمل شغلك، وتجيك النتيجة كمحادثة جديدة:", "")
+                                                "وش تبيه يسوي؟ يشتغل لوحده وتكمل شغلك، وتنزل النتيجة داخل هذي المحادثة:", "")
         if not ok or not txt.strip():
             return
         dirs = [d for d in self.allowed_dirs if os.path.isdir(d)] if self.tools_enabled else []
@@ -7323,9 +7408,13 @@ class App(QMainWindow):
     # ---------- Telegram ----------
     def open_telegram(self):
         tg = self.cfg.setdefault("tg", {})
-        TelegramDialog(self, tg, self.tg_bridge).exec()
-        self.cfg["tg"] = tg
-        self.save_cfg()
+
+        def mk():
+            d_ = TelegramDialog(self, tg, self.tg_bridge)
+            d_.app = self
+            return d_
+
+        self.open_dock("telegram", "ربط تليقرام", mk, lambda d_: (self.cfg.__setitem__("tg", tg), self.save_cfg()), 440)
 
     def tg_ready(self):
         tg = self.cfg.get("tg") or {}
@@ -7440,6 +7529,16 @@ class App(QMainWindow):
             self.statusBar().showMessage("هذي المهمة تشتغل الحين", 3000)
             return
         task = dict(task)
+        tgt = self.current
+        if tgt is None:
+            tgt = {"id": uuid.uuid4().hex, "title": task.get("name", "مهمة"), "updated": time.time(), "msgs": [],
+                   "settings": self.collect_settings(), "project": self.selected_project_id()}
+            self.chats.append(tgt)
+            self.persist()
+            self.refresh_list()
+        task["_chat_id"] = tgt["id"]
+        task["_ctx"] = [{"role": m["role"], "content": str(m.get("content", ""))[:1500]} for m in tgt["msgs"][-10:]
+                        if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str) and m.get("content")]
         self._bg_running.add(task["id"])
         for t in self.cfg.get("tasks") or []:
             if t["id"] == task["id"]:
@@ -7447,7 +7546,7 @@ class App(QMainWindow):
                 if files:
                     t["seen"] = list(set(t.get("seen") or []) | {os.path.basename(f) for f in files})
         self.save_cfg()
-        self.statusBar().showMessage("بدأت المهمة: " + task.get("name", ""), 4000)
+        self.statusBar().showMessage("بدأت المهمة داخل المحادثة المفتوحة: " + task.get("name", ""), 5000)
         threading.Thread(target=self.bg_worker, args=(task, key, files or []), daemon=True).start()
 
     def bg_worker(self, task, key, files):
@@ -7475,9 +7574,9 @@ class App(QMainWindow):
                 prompt += "\n\nالملفات الجديدة اللي ظهرت:\n" + "\n".join(files)
             system = (SYSTEM_PROMPT + "\n" + memory_prompt() + (tools_prompt(runner) if roots else "") +
                       ("\n" + folder_notes_prompt(roots) if roots else "") +
-                      "\nBACKGROUND TASK: you run unattended; nobody can answer questions. Do the task with the tools you have, then finish "
+                      "\nBACKGROUND TASK: you run unattended inside the user's open conversation (earlier messages are the context); nobody can answer questions. Do the task with the tools you have, then finish "
                       "with a concise report in Arabic (Saudi dialect) of what you did or found. If something is not allowed, say so in the report.")
-            messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+            messages = [{"role": "system", "content": system}] + list(task.get("_ctx") or []) + [{"role": "user", "content": prompt}]
             steps, final = [], ""
             tools = runner.tools() if roots else None
             for _ in range(60):
@@ -7518,6 +7617,7 @@ class App(QMainWindow):
                 final = "(وصلت لحد الخطوات الأقصى قبل ما يخلص المهمة)"
             final, mem_msgs = apply_memory_marks(final)
             chat = {"id": cid, "title": title, "updated": time.time(), "project": task.get("project", ""), "bg": True, "unread": True,
+                    "_target": task.get("_chat_id"),
                     "settings": clean_settings({"allowed_dirs": roots, "tools_enabled": bool(roots)}, restrictive_settings()),
                     "journal": runner.journal[-300:],
                     "msgs": [{"role": "user", "content": prompt, "shown": "" + task.get("name", "") + "\n" + task.get("prompt", ""), "names": []},
@@ -7534,19 +7634,42 @@ class App(QMainWindow):
             self.statusBar().showMessage("فشلت المهمة: " + err[:120], 8000)
             self.tg_notify("فشلت المهمة: " + err[:300])
             return
-        self.chats.append(chat)
         try:
             last = [m for m in chat["msgs"] if m["role"] == "assistant"][-1].get("content", "")
             self.tg_notify("خلصت المهمة: %s\n\n%s" % (chat["title"], str(last)[:3000]))
         except Exception:
             pass
-        self.persist()
-        self.refresh_list()
+        target = next((c for c in self.chats if c.get("id") == chat.get("_target")), None)
+        if target is None:  # the chat was deleted meanwhile: keep the result as its own chat
+            chat.pop("_target", None)
+            self.chats.append(chat)
+            self.persist()
+            self.refresh_list()
+        elif target is self.current and self.busy:
+            self._bg_pending.append((target, chat))  # do not interleave with a reply that is being streamed
+            self.statusBar().showMessage("خلصت المهمة، تنزل بالمحادثة بعد ما يخلص الرد", 6000)
+            return
+        else:
+            self.merge_bg(target, chat)
         self.statusBar().showMessage("خلصت: " + chat["title"], 10000)
         try:
             QApplication.alert(self, 5000)
         except Exception:
             pass
+
+    def merge_bg(self, target, chat):
+        msgs = chat["msgs"]
+        if msgs and msgs[0].get("role") == "user":
+            msgs[0]["shown"] = "مهمة: " + str(msgs[0].get("shown", ""))
+        target["msgs"] += msgs
+        target["journal"] = ((target.get("journal") or []) + (chat.get("journal") or []))[-300:]
+        target["updated"] = time.time()
+        if target is not self.current:
+            target["unread"] = True
+        self.persist()
+        self.refresh_list()
+        if target is self.current:
+            self.render_chat()
 
     # ---------- projects, memory, usage, undo, peak, problem report ----------
     def get_project(self, pid):
@@ -7604,16 +7727,16 @@ class App(QMainWindow):
         self.refresh_list()
 
     def open_memory(self):
-        dlg = MemoryDialog(self)
-        if dlg.exec():
-            save_memory(dlg.text())
+        def ok(d):
+            save_memory(d.text())
             self.statusBar().showMessage("انحفظت الذاكرة", 2500)
+        self.open_dock("memory", "الذاكرة", lambda: MemoryDialog(self), ok, 420)
 
     def open_usage(self):
-        UsageDialog(self, self.chats).exec()
+        self.open_dock("usage", "الصرف", lambda: UsageDialog(self, self.chats), width=520)
 
     def open_problem(self):
-        ProblemDialog(self, build_problem_report()).exec()
+        self.open_dock("problem", "تقرير مشكلة", lambda: ProblemDialog(self, build_problem_report()), width=460)
 
     def open_undo(self):
         if self.busy or not self.current:
@@ -8778,6 +8901,9 @@ class App(QMainWindow):
         self.busy = False
         self.set_send_mode("send")
         self.inp.setFocus()
+        while self._bg_pending:
+            t_, c_ = self._bg_pending.pop(0)
+            self.merge_bg(t_, c_)
         if self._interrupt is not None or self._queued is not None:
             QTimer.singleShot(250, self.run_pending)
 
