@@ -1,10 +1,10 @@
 {
-  "version": "2.15.1",
-  "notes": "2.15.1: /open يعرض المحادثات بأرقام بدون أوقات",
+  "version": "2.15.2",
+  "notes": "2.15.2: بعد /open تكتب رقم المحادثة بس",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "b32fac71a12113ae7ed661dfcabb98900d38a67a3a48247c3396477527f73d52"
+      "sha256": "41c8c0b9d1818c24b94aeb83b6af4174c74a3fea1211023dd2cb6a33f4722d95"
     },
     {
       "name": "guard.py",
