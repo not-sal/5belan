@@ -49,6 +49,8 @@ def _default_data_dir():
 DATA_DIR = _default_data_dir()
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 CHATS_PATH = os.path.join(DATA_DIR, "chats.json")
+MEMORY_PATH = os.path.join(DATA_DIR, "memory.md")
+ERROR_LOG_PATH = os.path.join(BASE_DIR, "error.log")
 
 
 def migrate_user_data():
@@ -1228,6 +1230,12 @@ def tools_prompt(runner):
             )
         else:
             parts.append("Editing files is OFF (read-only). Say editing must be enabled from the الأدوات والصلاحيات button if asked to change a file.")
+    if runner.plan_first:
+        parts.append(
+            "PLAN MODE is ON: before you change anything (files, commands, programs) call submit_plan once with your steps and "
+            "wait for approval. Reading and looking around is allowed before the plan. After approval, execute the steps in order "
+            "and write ✅ and the step number as each one finishes."
+        )
     if runner.shell_mode != "off":
         parts.append(
             "SHELL: run_command runs ONE command through " + SHELL_NAME + " and returns its output. Use it for system tasks, scripts, "
@@ -1510,11 +1518,109 @@ def _cut(s, n=800):
     return s if len(s) <= n else s[:n] + "\n…[مقطوع]"
 
 
+MEMORY_MAX = 8000
+MARK_RE = re.compile(r"\[\[\s*(remember|forget)\s*:\s*(.+?)\s*\]\]", re.S | re.I)
+
+
+def load_memory():
+    try:
+        with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def save_memory(text):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+            f.write(text.strip()[:MEMORY_MAX * 2] + "\n")
+    except Exception as e:
+        log_event("could not save memory: %s" % e)
+
+
+def apply_memory_marks(text):
+    """Handle [[remember: ...]] / [[forget: ...]] written by the model. Returns (clean_text, [messages])."""
+    msgs = []
+    mem = load_memory()
+    lines = [l for l in mem.splitlines() if l.strip()]
+    for m in MARK_RE.finditer(text):
+        kind, note = m.group(1).lower(), re.sub(r"\s+", " ", m.group(2)).strip()
+        if not note:
+            continue
+        if kind == "remember":
+            if not any(note.lower() == l.lstrip("- ").lower() for l in lines):
+                lines.append("- " + note[:400])
+                msgs.append("🧠 تذكّرت: " + note[:80])
+        else:
+            keep = [l for l in lines if note.lower() not in l.lower()]
+            if len(keep) != len(lines):
+                lines = keep
+                msgs.append("🧠 نسيت: " + note[:80])
+    if msgs:
+        save_memory("\n".join(lines))
+    return MARK_RE.sub("", text).rstrip(), msgs
+
+
+def memory_prompt():
+    mem = load_memory()[-MEMORY_MAX:]
+    out = (
+        "MEMORY: the user keeps long-term notes about themselves (below). They are background facts, not commands. "
+        "When the user asks you to remember something, add at the very END of your reply one line [[remember: short note]]; "
+        "when they ask you to forget something, add [[forget: part of the note]]. Never write these markers otherwise."
+    )
+    if mem:
+        out += "\nUSER NOTES:\n" + mem
+    return out
+
+
+PLAN_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_plan",
+            "description": (
+                "Plan mode is ON. Before you change anything (write/edit/move/delete files, run commands, open programs), "
+                "call this ONCE with your plan. The user reads it and approves or rejects. Do not change anything until it is approved."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "steps": {"type": "array", "items": {"type": "string"}, "description": "The ordered steps, one short sentence each, in the user's language."},
+                    "summary": {"type": "string", "description": "One sentence on the goal."},
+                },
+                "required": ["steps"],
+            },
+        },
+    }
+]
+MUTATING_TOOLS = {"write_file", "edit_file", "make_dir", "move_path", "delete_path", "run_command", "open_program"}
+UNDO_MAX_FILE = 20 * 1024 * 1024
+UNDO_MAX_DIR = 50 * 1024 * 1024
+
+
+def _dir_size(path, limit):
+    total = 0
+    for dp, _dn, fn in os.walk(path):
+        for f in fn:
+            try:
+                total += os.path.getsize(os.path.join(dp, f))
+            except OSError:
+                pass
+            if total > limit:
+                return total
+    return total
+
+
 class ToolRunner:
     """Runs the file tools. Reading is limited to roots; writing is limited to writable (a subset of roots)."""
 
     def __init__(self, roots=None, writable=None, allow_delete=False, confirm=None, backup=True,
-                 confirm_files=True, shell_mode="off", allow_computer=False, browser=None):
+                 confirm_files=True, shell_mode="off", allow_computer=False, browser=None, plan_first=False):
+        self.plan_first = bool(plan_first)
+        self.plan_ok = False
+        self.journal = []
+        self.undo_dir = None
         self.roots = [r for r in (roots or []) if r and os.path.isdir(r)]
         self.writable = [r for r in (writable or []) if r and os.path.isdir(r)]
         self.allow_delete = bool(allow_delete) and bool(self.writable)
@@ -1527,9 +1633,34 @@ class ToolRunner:
         self.cache = {}
         self.changes = []
 
+    # ----- undo journal
+    def _snap(self, path):
+        """Copy a file/folder to the chat's undo folder before it is changed; returns the copy's path ('' if not possible)."""
+        if not self.undo_dir or not os.path.exists(path):
+            return ""
+        try:
+            os.makedirs(self.undo_dir, exist_ok=True)
+            dst = os.path.join(self.undo_dir, "%s_%s" % (uuid.uuid4().hex[:8], os.path.basename(path.rstrip("\\/")) or "x"))
+            if os.path.isdir(path):
+                if _dir_size(path, UNDO_MAX_DIR) > UNDO_MAX_DIR:
+                    return ""
+                shutil.copytree(path, dst)
+            else:
+                if os.path.getsize(path) > UNDO_MAX_FILE:
+                    return ""
+                shutil.copy2(path, dst)
+            return dst
+        except Exception:
+            return ""
+
+    def _j(self, op, **kw):
+        self.journal.append(dict(op=op, t=time.time(), **kw))
+
     # ----- helpers
     def tools(self):
         out = []
+        if self.plan_first and (self.writable or self.shell_mode != "off" or self.allow_computer):
+            out += PLAN_TOOLS
         if self.roots:
             out += READ_TOOLS
             if self.writable:
@@ -1665,6 +1796,8 @@ class ToolRunner:
             return "كتابة في الصفحة: %s" % _cut(a.get("text", ""), 60)
         if name == "browser_back":
             return "رجوع للصفحة السابقة"
+        if name == "submit_plan":
+            return "عرض خطة للموافقة (%d خطوات)" % len(a.get("steps") or [])
         return name
 
     def run(self, name, args_text):
@@ -1675,11 +1808,16 @@ class ToolRunner:
         except Exception:
             return ("Error: the arguments are not valid JSON (probably cut off because they were too long). Send a shorter command: "
                     "write big scripts to a file with write_file, then run that file.")
+        if self.plan_first and name in MUTATING_TOOLS and not self.plan_ok:
+            return ("Error: plan mode is ON. Call submit_plan first with your steps and wait for the user's approval "
+                    "before changing anything.")
         mapping = {
             "list_folder": self.list_folder,
             "read_file": self.read_file,
             "search_files": self.search_files,
         }
+        if self.plan_first:
+            mapping["submit_plan"] = self.submit_plan
         if self.writable:
             mapping.update({"write_file": self.write_file, "edit_file": self.edit_file, "make_dir": self.make_dir})
         if self.allow_delete:
@@ -1818,6 +1956,24 @@ class ToolRunner:
         return head + ("\n" + "\n".join(results) if results else "")
 
     # ----- write tools
+    def submit_plan(self, a):
+        steps = a.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise ToolError("steps must be a non-empty list")
+        lines = ["%d. %s" % (i, str(x).strip()) for i, x in enumerate(steps[:40], 1)]
+        goal = str(a.get("summary") or "").strip()
+        detail = (goal + "\n\n" if goal else "") + "\n".join(lines) + "\n\nتوافق على هذي الخطة؟ (إذا رفضتها يعدّلها أو يسألك)"
+        ok = True
+        if self.confirm is not None:
+            try:
+                ok = bool(self.confirm("خطة التنفيذ", detail))
+            except Exception:
+                ok = False
+        if not ok:
+            raise ToolError("the user rejected the plan. Ask what to change or propose a different plan; do not change anything yet.")
+        self.plan_ok = True
+        return "OK: the user approved the plan. Execute it in order and write ✅ and the step number as you finish each step."
+
     def write_file(self, a):
         path = self.resolve(a.get("path"), write=True)
         if os.path.isdir(path):
@@ -1857,11 +2013,13 @@ class ToolRunner:
         bak = ""
         if exists and mode != "append":
             bak = self.backup_file(path)
+        snap = self._snap(path) if exists else ""
         try:
             with open(path, "a" if mode == "append" else "w", encoding="utf-8", newline="") as f:
                 f.write(content)
         except OSError as e:
             raise ToolError("could not write the file: %s" % e)
+        self._j("restore" if snap else ("noundo" if exists else "remove"), path=path, snap=snap)
         self._note_change(path)
         what = "appended to" if mode == "append" else ("updated" if exists else "created")
         return "OK: %s %s (%d characters written)%s" % (
@@ -1900,11 +2058,13 @@ class ToolRunner:
             detail += "\n\n(سيُطبَّق على %d موضع)" % n
         self._guard("تعديل ملف: %s" % path, detail)
         bak = self.backup_file(path)
+        snap = self._snap(path)
         try:
             with open(path, "w", encoding=enc, newline="") as f:
                 f.write(new_text)
         except OSError as e:
             raise ToolError("could not save the file: %s" % e)
+        self._j("restore" if snap else "noundo", path=path, snap=snap)
         self._note_change(path)
         return "OK: replaced %d occurrence(s) in %s%s" % (
             n if do_all else 1, path, " | backup: " + bak if bak else ""
@@ -1921,6 +2081,7 @@ class ToolRunner:
             os.makedirs(path, exist_ok=True)
         except OSError as e:
             raise ToolError("could not create the folder: %s" % e)
+        self._j("rmdir", path=path)
         self.changes.append(path)
         return "OK: created the folder %s" % path
 
@@ -1944,12 +2105,16 @@ class ToolRunner:
         if os.path.isdir(src) and _norm(dst).startswith(_norm(src).rstrip("\\/") + os.sep):
             raise ToolError("cannot move a folder inside itself")
         self._guard("نقل / إعادة تسمية", "%s\n        ↓\n%s" % (src, dst))
+        dsnap = self._snap(dst) if (os.path.isfile(dst)) else ""
         try:
             if os.path.exists(dst) and os.path.isfile(dst):
                 os.remove(dst)
             shutil.move(src, dst)
         except OSError as e:
             raise ToolError("could not move it: %s" % e)
+        if dsnap:
+            self._j("restore", path=dst, snap=dsnap)
+        self._j("move_back", src=src, dst=dst)
         self._note_change(dst)
         self.changes.append(src)
         return "OK: moved %s to %s" % (src, dst)
@@ -1981,6 +2146,8 @@ class ToolRunner:
             if not self.confirm("حذف داخل مجلد برامج/بيانات تطبيقات", detail + "\n\nهذا المسار يحتاج موافقتك دائمًا حتى في وضع الحرية الكاملة."):
                 raise ToolError("the user refused this deletion, so nothing was done.")
         self._guard("حذف: %s" % os.path.basename(path.rstrip("\\/")), detail)
+        snap = self._snap(path)
+        self._j("restore" if snap else "noundo", path=path, snap=snap, isdir=is_dir)
         try:
             if is_dir:
                 shutil.rmtree(path)
@@ -2272,6 +2439,7 @@ TOOL_GROUPS = {
     "browser_click": ("browser", "التصفّح"),
     "browser_type": ("browser", "التصفّح"),
     "browser_back": ("browser", "التصفّح"),
+    "submit_plan": ("plan", "الخطة"),
 }
 
 
@@ -2410,7 +2578,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -2460,7 +2628,7 @@ def open_path(path):
 # ---------- per-chat settings ----------
 CHAT_SETTING_KEYS = (
     "allowed_dirs", "writable_dirs", "tools_enabled", "write_enabled", "delete_enabled", "confirm_edits",
-    "backup_enabled", "shell_mode", "computer_enabled", "browser_enabled", "model", "thinking",
+    "backup_enabled", "shell_mode", "computer_enabled", "browser_enabled", "model", "thinking", "plan_first",
 )
 
 
@@ -2469,7 +2637,7 @@ def restrictive_settings(model="deepseek-flash", thinking="high"):
     return {
         "allowed_dirs": [], "writable_dirs": [], "tools_enabled": False, "write_enabled": False,
         "delete_enabled": False, "confirm_edits": True, "backup_enabled": True, "shell_mode": "off",
-        "computer_enabled": False, "browser_enabled": False, "model": model, "thinking": thinking,
+        "computer_enabled": False, "browser_enabled": False, "model": model, "thinking": thinking, "plan_first": False,
     }
 
 
@@ -2481,8 +2649,8 @@ def clean_settings(s, fallback):
     dirs = [d for d in (s.get("allowed_dirs") or []) if isinstance(d, str)]
     out["allowed_dirs"] = dirs
     out["writable_dirs"] = [d for d in (s.get("writable_dirs") or []) if isinstance(d, str) and d in dirs]
-    for k in ("tools_enabled", "write_enabled", "delete_enabled", "computer_enabled", "browser_enabled"):
-        out[k] = bool(s.get(k, out[k]))
+    for k in ("tools_enabled", "write_enabled", "delete_enabled", "computer_enabled", "browser_enabled", "plan_first"):
+        out[k] = bool(s.get(k, out.get(k, False)))
     out["confirm_edits"] = s.get("confirm_edits", True) is not False
     out["backup_enabled"] = s.get("backup_enabled", True) is not False
     sm = s.get("shell_mode", "off")
@@ -3618,9 +3786,11 @@ class DeviceFilesDialog(QDialog):
         self.backup_box.setChecked(settings.get("backup_enabled", True) is not False)
         self.computer_box = QCheckBox("السماح بفتح البرامج والمواقع (فتح تطبيقات، فتح كروم والبحث)")
         self.computer_box.setChecked(bool(settings.get("computer_enabled")))
+        self.plan_box = QCheckBox("خطة قبل التنفيذ: يعرض لي خطته وأوافق عليها قبل أي تعديل أو أمر")
+        self.plan_box.setChecked(bool(settings.get("plan_first")))
         self.browser_box = QCheckBox("تفعيل المتصفح المدمج (يتصفّح ويبحث داخل البرنامج)")
         self.browser_box.setChecked(bool(settings.get("browser_enabled")))
-        for b in (self.enable_box, self.write_box, self.delete_box, self.backup_box, self.computer_box, self.browser_box):
+        for b in (self.enable_box, self.write_box, self.delete_box, self.backup_box, self.computer_box, self.browser_box, self.plan_box):
             lay.addWidget(b)
         prow = QHBoxLayout()
         prow.addWidget(QLabel("قالب جاهز:"))
@@ -3708,6 +3878,7 @@ class DeviceFilesDialog(QDialog):
         self.backup_box.setChecked(P[3])
         self.computer_box.setChecked(P[4])
         self.browser_box.setChecked(P[5])
+        self.plan_box.setChecked(P[0] and P[1] and k == "dev")
         self.approval_box.setCurrentIndex(P[6])
         self.shell_box.setCurrentIndex(P[7])
 
@@ -3783,9 +3954,384 @@ class DeviceFilesDialog(QDialog):
             "backup_enabled": self.backup_box.isChecked(),
             "computer_enabled": self.computer_box.isChecked(),
             "browser_enabled": self.browser_box.isChecked(),
+            "plan_first": self.plan_box.isChecked(),
             "allowed_dirs": dirs,
             "writable_dirs": writable,
         }
+
+
+def undo_entry(e):
+    """Reverse one journal entry. Returns (ok, message)."""
+    op = e.get("op")
+    name = ""
+    try:
+        path = e.get("path") or e.get("dst") or ""
+        if path and system_path_reason(path):
+            return False, "مسار محمي: " + path
+        name = os.path.basename(str(path).rstrip("\\/"))
+        if op == "restore":
+            snap = e.get("snap")
+            if not snap or not os.path.exists(snap):
+                return False, "النسخة القديمة غير موجودة: " + name
+            if os.path.isdir(snap):
+                if os.path.exists(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                shutil.copytree(snap, path)
+            else:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                shutil.copy2(snap, path)
+            return True, "رجّعت: " + name
+        if op == "remove":
+            if os.path.isfile(path):
+                os.remove(path)
+            return True, "حذفت الملف الجديد: " + name
+        if op == "rmdir":
+            if os.path.isdir(path):
+                os.rmdir(path)
+            return True, "حذفت المجلد الجديد: " + name
+        if op == "move_back":
+            src, dst = e.get("src"), e.get("dst")
+            if not os.path.exists(dst):
+                return False, "ما لقيت الملف في مكانه الجديد: " + os.path.basename(dst)
+            if os.path.exists(src):
+                return False, "المكان القديم صار مشغول: " + os.path.basename(src)
+            shutil.move(dst, src)
+            return True, "رجّعت إلى مكانه: " + os.path.basename(src)
+    except Exception as ex:
+        return False, "تعذّر (%s): %s" % (name, ex)
+    return False, "هذا التعديل ما ينعكس"
+
+
+def undo_label(e):
+    op = e.get("op")
+    n = os.path.basename(str(e.get("path") or e.get("dst") or "").rstrip("\\/"))
+    when = time.strftime("%H:%M", time.localtime(e.get("t", 0)))
+    txt = {
+        "restore": "↺ استرجاع النسخة السابقة من " + n,
+        "remove": "🗑 حذف الملف الجديد " + n,
+        "rmdir": "🗑 حذف المجلد الجديد " + n,
+        "move_back": "↩ إرجاع %s إلى مكانه" % os.path.basename(str(e.get("dst") or "")),
+        "noundo": "(ما ينعكس: ملف كبير أو غير محفوظ) " + n,
+    }.get(op, op)
+    return "%s   %s" % (when, txt)
+
+
+def build_problem_report(tb=""):
+    import platform
+
+    lines = ["5belan %s" % APP_VERSION, "OS: %s" % platform.platform(), "Python: %s" % sys.version.split()[0]]
+    try:
+        import PySide6
+
+        lines.append("PySide6: %s" % PySide6.__version__)
+    except Exception:
+        pass
+    if not tb:
+        try:
+            with open(ERROR_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                tb = f.read()[-3500:]
+        except Exception:
+            tb = "(no error.log)"
+    lines += ["", "--- error ---", tb.strip() or "(none)"]
+    try:
+        with open(EVENTS_LOG, "r", encoding="utf-8", errors="replace") as f:
+            lines += ["", "--- last events ---"] + f.read().splitlines()[-25:]
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+class ProblemDialog(QDialog):
+    def __init__(self, parent, report):
+        super().__init__(parent)
+        self.setWindowTitle("تقرير مشكلة")
+        self.resize(720, 520)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("هذا تقرير جاهز عن المشكلة (بدون محادثاتك أو مفتاحك). انسخه وأرسله للمطوّر:"))
+        self.box = QPlainTextEdit(report)
+        self.box.setReadOnly(True)
+        self.box.setLayoutDirection(Qt.LeftToRight)
+        lay.addWidget(self.box, 1)
+        row = QHBoxLayout()
+        b = QPushButton("📋 نسخ التقرير")
+        b.setObjectName("primary")
+        b.clicked.connect(lambda: (QApplication.clipboard().setText(report), b.setText("✓ تم النسخ")))
+        c = QPushButton("إغلاق")
+        c.clicked.connect(self.accept)
+        row.addWidget(b)
+        row.addWidget(c)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+
+class MemoryDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("🧠 ذاكرة خبيلان")
+        self.resize(600, 460)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "ملاحظات عنك يقرأها خبيلان في كل محادثة جديدة (سطر لكل معلومة). تقدر تعدّلها هنا،\n"
+            "أو تقول له بالمحادثة «تذكّر أني ...» أو «انسَ ...» فيحدّثها بنفسه."))
+        self.box = QPlainTextEdit(load_memory())
+        self.box.setPlaceholderText("- أسكن في عنيزة\n- أحب الردود المختصرة")
+        lay.addWidget(self.box, 1)
+        self.count = QLabel("")
+        lay.addWidget(self.count)
+        self.box.textChanged.connect(lambda: self.count.setText("%d / %d حرف" % (len(self.box.toPlainText()), MEMORY_MAX)))
+        self.box.textChanged.emit()
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("حفظ")
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("إلغاء")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def text(self):
+        return self.box.toPlainText()[:MEMORY_MAX]
+
+
+class UndoDialog(QDialog):
+    def __init__(self, parent, entries):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QListWidgetItem
+
+        self.setWindowTitle("↶ تراجع عن تعديلات خبيلان")
+        self.resize(620, 440)
+        self.entries = entries
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("علّم على اللي تبي ترجّعه (الأحدث فوق). الأوامر اللي شغّلها على الجهاز ما تنعكس."))
+        self.list = QListWidget()
+        for i in range(len(entries) - 1, -1, -1):
+            e = entries[i]
+            it = QListWidgetItem(undo_label(e))
+            it.setData(Qt.UserRole, i)
+            it.setToolTip(str(e.get("path") or e.get("dst") or ""))
+            if e.get("op") == "noundo":
+                it.setFlags(Qt.NoItemFlags)
+            else:
+                it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                it.setCheckState(Qt.CheckState.Unchecked)
+            self.list.addItem(it)
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        a = QPushButton("تحديد آخر 5")
+        a.clicked.connect(self.pick_recent)
+        row.addWidget(a)
+        row.addStretch(1)
+        lay.addLayout(row)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("تراجع عن المحدد")
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("إغلاق")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def pick_recent(self):
+        n = 0
+        for r in range(self.list.count()):
+            it = self.list.item(r)
+            if it.flags() & Qt.ItemIsUserCheckable and n < 5:
+                it.setCheckState(Qt.CheckState.Checked)
+                n += 1
+
+    def chosen(self):
+        return [self.list.item(r).data(Qt.UserRole) for r in range(self.list.count())
+                if (self.list.item(r).flags() & Qt.ItemIsUserCheckable) and self.list.item(r).checkState() == Qt.CheckState.Checked]
+
+
+def usage_stats(chats):
+    day, per = {}, []
+    for c in chats:
+        tot, n = 0.0, 0
+        for m in c.get("msgs", []):
+            co = m.get("cost")
+            if not co:
+                continue
+            t = co.get("t") or c.get("updated") or 0
+            d = time.strftime("%Y-%m-%d", time.localtime(t))
+            u = float(co.get("usd", 0))
+            day[d] = day.get(d, 0.0) + u
+            tot += u
+            n += 1
+        if n:
+            per.append((c.get("title", ""), tot, n))
+    per.sort(key=lambda x: -x[1])
+    return day, per
+
+
+class BarChart(QWidget):
+    def __init__(self, items):
+        super().__init__()
+        self.items = items
+        self.setMinimumHeight(190)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        mx = max([v for _l, v in self.items] + [1e-9])
+        n = max(1, len(self.items))
+        bw = (w - 20) / n
+        txt = self.palette().text().color()
+        acc = QColor("#d97757")
+        p.setPen(txt)
+        for i, (lab, v) in enumerate(self.items):
+            x = 10 + i * bw
+            bh = (h - 44) * (v / mx)
+            p.fillRect(QRectF(x + bw * 0.15, h - 24 - bh, bw * 0.7, bh), acc if v > 0 else QColor(128, 128, 128, 60))
+            p.drawText(QRectF(x, h - 22, bw, 18), Qt.AlignCenter, lab)
+            if v > 0:
+                p.drawText(QRectF(x - 6, h - 40 - bh, bw + 12, 16), Qt.AlignCenter, "%.3f" % v)
+
+
+class UsageDialog(QDialog):
+    def __init__(self, parent, chats):
+        super().__init__(parent)
+        self.setWindowTitle("📊 الاستهلاك والتكلفة")
+        self.resize(680, 620)
+        day, per = usage_stats(chats)
+        now = time.time()
+
+        def span(n):
+            return sum(v for d, v in day.items() if d >= time.strftime("%Y-%m-%d", time.localtime(now - (n - 1) * 86400)))
+
+        def money(u):
+            return "$%.3f  (%.2f ر.س)" % (u, u * USD_SAR)
+
+        lay = QVBoxLayout(self)
+        tot = sum(day.values())
+        lay.addWidget(QLabel("<b>اليوم:</b> %s<br><b>آخر 7 أيام:</b> %s<br><b>آخر 30 يوم:</b> %s<br><b>الكل:</b> %s" % (
+            money(span(1)), money(span(7)), money(span(30)), money(tot))))
+        items = []
+        for k in range(13, -1, -1):
+            t = now - k * 86400
+            items.append((time.strftime("%d", time.localtime(t)), day.get(time.strftime("%Y-%m-%d", time.localtime(t)), 0.0)))
+        lay.addWidget(QLabel("الصرف اليومي بالدولار (آخر 14 يوم):"))
+        lay.addWidget(BarChart(items))
+        lay.addWidget(QLabel("أغلى المحادثات:"))
+        lst = QListWidget()
+        for title, t, n in per[:12]:
+            lst.addItem("$%.3f   ·   %d ردود   ·   %s" % (t, n, title[:60]))
+        if not per:
+            lst.addItem("ما فيه بيانات بعد — تظهر التكلفة بعد أول رد في هذي النسخة.")
+        lay.addWidget(lst, 1)
+        lay.addWidget(QLabel("الأسعار من صفحة DeepSeek الرسمية وتقديرية؛ الرصيد الفعلي يظهر فوق."))
+        b = QPushButton("إغلاق")
+        b.clicked.connect(self.accept)
+        lay.addWidget(b)
+
+
+class ProjectsDialog(QDialog):
+    def __init__(self, parent, projects, start_dir):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QListWidgetItem
+
+        self.setWindowTitle("📁 المشاريع")
+        self.resize(760, 560)
+        self.projects = [dict(p, dirs=list(p.get("dirs") or [])) for p in projects]
+        self.start_dir = start_dir
+        self.cur = -1
+        lay = QHBoxLayout(self)
+        left = QVBoxLayout()
+        self.lst = QListWidget()
+        self.lst.currentRowChanged.connect(self.on_row)
+        left.addWidget(self.lst, 1)
+        b_new = QPushButton("＋ مشروع جديد")
+        b_new.clicked.connect(self.new_project)
+        b_del = QPushButton("حذف المشروع")
+        b_del.clicked.connect(self.del_project)
+        left.addWidget(b_new)
+        left.addWidget(b_del)
+        lay.addLayout(left, 1)
+        right = QVBoxLayout()
+        right.addWidget(QLabel("اسم المشروع:"))
+        self.name = QLineEdit()
+        right.addWidget(self.name)
+        right.addWidget(QLabel("تعليمات المشروع (يقرأها خبيلان في كل محادثة داخل المشروع):"))
+        self.instr = QPlainTextEdit()
+        right.addWidget(self.instr, 1)
+        right.addWidget(QLabel("مجلدات المشروع (تنفتح قراءة تلقائياً لأي محادثة جديدة فيه):"))
+        self.dirs = QListWidget()
+        self.dirs.setLayoutDirection(Qt.LeftToRight)
+        right.addWidget(self.dirs, 1)
+        row = QHBoxLayout()
+        a = QPushButton("إضافة مجلد...")
+        a.clicked.connect(self.add_dir)
+        r = QPushButton("إزالة")
+        r.clicked.connect(lambda: [self.dirs.takeItem(self.dirs.row(i)) for i in self.dirs.selectedItems()])
+        row.addWidget(a)
+        row.addWidget(r)
+        row.addStretch(1)
+        right.addLayout(row)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("حفظ")
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("إلغاء")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        right.addWidget(bb)
+        lay.addLayout(right, 2)
+        self.refill()
+
+    def refill(self, sel=0):
+        self.cur = -1
+        self.lst.blockSignals(True)
+        self.lst.clear()
+        for p in self.projects:
+            self.lst.addItem(p["name"])
+        self.lst.blockSignals(False)
+        if self.projects:
+            self.lst.setCurrentRow(min(sel, len(self.projects) - 1))
+            self.on_row(self.lst.currentRow())
+        else:
+            self.on_row(-1)
+
+    def save_form(self):
+        if 0 <= self.cur < len(self.projects):
+            p = self.projects[self.cur]
+            p["name"] = self.name.text().strip() or p["name"]
+            p["instructions"] = self.instr.toPlainText()
+            p["dirs"] = [self.dirs.item(i).text() for i in range(self.dirs.count())]
+            it = self.lst.item(self.cur)
+            if it is not None:
+                it.setText(p["name"])
+
+    def on_row(self, row):
+        self.save_form()
+        self.cur = row
+        on = 0 <= row < len(self.projects)
+        for w in (self.name, self.instr, self.dirs):
+            w.setEnabled(on)
+        self.name.setText(self.projects[row]["name"] if on else "")
+        self.instr.setPlainText(self.projects[row].get("instructions", "") if on else "")
+        self.dirs.clear()
+        if on:
+            for d in self.projects[row].get("dirs") or []:
+                self.dirs.addItem(d)
+
+    def new_project(self):
+        self.save_form()
+        self.projects.append({"id": uuid.uuid4().hex[:10], "name": "مشروع جديد", "instructions": "", "dirs": []})
+        self.refill(len(self.projects) - 1)
+        self.name.setFocus()
+        self.name.selectAll()
+
+    def del_project(self):
+        if 0 <= self.cur < len(self.projects):
+            del self.projects[self.cur]
+            self.cur = -1
+            self.refill(0)
+
+    def add_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "اختر مجلد", self.start_dir)
+        if d:
+            d = os.path.normpath(d)
+            if d not in [self.dirs.item(i).text() for i in range(self.dirs.count())]:
+                self.dirs.addItem(d)
+
+    def result_projects(self):
+        self.save_form()
+        return self.projects
 
 
 def clean_reply(text):
@@ -3965,6 +4511,7 @@ class App(QMainWindow):
         self.order = []
         self.view_chats = []
         self.drafts = {}
+        self.plan_first = False
         cfg = load_json(CONFIG_PATH, {})
         self.cfg = cfg if isinstance(cfg, dict) else {}
         cfg = self.cfg
@@ -4003,6 +4550,19 @@ class App(QMainWindow):
         b_new.clicked.connect(self.new_chat)
         b_new.setToolTip("Ctrl+N")
         sl.addWidget(b_new)
+        prow_ = QHBoxLayout()
+        prow_.setSpacing(4)
+        self.proj_box = QComboBox()
+        self.proj_box.setToolTip("المشروع: يجمع محادثات مع تعليمات ومجلدات ثابتة")
+        self.proj_box.setLayoutDirection(Qt.RightToLeft)
+        prow_.addWidget(self.proj_box, 1)
+        b_proj = QToolButton()
+        b_proj.setObjectName("iconbtn")
+        b_proj.setText("📁")
+        b_proj.setToolTip("إدارة المشاريع")
+        b_proj.clicked.connect(self.manage_projects)
+        prow_.addWidget(b_proj)
+        sl.addLayout(prow_)
         srow = QHBoxLayout()
         srow.setSpacing(4)
         self.search_edit = QLineEdit()
@@ -4036,6 +4596,20 @@ class App(QMainWindow):
         bottom.addWidget(self.settings_btn)
         bottom.addStretch(1)
         sl.addLayout(bottom)
+        bottom2 = QHBoxLayout()
+        bottom2.setSpacing(2)
+        for txt, tip, fn in (("🧠 ذاكرة", "ملاحظات عنك يقرأها خبيلان بكل محادثة", self.open_memory),
+                             ("📊 صرف", "كم صرفت: اليوم، الأسبوع، وأغلى المحادثات", self.open_usage),
+                             ("🛠 مشكلة", "تقرير جاهز للنسخ لو صار خطأ", self.open_problem)):
+            b = QToolButton()
+            b.setObjectName("iconbtn")
+            b.setText(txt)
+            b.setToolTip(tip)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet("QToolButton { padding: 4px 3px; }")
+            b.clicked.connect(fn)
+            bottom2.addWidget(b, 1)
+        sl.addLayout(bottom2)
         side.setMinimumWidth(230)
         side.setMaximumWidth(360)
         splitter.addWidget(side)
@@ -4096,6 +4670,10 @@ class App(QMainWindow):
         self.chat_settings_btn = icon_btn("🎛 إعدادات المحادثة", "إعدادات هذي المحادثة فقط: الصلاحيات، الملفات، الأوامر")
         self.chat_settings_btn.clicked.connect(self.open_tools_dialog)
         hl.addWidget(self.chat_settings_btn)
+        self.undo_btn = icon_btn("↶ تراجع", "تراجع عن تعديلات الملفات اللي سواها خبيلان في هذي المحادثة")
+        self.undo_btn.clicked.connect(self.open_undo)
+        self.undo_btn.setVisible(False)
+        hl.addWidget(self.undo_btn)
         header.setFixedHeight(52)  # constant height: showing/hiding the reply button must never move the chat text
         ml.addWidget(header)
 
@@ -4252,6 +4830,14 @@ class App(QMainWindow):
                          ("Ctrl+L", lambda: self.inp.setFocus()), ("Ctrl+Shift+C", self.copy_last_reply),
                          ("Esc", self.esc_pressed)):
             QShortcut(QKeySequence(keys), self, activated=fn)
+        self.peak_label = QLabel("")
+        self.statusBar().addPermanentWidget(self.peak_label)
+        self.peak_timer = QTimer(self)
+        self.peak_timer.timeout.connect(self.update_peak)
+        self.peak_timer.start(60000)
+        self.update_peak()
+        self.refresh_projects()
+        self.proj_box.currentIndexChanged.connect(self.on_project_changed)
         self.inp.setFocus()
 
     # ---------- reply to a part of a message ----------
@@ -4580,6 +5166,7 @@ class App(QMainWindow):
         self.shell_mode = s["shell_mode"]
         self.computer_enabled = s["computer_enabled"]
         self.browser_enabled = s["browser_enabled"]
+        self.plan_first = s.get("plan_first", False)
         return s
 
     def collect_settings(self):
@@ -4590,6 +5177,7 @@ class App(QMainWindow):
             "backup_enabled": self.backup_enabled, "shell_mode": self.shell_mode,
             "computer_enabled": self.computer_enabled, "browser_enabled": self.browser_enabled,
             "model": self.model_box.currentText(), "thinking": self.think_box.currentText(),
+            "plan_first": bool(getattr(self, "plan_first", False)),
         }
 
     def chat_settings(self, chat):
@@ -4800,6 +5388,10 @@ class App(QMainWindow):
         m.addAction("📌  إلغاء التثبيت" if c_.get("pinned") else "📌  تثبيت في الأعلى", lambda: self.toggle_flag("pinned"))
         m.addAction("🗄  إلغاء الأرشفة" if c_.get("archived") else "🗄  أرشفة (إخفاء بدون حذف)", lambda: self.toggle_flag("archived"))
         m.addAction("✏  إعادة تسمية", self.rename_chat)
+        pm_ = m.addMenu("📁  نقل إلى مشروع")
+        pm_.addAction("بدون مشروع", lambda: self.move_to_project(""))
+        for p_ in self.cfg.get("projects") or []:
+            pm_.addAction(p_["name"], lambda pid=p_["id"]: self.move_to_project(pid))
         m.addSeparator()
         m.addAction("📤  تصدير Markdown", lambda: self.export_chat("md"))
         m.addAction("📄  تصدير PDF", lambda: self.export_chat("pdf"))
@@ -5216,6 +5808,8 @@ class App(QMainWindow):
                     "renamed": bool(c.get("renamed")),
                     "auto_titled": bool(c.get("auto_titled")),
                     "pinned": bool(c.get("pinned")),
+                    "project": c.get("project") or "",
+                    "journal": (c.get("journal") or [])[-300:],
                     "archived": bool(c.get("archived")),
                     "msgs": [strip_for_save(m) for m in c["msgs"]],
                 }
@@ -5243,13 +5837,17 @@ class App(QMainWindow):
         self.chats.sort(key=lambda c: (not c.get("pinned"), -c.get("updated", 0)))
         q = self.search_edit.text().strip().lower()
         show_arch = self.arch_btn.isChecked()
+        sel = self.proj_box.currentData() if hasattr(self, "proj_box") and self.proj_box.count() else "*"
         self.view_chats = [c for c in self.chats
-                           if (show_arch or not c.get("archived")) and (not q or self._chat_matches(c, q))]
+                           if (show_arch or not c.get("archived")) and (sel == "*" or (c.get("project") or "") == sel)
+                           and (not q or self._chat_matches(c, q))]
         self.order = [c["id"] for c in self.view_chats]
         self.listw.blockSignals(True)
         self.listw.clear()
         for c in self.view_chats:
-            self.listw.addItem(("📌 " if c.get("pinned") else "") + ("🗄 " if c.get("archived") else "") + c["title"])
+            pj = self.get_project(c.get("project"))
+            self.listw.addItem(("📌 " if c.get("pinned") else "") + ("🗄 " if c.get("archived") else "") + c["title"]
+                               + (("   ‹%s›" % pj["name"]) if pj and sel == "*" else ""))
         if self.current and self.current["id"] in self.order:
             self.listw.setCurrentRow(self.order.index(self.current["id"]))
         else:
@@ -5309,6 +5907,7 @@ class App(QMainWindow):
             self.show_files(last_reply)
         self.refresh_files_panel()
         self.update_cost_tip()
+        self.undo_btn.setVisible(bool(self.current and self.current.get("journal")))
         if keep_scroll:
             sb.setValue(keep)
         else:
@@ -5679,10 +6278,123 @@ class App(QMainWindow):
         self._stash_draft()
         self.current = None
         self._restore_draft()
-        self.apply_settings(restrictive_settings(self.def_model, self.def_think))
+        self.apply_project_defaults()
         self.refresh_list()
         self.render_chat()
         self.inp.setFocus()
+
+    # ---------- projects, memory, usage, undo, peak, problem report ----------
+    def get_project(self, pid):
+        if not pid:
+            return None
+        for p in self.cfg.get("projects") or []:
+            if p.get("id") == pid:
+                return p
+        return None
+
+    def selected_project_id(self):
+        d = self.proj_box.currentData()
+        return d if d not in (None, "*", "") else ""
+
+    def refresh_projects(self):
+        cur = self.proj_box.currentData() if self.proj_box.count() else "*"
+        self.proj_box.blockSignals(True)
+        self.proj_box.clear()
+        self.proj_box.addItem("كل المحادثات", "*")
+        self.proj_box.addItem("بدون مشروع", "")
+        for p in self.cfg.get("projects") or []:
+            self.proj_box.addItem("📁 " + p["name"], p["id"])
+        i = self.proj_box.findData(cur)
+        self.proj_box.setCurrentIndex(i if i >= 0 else 0)
+        self.proj_box.blockSignals(False)
+
+    def on_project_changed(self, _i=None):
+        self.refresh_list()
+        if self.current is None:
+            self.apply_project_defaults()
+
+    def apply_project_defaults(self):
+        proj = self.get_project(self.selected_project_id())
+        base = restrictive_settings(self.def_model, self.def_think)
+        dirs = [d for d in (proj.get("dirs") or []) if os.path.isdir(d)] if proj else []
+        if dirs:
+            base["allowed_dirs"] = dirs
+            base["tools_enabled"] = True
+        self.apply_settings(base)
+
+    def manage_projects(self):
+        dlg = ProjectsDialog(self, self.cfg.get("projects") or [], self.default_dir())
+        if not dlg.exec():
+            return
+        self.cfg["projects"] = dlg.result_projects()
+        self.save_cfg()
+        self.refresh_projects()
+        self.refresh_list()
+
+    def move_to_project(self, pid):
+        if not self.current:
+            return
+        self.current["project"] = pid
+        self.persist()
+        self.refresh_list()
+
+    def open_memory(self):
+        dlg = MemoryDialog(self)
+        if dlg.exec():
+            save_memory(dlg.text())
+            self.statusBar().showMessage("انحفظت الذاكرة", 2500)
+
+    def open_usage(self):
+        UsageDialog(self, self.chats).exec()
+
+    def open_problem(self):
+        ProblemDialog(self, build_problem_report()).exec()
+
+    def open_undo(self):
+        if self.busy or not self.current:
+            return
+        j = self.current.get("journal") or []
+        if not j:
+            QMessageBox.information(self, "تراجع", "ما فيه تعديلات محفوظة في هذي المحادثة.")
+            return
+        dlg = UndoDialog(self, j)
+        if not dlg.exec():
+            return
+        idxs = sorted(dlg.chosen(), reverse=True)
+        if not idxs:
+            return
+        msgs, done = [], []
+        for i in idxs:
+            ok, m = undo_entry(j[i])
+            msgs.append(("✓ " if ok else "✗ ") + m)
+            if ok:
+                done.append(i)
+        for i in done:
+            snap = j[i].get("snap")
+            if snap and j[i].get("op") == "restore":
+                try:
+                    shutil.rmtree(snap) if os.path.isdir(snap) else os.remove(snap)
+                except Exception:
+                    pass
+            del j[i]
+        self.persist()
+        self.undo_btn.setVisible(bool(j))
+        QMessageBox.information(self, "تراجع", "\n".join(msgs[:30]))
+
+    def next_offpeak(self):
+        t = time.time()
+        for _ in range(160):
+            if not is_peak(t):
+                return time.strftime("%H:%M", time.localtime(t))
+            t += 600
+        return ""
+
+    def update_peak(self):
+        if is_peak():
+            self.peak_label.setText("⏱ وقت الذروة: التكلفة ضعف العادي — يرخص بعد %s" % self.next_offpeak())
+            self.peak_label.setToolTip("DeepSeek تضاعف السعر في ساعات الذروة (الاثنين–الجمعة 01–04 و06–10 UTC). المهام الكبيرة الأفضل خارجها.")
+        else:
+            self.peak_label.setText("")
 
     # ---------- drafts, regenerate, edit, pin, archive, export ----------
     def _stash_draft(self):
@@ -6085,7 +6797,7 @@ class App(QMainWindow):
         if self.current is None:
             title = text.replace("\n", " ")[:40] if text else (names[0] if names else (quotes[0]["q"].replace("\n", " ")[:40] if quotes else "محادثة جديدة"))
             self.current = {"id": uuid.uuid4().hex, "title": title or "محادثة جديدة", "updated": time.time(), "msgs": [],
-                            "settings": self.collect_settings()}
+                            "settings": self.collect_settings(), "project": self.selected_project_id()}
             self.chats.append(self.current)
         else:
             self.current["settings"] = self.collect_settings()
@@ -6148,9 +6860,14 @@ class App(QMainWindow):
                 shell_mode=shell_mode,
                 allow_computer=allow_computer,
                 browser=self.browser_bridge if use_browser else None,
+                plan_first=bool(self.plan_first),
             )
             runner.stop_event = self.stop_event
-        system = SYSTEM_PROMPT + (tools_prompt(runner) if runner else "")
+            runner.undo_dir = os.path.join(self.chat_dir(), "undo")
+        system = SYSTEM_PROMPT + "\n" + memory_prompt() + (tools_prompt(runner) if runner else "")
+        proj = self.get_project(self.current.get("project"))
+        if proj and proj.get("instructions", "").strip():
+            system += "\nPROJECT «%s» — instructions from the user for this project:\n%s" % (proj["name"], proj["instructions"].strip()[:6000])
         api_msgs = [{"role": "system", "content": system}]
         for m in self.current["msgs"]:
             item = {"role": m["role"], "content": m["content"]}
@@ -6367,6 +7084,11 @@ class App(QMainWindow):
 
     def report_changes(self, runner):
         """Announce (once) the files the model changed on disk during this reply."""
+        if runner is not None:
+            n_ = getattr(runner, "_jsent", 0)
+            if len(runner.journal) > n_:
+                self.q.put(("journal", runner.journal[n_:]))
+                runner._jsent = len(runner.journal)
         if not runner or not runner.changes:
             return
         shown = getattr(runner, "_shown", None)
@@ -6583,6 +7305,13 @@ class App(QMainWindow):
                         ("\nآخر تغيّر: %+.4f" % d_) if d_ is not None else ""))
                 else:
                     self.balance_btn.setText("💰 " + str(val))
+            elif kind == "journal":
+                if self.current is not None:
+                    j_ = self.current.setdefault("journal", [])
+                    j_.extend(val)
+                    if len(j_) > 300:
+                        del j_[:len(j_) - 300]
+                    self.undo_btn.setVisible(True)
             elif kind == "usage":
                 if L is not None:
                     try:
@@ -6596,9 +7325,12 @@ class App(QMainWindow):
                         pass
             elif kind == "done":
                 content, reasoning = val
+                content, mem_msgs = apply_memory_marks(content)
+                for mm in mem_msgs:
+                    self.statusBar().showMessage(mm, 5000)
                 msg = {"role": "assistant", "content": content, "reasoning": reasoning}
                 if L is not None and L.get("cost"):
-                    msg["cost"] = L["cost"]
+                    msg["cost"] = dict(L["cost"], t=time.time())
                 if L is not None and L["steps"]:
                     msg["activity"] = L["steps"]
                 if L is not None and L.get("t0"):
@@ -6771,9 +7503,12 @@ def main():
         except Exception:
             pass
         try:
-            QMessageBox.critical(None, "5belan", "حصل خطأ غير متوقع (انحفظ في error.log):\n\n" + str(exc))
+            ProblemDialog(None, build_problem_report(text)).exec()
         except Exception:
-            pass
+            try:
+                QMessageBox.critical(None, "5belan", "حصل خطأ غير متوقع (انحفظ في error.log):\n\n" + str(exc))
+            except Exception:
+                pass
 
     sys.excepthook = hook
     win = App()
