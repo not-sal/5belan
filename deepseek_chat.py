@@ -2772,7 +2772,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.9.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -2956,13 +2956,19 @@ def apply_update(m, progress=None):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def restart_app():
+TMP_KEY = ""  # the API key handed over by the previous process when the app restarts itself after an update
+
+
+def restart_app(key=""):
     guard = os.path.join(BASE_DIR, "guard.py")
     args = [sys.executable] + ([guard, "deepseek_chat.py"] if os.path.exists(guard) else [os.path.join(BASE_DIR, "deepseek_chat.py")])
     flags = 0
     if os.name == "nt":
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-    subprocess.Popen(args, cwd=BASE_DIR, creationflags=flags, close_fds=True)
+    env = dict(os.environ)
+    if key:
+        env["BELAN_TMP_KEY"] = key  # survives the restart even if "remember the key" is off; never written to disk
+    subprocess.Popen(args, cwd=BASE_DIR, creationflags=flags, close_fds=True, env=env)
 
 
 class PasteEdit(QPlainTextEdit):
@@ -5015,10 +5021,13 @@ class App(QMainWindow):
         self.setAcceptDrops(True)
 
         # hidden storage widgets: the API key lives here so the rest of the code can keep reading it
-        self.key_edit = QLineEdit(cfg.get("api_key", ""))
+        self.key_edit = QLineEdit(cfg.get("api_key", "") or TMP_KEY)
         self.key_edit.setEchoMode(QLineEdit.Password)
         self.remember_box = QCheckBox()
-        self.remember_box.setChecked(bool(cfg.get("api_key")))
+        self.remember_box.setChecked(cfg.get("remember_key", True) is not False)  # remembered unless the user turned it off
+        if self.remember_box.isChecked() and self.key_edit.text().strip() and not cfg.get("api_key"):
+            cfg["api_key"] = self.key_edit.text().strip()
+            QTimer.singleShot(0, self.save_cfg)
 
         self.splitter = splitter = QSplitter(Qt.Horizontal)
         self.setCentralWidget(splitter)
@@ -5725,6 +5734,7 @@ class App(QMainWindow):
             self.cfg["api_key"] = v["key"]
         else:
             self.cfg.pop("api_key", None)
+        self.cfg["remember_key"] = bool(v["remember"])
         self.cfg["update_url"] = v["update_url"]
         self.cfg["chat_width"] = v["width"]
         self.apply_width()
@@ -8038,7 +8048,10 @@ class App(QMainWindow):
                 self.persist()
                 QMessageBox.information(self, "التحديث", "تم التحديث ✓ سيُعاد تشغيل البرنامج الحين.")
                 try:
-                    restart_app()
+                    if self.remember_box.isChecked() and self.key_edit.text().strip():
+                        self.cfg["api_key"] = self.key_edit.text().strip()
+                        self.save_cfg()
+                    restart_app(self.key_edit.text().strip())
                 except Exception as e:
                     QMessageBox.warning(self, "التحديث", "افتح البرنامج يدويًا: %s" % e)
                     return
@@ -8258,6 +8271,8 @@ def main():
         import PySide6.QtWebEngineWidgets  # noqa: F401  (must be imported before the QApplication exists)
     except Exception:
         pass
+    global TMP_KEY
+    TMP_KEY = os.environ.pop("BELAN_TMP_KEY", "")  # take it out of the environment so commands never see it
     migrate_user_data()
     setup_crash_tools()
     app = QApplication(sys.argv)
