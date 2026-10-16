@@ -2773,7 +2773,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.12.1"
+APP_VERSION = "2.12.2"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5588,8 +5588,15 @@ class App(QMainWindow):
         self.dock = QSplitter(Qt.Horizontal)
         self.dock.setChildrenCollapsible(False)
         self.docks = {}
-        splitter.addWidget(self.dock)
-        splitter.addWidget(main)
+        # the dock must sit on the physical LEFT of the chat. In a right-to-left window the first widget is the
+        # rightmost one, so the order depends on the layout direction.
+        self._rtl = QApplication.layoutDirection() == Qt.RightToLeft
+        if self._rtl:
+            splitter.addWidget(main)
+            splitter.addWidget(self.dock)
+        else:
+            splitter.addWidget(self.dock)
+            splitter.addWidget(main)
         self.files_panel = QWidget()
         self.files_panel.setObjectName("filespanel")
         fpl = QVBoxLayout(self.files_panel)
@@ -5610,9 +5617,9 @@ class App(QMainWindow):
         self.dock.addWidget(self.files_dock)
         self.dock.setVisible(False)
         splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 0)
-        splitter.setStretchFactor(2, 1)
-        splitter.setSizes([260, 0, 940])
+        splitter.setStretchFactor(1, 1 if self._rtl else 0)
+        splitter.setStretchFactor(2, 0 if self._rtl else 1)
+        self.set_split(260, 0, 940)
 
         self.apply_settings(restrictive_settings(self.def_model, self.def_think))
         self.model_box.currentTextChanged.connect(lambda _=None: self.store_settings())
@@ -5803,6 +5810,13 @@ class App(QMainWindow):
             self.refresh_files_panel()
         self.relayout()
 
+    def set_split(self, side, dock_w, main_w):
+        self.splitter.setSizes([side, main_w, dock_w] if self._rtl else [side, dock_w, main_w])
+
+    def side_width(self):
+        cur = self.splitter.sizes()
+        return cur[0] if cur and cur[0] > 150 else 260
+
     def relayout(self):
         total = max(self.splitter.width(), 1000)
         cur = self.splitter.sizes()
@@ -5812,7 +5826,7 @@ class App(QMainWindow):
         self.dock.setVisible(bool(vis))
         want = sum(f.want_width for f in vis)
         dw = min(want, max(300, int(total * 0.7 - side))) if vis else 0
-        self.splitter.setSizes([side, dw, max(320, total - side - dw)])
+        self.set_split(side, dw, max(320, total - side - dw))
         if vis:
             self.dock.setSizes([max(300, int(f.want_width * dw / max(want, 1))) if not f.isHidden() else 0 for f in frames])
 
