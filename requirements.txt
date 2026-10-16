@@ -1,0 +1,8 @@
+PySide6-Essentials
+PySide6-Addons
+pypdf
+python-docx
+openpyxl
+matplotlib
+arabic-reshaper
+python-bidi
