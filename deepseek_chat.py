@@ -31,8 +31,51 @@ DETACH_HINT = ("launch it detached with Start-Process -WindowStyle Hidden (never
                "launch it detached with: nohup <command> > /tmp/app.log 2>&1 & (never run it in the foreground), then check it with a separate short command. ")
 API_URL = "https://api.deepseek.com/chat/completions"
 BALANCE_URL = "https://api.deepseek.com/user/balance"
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-CHATS_PATH = os.path.join(BASE_DIR, "chats.json")
+
+
+def _default_data_dir():
+    """Where the user's chats, settings and files live. It is separate from the program folder, so installing or
+    updating the program never loses them (set BELAN_DATA_DIR to move it)."""
+    env = os.environ.get("BELAN_DATA_DIR")
+    if env:
+        return env
+    if os.name == "nt":
+        return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "5belan")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/5belan")
+    return os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "5belan")
+
+
+DATA_DIR = _default_data_dir()
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+CHATS_PATH = os.path.join(DATA_DIR, "chats.json")
+
+
+def migrate_user_data():
+    """First start with the data folder: bring in the chats of any earlier install (same folder, or the old dev folder)."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        if os.path.exists(CHATS_PATH):
+            return None
+        home = os.path.expanduser("~")
+        cands = [BASE_DIR, os.path.join(home, "Desktop", "deep"), os.path.join(home, "OneDrive", "Desktop", "deep"),
+                 os.path.join(home, "Documents", "deep")]
+        for d in cands:
+            if os.path.abspath(d) == os.path.abspath(DATA_DIR):
+                continue
+            src = os.path.join(d, "chats.json")
+            if os.path.exists(src) and os.path.getsize(src) > 2:
+                shutil.copy2(src, CHATS_PATH)
+                old_cfg = os.path.join(d, "config.json")
+                if os.path.exists(old_cfg) and not os.path.exists(CONFIG_PATH):
+                    shutil.copy2(old_cfg, CONFIG_PATH)
+                old_files = os.path.join(d, "files")
+                if os.path.isdir(old_files):
+                    shutil.copytree(old_files, os.path.join(DATA_DIR, "files"), dirs_exist_ok=True)
+                return d
+    except Exception:
+        pass
+    return None
 CRASH_LOG = os.path.join(BASE_DIR, "crash.log")
 STATE_PATH = os.path.join(BASE_DIR, "run_state.json")
 RESUME_PATH = os.path.join(BASE_DIR, "resume.json")
@@ -845,6 +888,8 @@ def strip_for_save(msg):
         out["files"] = msg["files"]
     if msg.get("reasoning"):
         out["reasoning"] = str(msg["reasoning"])[:30000]
+    if msg.get("dur"):
+        out["dur"] = msg["dur"]
     if msg.get("activity"):
         # keep the file small: only the last steps, each shortened (full logs were making chats.json huge)
         out["activity"] = [dict(s, text=str(s.get("text", ""))[:3000]) for s in msg["activity"][-60:]]
@@ -2096,8 +2141,11 @@ from PySide6.QtGui import (
     QTextCharFormat,
     QTextCursor,
     QTextDocument,
+    QTextFrameFormat,
     QTextImageFormat,
+    QTextLength,
     QTextOption,
+    QTextTableFormat,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -2298,7 +2346,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -2532,11 +2580,17 @@ class ChatView(QTextBrowser):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
     def resizeEvent(self, e):
-        m = max(14, (e.size().width() - self.MAXW) // 2)
-        if getattr(self, "_m", None) != m:
-            self._m = m
-            self.setViewportMargins(m, 6, m, 6)
-        super().resizeEvent(e)  # after the margins, so the text is laid out for the final width
+        # always use the widget's own width (not the event size, which can be the viewport's) and never re-enter
+        if not getattr(self, "_in_resize", False):
+            self._in_resize = True
+            try:
+                m = max(14, (self.width() - self.MAXW) // 2)
+                if getattr(self, "_m", None) != m:
+                    self._m = m
+                    self.setViewportMargins(m, 6, m, 6)
+            finally:
+                self._in_resize = False
+        super().resizeEvent(e)
 
 
 class FilePreviewDialog(QDialog):
@@ -2630,6 +2684,7 @@ class AppSettingsDialog(QDialog):
         self.setWindowTitle("الإعدادات")
         self.resize(560, 420)
         self.check_requested = False
+        self.import_requested = False
         lay = QVBoxLayout(self)
         h = QLabel("الحساب")
         h.setObjectName("h2")
@@ -2666,6 +2721,15 @@ class AppSettingsDialog(QDialog):
         row.addWidget(self.ver_label, 1)
         row.addWidget(b)
         lay.addLayout(row)
+        h4 = QLabel("المحادثات")
+        h4.setObjectName("h2")
+        lay.addWidget(h4)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("محادثاتك محفوظة في: " + DATA_DIR), 1)
+        b2 = QPushButton("استيراد محادثات من ملف…")
+        b2.clicked.connect(self._import)
+        row2.addWidget(b2)
+        lay.addLayout(row2)
         lay.addStretch(1)
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         box.button(QDialogButtonBox.StandardButton.Ok).setText("حفظ")
@@ -2673,6 +2737,10 @@ class AppSettingsDialog(QDialog):
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
         lay.addWidget(box)
+
+    def _import(self):
+        self.import_requested = True
+        self.accept()
 
     def _check(self):
         self.check_requested = True
@@ -3344,7 +3412,7 @@ class App(QMainWindow):
     # ---------- files panel (everything sent in this chat, on the side) ----------
     def chat_dir(self, chat=None):
         chat = chat or self.current
-        return os.path.join(BASE_DIR, "files", chat["id"]) if chat else None
+        return os.path.join(DATA_DIR, "files", chat["id"]) if chat else None
 
     def gather_files(self):
         out = []
@@ -3618,6 +3686,40 @@ class App(QMainWindow):
         self.refresh_balance()
         if dlg.check_requested:
             self.check_updates(silent=False)
+        if dlg.import_requested:
+            self.import_chats()
+
+    def import_chats(self):
+        """Merge the chats of another chats.json (an older install or a backup) into this one."""
+        if self.busy:
+            QMessageBox.information(self, "استيراد", "انتظر حتى ينتهي الرد الحالي.")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "اختر ملف chats.json", self.default_dir(), "chats (*.json);;كل الملفات (*.*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError("الملف ليس ملف محادثات")
+            have = {c["id"] for c in self.chats}
+            added = 0
+            src_files = os.path.join(os.path.dirname(path), "files")
+            for c in data:
+                if isinstance(c, dict) and c.get("id") and c.get("msgs") is not None and c["id"] not in have:
+                    c.setdefault("title", "محادثة")
+                    c.setdefault("updated", time.time())
+                    self.chats.append(c)
+                    have.add(c["id"])
+                    added += 1
+                    sub = os.path.join(src_files, c["id"])
+                    if os.path.isdir(sub):
+                        shutil.copytree(sub, os.path.join(DATA_DIR, "files", c["id"]), dirs_exist_ok=True)
+            self.persist()
+            self.refresh_list()
+            QMessageBox.information(self, "استيراد", "تم استيراد %d محادثة جديدة ✓" % added)
+        except Exception as e:
+            QMessageBox.warning(self, "استيراد", "تعذّر الاستيراد:\n%s" % e)
 
     # ---------- updates ----------
     def check_updates(self, silent=True):
@@ -4118,7 +4220,7 @@ class App(QMainWindow):
                 steps = m.get("activity")
                 if not steps and m.get("reasoning"):
                     steps = [{"k": "think", "text": m["reasoning"]}]  # chats saved before the Thinking block existed
-                self.render_reply(steps or [], clean_reply(m["content"]), "m%d" % i, False, ())
+                self.render_reply(steps or [], clean_reply(m["content"]), "m%d" % i, False, (), m.get("dur"))
                 self.add_divider()
                 last_reply = m["content"]
         if self.busy and self.live is not None:
@@ -4160,7 +4262,15 @@ class App(QMainWindow):
         bf.setTopMargin(10)
         c.insertBlock(bf, QTextCharFormat())
 
-    def render_reply(self, steps, body, act_id, live, warns):
+    @staticmethod
+    def fmt_dur(sec):
+        sec = int(sec or 0)
+        if sec <= 0:
+            return ""
+        m, r = divmod(sec, 60)
+        return ("%dد %dث" % (m, r)) if m else ("%dث" % r)
+
+    def render_reply(self, steps, body, act_id, live, warns, dur=None):
         """Write one reply at the end of the view: Thinking line, optional details, then the answer.
 
         steps: list of {"k": think|say|tool|note, ...}; details are grouped under a heading per kind of work.
@@ -4170,23 +4280,27 @@ class App(QMainWindow):
         show_head = bool(steps) or (live and not body)
         c = self._end_cursor()
         if show_head:
+            if live and self.live is not None and self.live.get("t0"):
+                dur = time.time() - self.live["t0"]
+            ds = self.fmt_dur(dur)
             if not steps:
-                c.insertText("◌ جاري التفكير…", self.fmt["dim"])
+                c.insertText("✻ جاري التفكير…" + ((" · " + ds) if ds else ""), self.fmt["dim"])
             else:
-                base = ("جاري العمل…" if live else "التفكير") + (" • %d عملية" % ops if ops else "")
+                base = "✻ " + ("جاري العمل…" if live else "التفكير") + ((" · " + ds) if ds else "") + (" · %d عملية" % ops if ops else "")
                 f = QTextCharFormat()
                 f.setAnchor(True)
                 f.setAnchorHref("act:" + act_id)
                 f.setForeground(QColor("#8a8a8a"))
                 f.setFontUnderline(False)
                 f.setFontWeight(QFont.Weight.Bold)
-                c.insertText(("▾ " if expanded else "◂ ") + base, f)
+                c.insertText(base + "  " + ("˅" if expanded else "‹"), f)
             if expanded and steps:
                 shown_steps = steps
                 if live and len(steps) > LIVE_DETAIL_STEPS:
                     hidden = len(steps) - LIVE_DETAIL_STEPS
                     shown_steps = [{"k": "note", "text": "... %d earlier steps hidden while it is running; the full list appears when it finishes" % hidden}] + steps[-LIVE_DETAIL_STEPS:]
                 self._render_details(c, shown_steps, act_id)
+                c = self._end_cursor()
             c.insertBlock(QTextBlockFormat(), QTextCharFormat())
         for w in warns:
             c.insertText("[" + w + "]\n", self.fmt["file"])
@@ -4196,12 +4310,12 @@ class App(QMainWindow):
                 self._insert_reply_copy(c, act_id, body)
 
     def _render_details(self, c, steps, act_id="x"):
-        """The thinking outline: only the titles by default; click a title to open its details,
-        and every opened part has a fold link at its end so it can be closed from where you are."""
+        """The thinking outline in a bordered box: one row per main topic (title + chevron). Click a row to open it;
+        sub topics are nested inside, and every opened topic has a fold link at its end."""
         tree = build_activity_tree(steps)
         opened = self.open_secs
-        shade = QColor(128, 128, 128, 30)
         small = max(8, TEXT_FONT_SIZE - 2)
+        line = QColor(128, 128, 128, 110)
 
         def sized(base, bold=False, delta=0):
             f = QTextCharFormat(base)
@@ -4212,77 +4326,81 @@ class App(QMainWindow):
                 f.setFontWeight(QFont.Weight.Bold)
             return f
 
-        head_fmts = [sized(self.fmt["head"], True, 1), sized(self.fmt["head"], True, 0), sized(self.fmt["head"], False, 0)]
+        head_fmts = [sized(self.fmt["head"], False, 1), sized(self.fmt["head"], True, 0), sized(self.fmt["head"], False, 0)]
         think_f = sized(self.fmt["think"])
         bot_f = sized(self.fmt["bot"])
         err_f = sized(self.fmt["err"])
         dim_f = sized(self.fmt["dim"])
-        end_f = QTextCharFormat(dim_f)
 
         def ops_of(n):
             return sum(1 for it in n["items"] if it.get("k") == "tool") + sum(ops_of(s) for s in n["subs"])
 
-        def draw(node, path, depth):
+        def blk(depth, top=2):
+            b = QTextBlockFormat()
+            b.setLeftMargin(depth * 16)
+            b.setTopMargin(top)
+            b.setBottomMargin(0)
+            return b
+
+        def fill(cc, node, path, depth, first):
             sec_id = "%s:%s" % (act_id, path)
             is_open = sec_id in opened
-            bh = QTextBlockFormat()
-            bh.setBackground(shade)
-            bh.setLeftMargin(8 + depth * 18)
-            bh.setRightMargin(8)
-            bh.setTopMargin(5 if depth == 0 else 1)
-            bh.setBottomMargin(0)
-            c.insertBlock(bh, QTextCharFormat())
+            if first:
+                cc.setBlockFormat(blk(depth, 0))
+            else:
+                cc.insertBlock(blk(depth, 4), QTextCharFormat())
             link = QTextCharFormat(head_fmts[min(depth, 2)])
             link.setAnchor(True)
             link.setAnchorHref("sec:" + sec_id)
             ops = ops_of(node)
-            c.insertText(("▾ " if is_open else "◂ ") + "%s  %s" % (path, bidi_fix(node["title"] or "عام")) + ("  (%d)" % ops if ops else ""), link)
+            cc.insertText(bidi_fix(node["title"] or "عام") + ("  (%d)" % ops if ops else "") + "   " + ("˅" if is_open else "‹"), link)
             if not is_open:
                 return
-            bi = QTextBlockFormat()
-            bi.setBackground(shade)
-            bi.setLeftMargin(8 + depth * 18 + 16)
-            bi.setRightMargin(8)
             for s_ in node["items"]:
-                c.insertBlock(bi, QTextCharFormat())
+                cc.insertBlock(blk(depth + 1, 3), QTextCharFormat())
                 txt = bidi_fix(str(s_.get("text", "")).strip())
                 if len(txt) > DETAIL_TEXT_CAP:
                     txt = txt[:DETAIL_TEXT_CAP] + "\n[... shortened for speed]"
                 kind = s_.get("k")
                 if kind == "think":
-                    c.insertText(txt, think_f)
+                    cc.insertText(txt, think_f)
                 elif kind == "tool":
                     if s_.get("ok", True):
-                        c.insertText("✓ " + txt, bot_f)
+                        cc.insertText("✓ " + txt, bot_f)
                     else:
                         err = str(s_.get("err", "")).strip()
                         if err.startswith("Error:"):
                             err = err[6:].strip()
-                        c.insertText("✗ " + txt + (" — " + err if err else ""), err_f)
+                        cc.insertText("✗ " + txt + (" — " + err if err else ""), err_f)
                 else:
-                    c.insertText(txt, dim_f)
+                    cc.insertText(txt, dim_f)
             for i, sub in enumerate(node["subs"], 1):
-                draw(sub, "%s.%d" % (path, i), depth + 1)
-            be = QTextBlockFormat()
-            be.setBackground(shade)
-            be.setLeftMargin(8 + depth * 18 + 16)
-            be.setRightMargin(8)
-            c.insertBlock(be, QTextCharFormat())
-            fold = QTextCharFormat(end_f)
+                fill(cc, sub, "%s.%d" % (path, i), depth + 1, False)
+            cc.insertBlock(blk(depth + 1, 4), QTextCharFormat())
+            fold = QTextCharFormat(dim_f)
             fold.setAnchor(True)
             fold.setAnchorHref("sec:" + sec_id)
-            c.insertText("▴ طيّ " + path, fold)
+            cc.insertText("˄ طيّ", fold)
 
+        rows = len(tree) + 1
+        tf = QTextTableFormat()
+        tf.setBorder(1)
+        tf.setBorderBrush(line)
+        tf.setBorderStyle(QTextFrameFormat.BorderStyle_Solid)
+        tf.setBorderCollapse(True)
+        tf.setCellPadding(8)
+        tf.setCellSpacing(0)
+        tf.setMargin(4)
+        tf.setWidth(QTextLength(QTextLength.PercentageLength, 100))
+        table = c.insertTable(rows, 1, tf)
         for mi, m in enumerate(tree, 1):
-            draw(m, str(mi), 0)
-        bz = QTextBlockFormat()
-        bz.setBackground(shade)
-        bz.setLeftMargin(8)
-        c.insertBlock(bz, QTextCharFormat())
-        fold = QTextCharFormat(end_f)
+            fill(table.cellAt(mi - 1, 0).firstCursorPosition(), m, str(mi), 0, True)
+        cc = table.cellAt(rows - 1, 0).firstCursorPosition()
+        cc.setBlockFormat(blk(0, 0))
+        fold = QTextCharFormat(dim_f)
         fold.setAnchor(True)
         fold.setAnchorHref("act:" + act_id)
-        c.insertText("▴ طيّ التفكير كله", fold)
+        cc.insertText("˄ طيّ التفكير كله", fold)
 
     def insert_rich_body(self, c, body, mid):
         """Insert a reply body, turning ``` fenced blocks into copyable command/code boxes."""
@@ -4339,7 +4457,7 @@ class App(QMainWindow):
         c.insertText("⧉ نسخ الرد كامل", a)
 
     def begin_live(self):
-        self.live = {"steps": [], "body": "", "cur_think": None, "warns": []}
+        self.live = {"steps": [], "body": "", "cur_think": None, "warns": [], "t0": time.time()}
         self.append_bot_label()
         self.reply_start = self._end_cursor().position()
         self.redraw_live()
@@ -5069,6 +5187,8 @@ class App(QMainWindow):
                 msg = {"role": "assistant", "content": content, "reasoning": reasoning}
                 if L is not None and L["steps"]:
                     msg["activity"] = L["steps"]
+                if L is not None and L.get("t0"):
+                    msg["dur"] = int(time.time() - L["t0"])
                 self.current["msgs"].append(msg)
                 if "live" in self.open_acts:
                     self.open_acts.discard("live")
@@ -5201,6 +5321,7 @@ def main():
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     except Exception:
         pass
+    migrate_user_data()
     setup_crash_tools()
     app = QApplication(sys.argv)
     if os.path.exists(ICON_PATH):
