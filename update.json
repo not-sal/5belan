@@ -1,10 +1,10 @@
 {
-  "version": "2.2.0",
-  "notes": "Fix freeze on text selection; chats kept in a separate data folder; import chats; new boxed thinking view with duration",
+  "version": "2.2.1",
+  "notes": "Fix text jumping when selecting text (header height now fixed)",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "4621e048b52f45579ec8ce8518534ac23aa383f1a047976d59f96c6c845bb61b"
+      "sha256": "e2a13983341caa47d8e4d5ac0953d7b6e0973470f2311b412e941dcb98e88d77"
     },
     {
       "name": "guard.py",
