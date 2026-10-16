@@ -2149,6 +2149,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QSizePolicy,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -2346,7 +2347,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -3165,8 +3166,9 @@ class App(QMainWindow):
         tf.setBold(True)
         tf.setPointSize(tf.pointSize() + 1)
         self.title_label.setFont(tf)
-        hl.addWidget(self.title_label)
-        hl.addStretch(1)
+        self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.title_label.setMinimumWidth(60)
+        hl.addWidget(self.title_label, 1)
         self.update_btn = QPushButton("⬆  تحديث متوفر")
         self.update_btn.setObjectName("banner")
         self.update_btn.clicked.connect(self.start_update)
@@ -3197,6 +3199,7 @@ class App(QMainWindow):
         self.chat_settings_btn = QPushButton("⚙ إعدادات المحادثة")
         self.chat_settings_btn.clicked.connect(self.open_tools_dialog)
         hl.addWidget(self.chat_settings_btn)
+        header.setFixedHeight(52)  # constant height: showing/hiding the reply button must never move the chat text
         ml.addWidget(header)
 
         self.view = ChatView()
