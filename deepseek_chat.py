@@ -2773,7 +2773,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.11.0"
+APP_VERSION = "2.11.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5086,6 +5086,10 @@ def make_qss(c):
     QWidget#side, QWidget#filespanel { background: %(side)s; }
     QToolButton#iconbtn { background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 4px 10px; }
     QToolButton#iconbtn:hover { background: %(hover)s; }
+    QToolButton#toolbtn { background: transparent; border: none; border-radius: 8px; padding: 2px 12px; color: %(text)s; }
+    QToolButton#toolbtn:hover { background: %(hover)s; }
+    QToolButton#toolbtn:pressed { background: %(bubble)s; }
+    QWidget#toolsbar { border-bottom: 1px solid %(border)s; }
     QToolButton#iconbtn:checked { background: %(bubble)s; border-color: %(accent)s; }
     QFrame#vsep { color: %(border)s; }
     QToolButton#quotechip { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 9px; padding: 3px 9px; color: %(text)s; }
@@ -5330,25 +5334,37 @@ class App(QMainWindow):
         bottom.addWidget(self.settings_btn)
         bottom.addStretch(1)
         sl.addLayout(bottom)
-        bottom2 = QGridLayout()
-        bottom2.setSpacing(2)
-        for n_, (txt, tip, fn) in enumerate((
-                ("ذاكرة", "ملاحظات عنك يقرأها خبيلان بكل محادثة", self.open_memory),
-                ("صرف", "كم صرفت: اليوم، الأسبوع، وأغلى المحادثات", self.open_usage),
-                ("مشكلة", "تقرير جاهز للنسخ لو صار خطأ", self.open_problem),
-                ("مهام", "مهام تشتغل لوحدها بجدول أو عند ظهور ملف جديد", self.open_tasks),
-                ("سجل", "كل اللي سواه خبيلان على جهازك", self.open_activity),
-                ("خلفية", "شغّل مهمة طويلة بالخلفية وتكمل شغلك", self.new_bg_task),
-                ("تليقرام", "اربط خبيلان ببوت تليقرام: إشعارات ومحادثة من جوالك", self.open_telegram))):
-            b = QToolButton()
-            b.setObjectName("iconbtn")
-            b.setText(txt)
-            b.setToolTip(tip)
-            b.setCursor(Qt.PointingHandCursor)
-            b.setStyleSheet("QToolButton { padding: 4px 3px; }")
-            b.clicked.connect(fn)
-            bottom2.addWidget(b, n_ // 3, n_ % 3)
-        sl.addLayout(bottom2)
+        # the tools now live in a bar at the top of the main area (built below, next to the header)
+        self.tools_bar = QWidget()
+        self.tools_bar.setObjectName("toolsbar")
+        tbl = QHBoxLayout(self.tools_bar)
+        tbl.setContentsMargins(12, 4, 12, 4)
+        tbl.setSpacing(2)
+        self.tools_bar.setLayoutDirection(Qt.RightToLeft)
+        groups = (
+            (("ذاكرة", "ملاحظات عنك يقرأها خبيلان بكل محادثة", self.open_memory),
+             ("صرف", "كم صرفت: اليوم، الأسبوع، وأغلى المحادثات", self.open_usage)),
+            (("مهام", "مهام تشتغل لوحدها بجدول أو عند ظهور ملف جديد", self.open_tasks),
+             ("خلفية", "شغّل مهمة طويلة بالخلفية وتكمل شغلك", self.new_bg_task),
+             ("سجل", "كل اللي سواه خبيلان على جهازك", self.open_activity)),
+            (("تليقرام", "اربط خبيلان ببوت تليقرام: إشعارات ومحادثة من جوالك", self.open_telegram),
+             ("مشكلة", "تقرير جاهز للنسخ لو صار خطأ", self.open_problem)))
+        for gi, grp in enumerate(groups):
+            if gi:
+                sp_ = QFrame()
+                sp_.setFrameShape(QFrame.VLine)
+                sp_.setObjectName("vsep")
+                tbl.addWidget(sp_)
+            for txt, tip, fn in grp:
+                b = QToolButton()
+                b.setObjectName("toolbtn")
+                b.setText(txt)
+                b.setToolTip(tip)
+                b.setCursor(Qt.PointingHandCursor)
+                b.setFixedHeight(28)
+                b.clicked.connect(fn)
+                tbl.addWidget(b)
+        tbl.addStretch(1)
         side.setMinimumWidth(230)
         side.setMaximumWidth(360)
         splitter.addWidget(side)
@@ -5365,6 +5381,7 @@ class App(QMainWindow):
         ml.setContentsMargins(0, 0, 0, 8)
         ml.setSpacing(0)
 
+        ml.addWidget(self.tools_bar)
         header = QWidget()
         hl = QHBoxLayout(header)
         hl.setContentsMargins(16, 8, 16, 4)
@@ -5391,7 +5408,7 @@ class App(QMainWindow):
             b.setFixedHeight(34)
             return b
 
-        self.balance_btn = QPushButton("الرصيد: ...")
+        self.balance_btn = QPushButton("الرصيد ...")
         self.balance_btn.setObjectName("flat")
         self.balance_btn.setToolTip("الرصيد المتبقي في حساب DeepSeek — يتحدث تلقائيًا بعد كل رد، واضغط للتحديث الآن")
         self.balance_btn.clicked.connect(lambda: self.refresh_balance(force=True))
@@ -6505,7 +6522,7 @@ class App(QMainWindow):
             parts.append("تحكم")
         if self.browser_enabled and self.web_ok:
             parts.append("متصفح")
-        self.access_btn.setText("الصلاحيات: " + "، ".join(parts) if parts else "بدون صلاحيات")
+        self.access_btn.setText("الصلاحيات " + "، ".join(parts) if parts else "بدون صلاحيات")
         tip = ["صلاحيات هذي المحادثة فقط — اضغط للتعديل"]
         for d in self.allowed_dirs:
             tip.append(("[تعديل] " if d in self.writable_dirs else "[قراءة] ") + d)
@@ -8412,13 +8429,13 @@ class App(QMainWindow):
     def refresh_balance(self, force=False):
         key = self.key_edit.text().strip()
         if not key:
-            self.balance_btn.setText("الرصيد: —")
+            self.balance_btn.setText("الرصيد —")
             return
         if getattr(self, "_bal_busy", False) and not force:
             return
         self._bal_busy = True
         if not force or self.balance_btn.text().endswith("..."):
-            self.balance_btn.setText("الرصيد: ...")
+            self.balance_btn.setText("الرصيد ...")
 
         def work():
             try:
@@ -8580,12 +8597,12 @@ class App(QMainWindow):
                     d_ = getattr(self, "_bal_delta", None)
                     if d_ is not None and time.time() - getattr(self, "_bal_delta_t", 0) < 180:
                         shown += "  (%+.4f)" % d_
-                    self.balance_btn.setText("الرصيد: " + shown)
+                    self.balance_btn.setText("الرصيد " + shown)
                     self.balance_btn.setToolTip("رصيد حسابك في DeepSeek (مباشر من حسابك)\nآخر تحديث: %s%s\nيتحدث تلقائيًا بعد كل رد، واضغط للتحديث الآن" % (
                         time.strftime("%H:%M:%S"),
                         ("\nآخر تغيّر: %+.4f" % d_) if d_ is not None else ""))
                 else:
-                    self.balance_btn.setText("الرصيد: " + str(val))
+                    self.balance_btn.setText("الرصيد " + str(val))
             elif kind == "bg_done":
                 self.on_bg_done(*val)
             elif kind == "journal":
