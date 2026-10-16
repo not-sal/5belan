@@ -923,6 +923,8 @@ def strip_for_save(msg):
         out["cost"] = msg["cost"]
     if msg.get("sources"):
         out["sources"] = msg["sources"]
+    if msg.get("sugg"):
+        out["sugg"] = msg["sugg"][:3]
     if msg.get("activity"):
         # keep the file small: only the last steps, each shortened (full logs were making chats.json huge)
         out["activity"] = [dict(s, text=str(s.get("text", ""))[:3000]) for s in msg["activity"][-60:]]
@@ -3019,7 +3021,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.15.2"
+APP_VERSION = "2.16.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4124,7 +4126,7 @@ CHAT_WIDTHS = {
 class AppSettingsDialog(QDialog):
     """Application-wide settings (like the Settings page in the Claude app): account, appearance, updates."""
 
-    def __init__(self, parent, key, remember, theme, update_url, width="wide"):
+    def __init__(self, parent, key, remember, theme, update_url, width="wide", suggest=True, auto_update=True):
         super().__init__(parent)
         self.setWindowTitle("إعدادات التطبيق")
         self.resize(560, 420)
@@ -4157,6 +4159,12 @@ class AppSettingsDialog(QDialog):
         i_ = self.width_box.findData(width)
         self.width_box.setCurrentIndex(i_ if i_ >= 0 else 1)
         lay.addWidget(self.width_box)
+        self.suggest_box = QCheckBox("اقتراح أسئلة متابعة تحت كل رد (يصرف شوي بسيط)")
+        self.suggest_box.setChecked(bool(suggest))
+        lay.addWidget(self.suggest_box)
+        self.auto_box = QCheckBox("حدّث البرنامج تلقائياً لما ينزل إصدار جديد")
+        self.auto_box.setChecked(bool(auto_update))
+        lay.addWidget(self.auto_box)
         h3 = QLabel("التحديثات")
         h3.setObjectName("h3")
         h3.setObjectName("h2")
@@ -4205,6 +4213,8 @@ class AppSettingsDialog(QDialog):
             "theme": self.theme_box.currentData() or "dark",
             "width": self.width_box.currentData() or "wide",
             "update_url": self.url_edit.text().strip(),
+            "suggest": self.suggest_box.isChecked(),
+            "auto_update": self.auto_box.isChecked(),
         }
 
 
@@ -4862,6 +4872,23 @@ class ActivityDialog(QDialog):
 
 TRIGGERS = (("يدوي فقط", "manual"), ("كل ساعة", "hourly"), ("يومياً", "daily"), ("أسبوعياً", "weekly"), ("عند ظهور ملف جديد في مجلد", "watch"), ("عند تغيّر صفحة ويب", "page"))
 PAGE_EVERY = (("كل 15 دقيقة", 15), ("كل 30 دقيقة", 30), ("كل ساعة", 60), ("كل 6 ساعات", 360), ("يومياً", 1440))
+WATCH_ACTIONS = (
+    ("مخصص (أكتب الطلب بنفسي)", "custom", ""),
+    ("لخّص كل ملف جديد", "summarize", "لخّص كل ملف من الملفات الجديدة في نقاط قصيرة بالعربي، واذكر اسم الملف قبل ملخصه."),
+    ("ترجم كل ملف جديد للعربية", "translate", "ترجم محتوى كل ملف من الملفات الجديدة للعربية الفصحى المبسطة، واذكر اسم الملف قبل ترجمته. إذا الملف طويل ترجم الأهم وقل إنك اختصرت."),
+    ("رتّب الملفات حسب نوعها (بدون ذكاء، مجاني)", "sort", "يرتّب الملفات الجديدة في مجلدات حسب نوعها (صور، مستندات، جداول...). لا يستخدم الذكاء الاصطناعي."),
+)
+SORT_FOLDERS = (
+    ("صور", (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".heic", ".tif", ".tiff")),
+    ("مستندات", (".pdf", ".doc", ".docx", ".txt", ".md", ".rtf", ".odt")),
+    ("جداول", (".xls", ".xlsx", ".csv", ".ods")),
+    ("عروض", (".ppt", ".pptx", ".key")),
+    ("مضغوطات", (".zip", ".rar", ".7z", ".tar", ".gz")),
+    ("فيديو", (".mp4", ".mkv", ".mov", ".avi", ".webm")),
+    ("صوت", (".mp3", ".wav", ".m4a", ".flac", ".ogg")),
+    ("برامج", (".exe", ".msi", ".dmg", ".apk")),
+)
+DONE_FOLDER = "تمت المعالجة"
 WEEKDAYS = ("الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد")
 
 
@@ -5203,6 +5230,19 @@ class TasksDialog(QDialog):
         wrow.addWidget(self.watch_btn)
         right.addWidget(self.watch_lbl)
         right.addLayout(wrow)
+        self.wpat_lbl = QLabel("أنواع الملفات (اختياري)")
+        self.wpat = QLineEdit()
+        self.wpat.setLayoutDirection(Qt.LeftToRight)
+        self.wpat.setPlaceholderText("مثال: *.pdf, *.docx   (فاضي = كل الملفات)")
+        self.wsub = QCheckBox("يشمل المجلدات الداخلية")
+        self.waction_lbl = QLabel("وش يسوي بالملف الجديد")
+        self.waction = QComboBox()
+        for t_, _k, _p in WATCH_ACTIONS:
+            self.waction.addItem(t_)
+        self.waction.currentIndexChanged.connect(self.on_waction)
+        self.wmove = QCheckBox("انقل الملف بعد المعالجة لمجلد «%s»" % DONE_FOLDER)
+        for w_ in (self.wpat_lbl, self.wpat, self.wsub, self.waction_lbl, self.waction, self.wmove):
+            right.addWidget(w_)
         self.url_lbl = QLabel("رابط الصفحة")
         self.url = QLineEdit()
         self.url.setLayoutDirection(Qt.LeftToRight)
@@ -5241,6 +5281,13 @@ class TasksDialog(QDialog):
         orow.addWidget(self.think)
         orow.addStretch(1)
         right.addLayout(orow)
+        right.addWidget(head("بعد ما تخلص"))
+        self.nextbox = QComboBox()
+        self.nextbox.setToolTip("نتيجة هذي المهمة تنرسل للمهمة اللي تختارها كمدخل")
+        right.addWidget(QLabel("شغّل مهمة ثانية ونتيجة هذي تدخل عليها:"))
+        right.addWidget(self.nextbox)
+        self.tgbox = QCheckBox("أرسل نتيجتها على تليقرام")
+        right.addWidget(self.tgbox)
         _l = QLabel("تشتغل داخل المحادثة المفتوحة وقت التشغيل، ونتيجتها تنزل فيها. البرنامج لازم يكون مفتوح.")
         _l.setWordWrap(True)
         _l.setObjectName("chip")
@@ -5272,6 +5319,15 @@ class TasksDialog(QDialog):
             w.setVisible(k == "watch")
         for w in (self.url_lbl, self.url, self.every):
             w.setVisible(k == "page")
+        for w in (self.wpat_lbl, self.wpat, self.wsub, self.waction_lbl, self.waction, self.wmove):
+            w.setVisible(k == "watch")
+
+    def on_waction(self, *_a):
+        i = max(0, self.waction.currentIndex())
+        key, text = WATCH_ACTIONS[i][1], WATCH_ACTIONS[i][2]
+        if key != "custom":
+            self.prompt.setPlainText(text)
+        self.prompt.setEnabled(key in ("custom", "summarize", "translate") and self.cur >= 0)
 
     def refill(self, sel=0):
         self.cur = -1
@@ -5305,6 +5361,12 @@ class TasksDialog(QDialog):
         t["every"] = PAGE_EVERY[max(0, self.every.currentIndex())][1]
         t["avoid_peak"] = self.avoid.isChecked()
         t["think"] = self.think.currentText()
+        t["wpat"] = self.wpat.text().strip()
+        t["wsub"] = self.wsub.isChecked()
+        t["waction"] = WATCH_ACTIONS[max(0, self.waction.currentIndex())][1]
+        t["wmove"] = self.wmove.isChecked()
+        t["next"] = self.nextbox.currentData() or ""
+        t["tg"] = self.tgbox.isChecked()
         if t["trigger"] == "watch" and t["watch"] and t["watch"] not in t["dirs"]:
             t["dirs"].append(t["watch"])
 
@@ -5321,7 +5383,8 @@ class TasksDialog(QDialog):
         self.cur = row
         on = 0 <= row < len(self.tasks)
         for w in (self.enabled, self.name, self.prompt, self.dirs, self.write, self.trigger, self.time, self.weekday,
-                  self.watch, self.watch_btn, self.url, self.every, self.avoid, self.think):
+                  self.watch, self.watch_btn, self.url, self.every, self.avoid, self.think,
+                  self.wpat, self.wsub, self.waction, self.wmove, self.nextbox, self.tgbox):
             w.setEnabled(on)
         t = self.tasks[row] if on else {}
         self.enabled.setChecked(t.get("enabled", True))
@@ -5343,6 +5406,24 @@ class TasksDialog(QDialog):
         self.avoid.setChecked(bool(t.get("avoid_peak")))
         i = self.think.findText(t.get("think", "off"))
         self.think.setCurrentIndex(max(0, i))
+        self.wpat.setText(t.get("wpat", ""))
+        self.wsub.setChecked(bool(t.get("wsub")))
+        self.wmove.setChecked(bool(t.get("wmove")))
+        self.waction.blockSignals(True)
+        wk = [k_ for _t, k_, _p in WATCH_ACTIONS]
+        self.waction.setCurrentIndex(wk.index(t.get("waction", "custom")) if t.get("waction", "custom") in wk else 0)
+        self.waction.blockSignals(False)
+        self.prompt.setEnabled(on and t.get("waction", "custom") != "sort")
+        self.nextbox.blockSignals(True)
+        self.nextbox.clear()
+        self.nextbox.addItem("لا شي", "")
+        for o_ in self.tasks:
+            if on and o_["id"] != t.get("id"):
+                self.nextbox.addItem(o_["name"], o_["id"])
+        j = self.nextbox.findData(t.get("next", ""))
+        self.nextbox.setCurrentIndex(max(0, j))
+        self.nextbox.blockSignals(False)
+        self.tgbox.setChecked(t.get("tg", True) is not False)
         self.sync()
 
     def new_task(self):
@@ -6633,10 +6714,13 @@ class App(QMainWindow):
     def open_app_settings(self):
         dlg = AppSettingsDialog(self, self.key_edit.text(), self.remember_box.isChecked(), self.theme,
                                 (self.cfg.get("update_url") or get_update_url(self.cfg)),
-                                self.cfg.get("chat_width", "wide"))
+                                self.cfg.get("chat_width", "wide"),
+                                self.cfg.get("suggest", True) is not False, self.cfg.get("auto_update", True) is not False)
         if not dlg.exec():
             return
         v = dlg.values()
+        self.cfg["suggest"] = bool(v["suggest"])
+        self.cfg["auto_update"] = bool(v["auto_update"])
         self.key_edit.setText(v["key"])
         self.remember_box.setChecked(v["remember"])
         if v["remember"] and v["key"]:
@@ -7371,6 +7455,8 @@ class App(QMainWindow):
                 if not steps and m.get("reasoning"):
                     steps = [{"k": "think", "text": m["reasoning"]}]  # chats saved before the Thinking block existed
                 self.render_reply(steps or [], clean_reply(m["content"]), "m%d" % i, False, (), m.get("dur"), m.get("cost"), m.get("sources"))
+                if i == len(all_msgs) - 1 and m.get("sugg") and not self.busy:
+                    self._insert_suggestions(m["sugg"])
                 self.add_divider()
                 last_reply = m["content"]
         if self.busy and self.live is not None:
@@ -7827,8 +7913,73 @@ class App(QMainWindow):
         self.live_dirty = False
         sb.setValue(sb.maximum() if at_bottom else keep)
 
+    def request_suggestions(self, chat, idx):
+        if self.cfg.get("suggest", True) is False or chat is None or chat.get("id") == "telegram":
+            return
+        try:
+            m = chat["msgs"][idx]
+        except Exception:
+            return
+        body = clean_reply(str(m.get("content", ""))).strip()
+        if len(body) < 60 or m.get("cut") or body.startswith("⏹"):
+            return
+        q_ = ""
+        if idx >= 1 and chat["msgs"][idx - 1].get("role") == "user":
+            q_ = str(chat["msgs"][idx - 1].get("shown") or "")[:600]
+        key = self.key_edit.text().strip()
+        if not key:
+            return
+        cid = chat["id"]
+
+        def work():
+            try:
+                prompt = ("سؤال المستخدم:\n%s\n\nرد المساعد:\n%s\n\nاقترح 3 أسئلة متابعة قصيرة (أقل من 10 كلمات لكل سؤال) يمكن للمستخدم يسألها بعد هذا الرد، "
+                          "بنفس لغة المستخدم ولهجته. اكتب كل سؤال في سطر لحاله بدون ترقيم ولا شرح." % (q_, body[:2500]))
+                msg, _u = api_chat(key, MODELS[0], [{"role": "system", "content": "You write short follow-up questions. Output only the questions, one per line."},
+                                                  {"role": "user", "content": prompt}], think="off", timeout=40)
+                items = []
+                for ln in str(msg.get("content") or "").splitlines():
+                    ln = re.sub(r"^[\s\-\*\d\.\)\(•]+", "", ln).strip().strip("\"'«»")
+                    if 4 <= len(ln) <= 90:
+                        items.append(ln)
+                if items:
+                    self.q.put(("sugg", (cid, idx, items[:3])))
+            except Exception as ex:
+                log_event("suggestions failed: %s" % ex)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _insert_suggestions(self, items):
+        col = THEMES[self.theme]
+        c = self._end_cursor()
+        bf = QTextBlockFormat()
+        bf.setTopMargin(6)
+        c.insertBlock(bf, QTextCharFormat())
+        c.insertText("أسئلة مقترحة:", self.fmt["dim"])
+        for i, it in enumerate(items):
+            b2 = QTextBlockFormat()
+            b2.setTopMargin(3)
+            b2.setLeftMargin(8)
+            c.insertBlock(b2, QTextCharFormat())
+            f = QTextCharFormat()
+            f.setAnchor(True)
+            f.setAnchorHref("sug:%d" % i)
+            f.setForeground(QColor(col["accent"]))
+            c.insertText(bidi_fix(it), f)
+
     def on_anchor(self, url):
         s = url.toString()
+        if s.startswith("sug:"):
+            try:
+                i = int(s[4:])
+                msgs = self.current["msgs"] if self.current else []
+                items = msgs[-1].get("sugg") or [] if msgs and msgs[-1].get("role") == "assistant" else []
+                if 0 <= i < len(items) and not self.busy:
+                    self.inp.setPlainText(items[i])
+                    self.send()
+            except Exception:
+                pass
+            return
         if s.startswith("copy:"):
             self._copy(self.copy_store.get(s[5:], ""))
             return
@@ -8216,25 +8367,52 @@ class App(QMainWindow):
              "dirs": dirs, "write": write, "think": "off", "model": self.model_box.currentText()}
         self.start_bg(t, manual=True)
 
-    def scan_watch(self, t):
+    def _watch_list(self, t):
+        """Files in the watched folder as {relative path: full path}, honouring the type filter and sub-folders."""
+        import fnmatch
         d = t.get("watch")
+        out = {}
         if not d or not os.path.isdir(d):
-            return []
+            return out
+        pats = [x.strip().lower() for x in re.split(r"[,;\s]+", str(t.get("wpat") or "")) if x.strip()]
+        skip_ext = (".tmp", ".crdownload", ".part", ".download")
         try:
-            files = [f for f in os.listdir(d) if os.path.isfile(os.path.join(d, f)) and not f.startswith(".")
-                     and not f.lower().endswith((".tmp", ".crdownload", ".part", ".download"))]
+            if t.get("wsub"):
+                for root, dirs, files in os.walk(d):
+                    dirs[:] = [x for x in dirs if not x.startswith(".") and x != DONE_FOLDER]
+                    if root.count(os.sep) - d.count(os.sep) > 4:
+                        dirs[:] = []
+                    for f in files:
+                        out[os.path.relpath(os.path.join(root, f), d).replace("\\", "/")] = os.path.join(root, f)
+                    if len(out) > 3000:
+                        break
+            else:
+                for f in os.listdir(d):
+                    if os.path.isfile(os.path.join(d, f)):
+                        out[f] = os.path.join(d, f)
         except OSError:
-            return []
+            return {}
+        res = {}
+        for rel, fp in out.items():
+            base = os.path.basename(rel)
+            if base.startswith(".") or base.lower().endswith(skip_ext):
+                continue
+            if pats and not any(fnmatch.fnmatch(base.lower(), pt if ("*" in pt or "?" in pt) else "*" + pt) for pt in pats):
+                continue
+            res[rel] = fp
+        return res
+
+    def scan_watch(self, t):
+        cur = self._watch_list(t)
         if t.get("seen") is None:
-            t["seen"] = files  # first time: what is already there is not "new"
+            t["seen"] = list(cur)  # first time: what is already there is not "new"
             self.save_cfg()
             return []
         seen = set(t["seen"])
         out = []
-        for f in files:
-            if f in seen:
+        for rel, fp in cur.items():
+            if rel in seen:
                 continue
-            fp = os.path.join(d, f)
             try:
                 st = os.stat(fp)
             except OSError:
@@ -8244,6 +8422,28 @@ class App(QMainWindow):
                 out.append(fp)
             self._watch_sizes[fp] = sig
         return out[:20]
+
+    def sort_files(self, t, files):
+        """Move new files of the watched folder into sub-folders by type. Only inside that folder; nothing is deleted."""
+        base = t.get("watch")
+        moved = 0
+        newseen = []
+        for fp in files:
+            try:
+                if os.path.dirname(os.path.abspath(fp)) != os.path.abspath(base) or not os.path.isfile(fp):
+                    newseen.append(os.path.relpath(fp, base).replace("\\", "/"))
+                    continue
+                ext = os.path.splitext(fp)[1].lower()
+                sub = next((n for n, exts in SORT_FOLDERS if ext in exts), "أخرى")
+                dd = os.path.join(base, sub)
+                os.makedirs(dd, exist_ok=True)
+                dst = unique_path(dd, os.path.basename(fp))
+                shutil.move(fp, dst)
+                newseen.append(os.path.relpath(dst, base).replace("\\", "/"))
+                moved += 1
+            except Exception as ex:
+                log_event("sort failed for %s: %s" % (fp, ex))
+        return moved, newseen
 
     def tick_tasks(self):
         key = self.key_edit.text().strip()
@@ -8276,6 +8476,16 @@ class App(QMainWindow):
             elif trig == "watch":
                 files = self.scan_watch(t)
                 due = bool(files)
+                if due and t.get("waction") == "sort":
+                    moved, ns = self.sort_files(t, files)
+                    t["seen"] = list(set(t.get("seen") or []) | set(ns) | {os.path.relpath(f, t["watch"]).replace("\\", "/") for f in files})
+                    t["last_run"] = now
+                    self.save_cfg()
+                    msg_ = "رتّبت %d ملف في المجلد %s" % (moved, t.get("watch"))
+                    self.statusBar().showMessage(msg_, 8000)
+                    if t.get("tg", True) is not False:
+                        self.tg_notify(msg_)
+                    continue
             elif trig == "page":
                 if t.get("url") and now - t.get("last_check", 0) >= int(t.get("every", 60)) * 60 and t["id"] not in self._page_busy:
                     t["last_check"] = now
@@ -8550,7 +8760,8 @@ class App(QMainWindow):
             if t["id"] == task["id"]:
                 t["last_run"] = time.time()
                 if files:
-                    t["seen"] = list(set(t.get("seen") or []) | {os.path.basename(f) for f in files})
+                    wd_ = t.get("watch") or ""
+                    t["seen"] = list(set(t.get("seen") or []) | {(os.path.relpath(f, wd_).replace("\\", "/") if wd_ else os.path.basename(f)) for f in files})
         self.save_cfg()
         self.statusBar().showMessage("بدأت المهمة داخل المحادثة المفتوحة: " + task.get("name", ""), 5000)
         threading.Thread(target=self.bg_worker, args=(task, key, files or []), daemon=True).start()
@@ -8580,6 +8791,7 @@ class App(QMainWindow):
                 prompt += "\n\nالملفات الجديدة اللي ظهرت:\n" + "\n".join(files)
             system = (SYSTEM_PROMPT + "\n" + memory_prompt() + (tools_prompt(runner) if roots else "") +
                       ("\n" + folder_notes_prompt(roots) if roots else "") +
+                      ("\nCHAIN: another task will run after you and receive your final report as its input. If there is truly nothing to pass on (nothing new, nothing found), answer exactly [لا شي] and nothing else." if task.get("next") else "") +
                       "\nBACKGROUND TASK: you run unattended inside the user's open conversation (earlier messages are the context); nobody can answer questions. Do the task with the tools you have, then finish "
                       "with a concise report in Arabic (Saudi dialect) of what you did or found. If something is not allowed, say so in the report.")
             messages = [{"role": "system", "content": system}] + list(task.get("_ctx") or []) + [{"role": "user", "content": prompt}]
@@ -8622,8 +8834,19 @@ class App(QMainWindow):
             else:
                 final = "(وصلت لحد الخطوات الأقصى قبل ما يخلص المهمة)"
             final, mem_msgs = apply_memory_marks(final)
+            if task.get("wmove") and files and task.get("watch"):
+                dd_ = os.path.join(task["watch"], DONE_FOLDER)
+                try:
+                    os.makedirs(dd_, exist_ok=True)
+                    for fp_ in files:
+                        if os.path.isfile(fp_):
+                            shutil.move(fp_, unique_path(dd_, os.path.basename(fp_)))
+                except Exception as ex:
+                    log_event("move processed failed: %s" % ex)
             chat = {"id": cid, "title": title, "updated": time.time(), "project": task.get("project", ""), "bg": True, "unread": True,
                     "_target": task.get("_chat_id"),
+                    "_task": {"id": task.get("id"), "next": task.get("next") or "", "tg": task.get("tg", True) is not False,
+                              "chain": list(task.get("_chain") or []), "name": task.get("name", "")},
                     "settings": clean_settings({"allowed_dirs": roots, "tools_enabled": bool(roots)}, restrictive_settings()),
                     "journal": runner.journal[-300:],
                     "msgs": [{"role": "user", "content": prompt, "shown": "" + task.get("name", "") + "\n" + task.get("prompt", ""), "names": []},
@@ -8640,11 +8863,18 @@ class App(QMainWindow):
             self.statusBar().showMessage("فشلت المهمة: " + err[:120], 8000)
             self.tg_notify("فشلت المهمة: " + err[:300])
             return
+        info = chat.pop("_task", None) or {}
+        last = ""
         try:
-            last = [m for m in chat["msgs"] if m["role"] == "assistant"][-1].get("content", "")
-            self.tg_notify("خلصت المهمة: %s\n\n%s" % (chat["title"], str(last)[:3000]))
+            last = str([m for m in chat["msgs"] if m["role"] == "assistant"][-1].get("content", ""))
+            if info.get("tg", True) and last.strip() != "[لا شي]":
+                self.tg_notify("خلصت المهمة: %s\n\n%s" % (chat["title"], last[:3000]))
         except Exception:
             pass
+        try:
+            self.chain_next(info, last)
+        except Exception as ex:
+            log_event("chain failed: %s" % ex)
         target = next((c for c in self.chats if c.get("id") == chat.get("_target")), None)
         if target is None:  # the chat was deleted meanwhile: keep the result as its own chat
             chat.pop("_target", None)
@@ -8662,6 +8892,28 @@ class App(QMainWindow):
             QApplication.alert(self, 5000)
         except Exception:
             pass
+
+    def chain_next(self, info, last):
+        """The task that just finished may hand its report to another task (the 'after it finishes' choice)."""
+        nxt = info.get("next")
+        if not nxt:
+            return
+        chain = list(info.get("chain") or []) + [info.get("id")]
+        if nxt in chain or len(chain) >= 6:
+            self.statusBar().showMessage("وقفت سلسلة المهام عشان ما تدور على نفسها", 6000)
+            return
+        if last.strip() == "[لا شي]":
+            self.statusBar().showMessage("المهمة قالت ما فيه شي جديد، فما شغّلت اللي بعدها", 6000)
+            return
+        t = next((x for x in (self.cfg.get("tasks") or []) if x.get("id") == nxt), None)
+        if t is None:
+            return
+        t2 = dict(t)
+        t2["prompt"] = (t.get("prompt", "").strip() + "\n\nنتيجة المهمة السابقة («%s»):\n%s" % (info.get("name", ""), last[:8000]))
+        t2["_chain"] = chain
+        if t2["id"] in self._bg_running:
+            return
+        self.start_bg(t2)
 
     def merge_bg(self, target, chat):
         msgs = chat["msgs"]
@@ -9824,6 +10076,18 @@ class App(QMainWindow):
                 self.on_bg_done(*val)
             elif kind == "page_done":
                 self._page_busy.discard(val)
+            elif kind == "sugg":
+                cid_, idx_, items_ = val
+                ch_ = next((c for c in self.chats if c.get("id") == cid_), None)
+                if ch_ is not None and idx_ < len(ch_["msgs"]) and ch_["msgs"][idx_].get("role") == "assistant":
+                    ch_["msgs"][idx_]["sugg"] = items_
+                    self.persist()
+                    if ch_ is self.current and not self.busy and idx_ == len(ch_["msgs"]) - 1:
+                        sb_ = self.view.verticalScrollBar()
+                        near = sb_.value() >= sb_.maximum() - 60
+                        self.render_chat(keep_scroll=True)
+                        if near:
+                            self.scroll_bottom()
             elif kind == "page_note":
                 self.statusBar().showMessage(val, 5000)
             elif kind == "page_changed":
@@ -9895,6 +10159,7 @@ class App(QMainWindow):
                 except Exception as ex:
                     log_event("canvas: %s" % ex)
                 self.finish()
+                self.request_suggestions(self.current, len(self.current["msgs"]) - 1)
             elif kind == "err":
                 if L is not None:
                     self.redraw_live()
