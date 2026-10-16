@@ -1561,12 +1561,12 @@ def apply_memory_marks(text):
         if kind == "remember":
             if not any(note.lower() == l.lstrip("- ").lower() for l in lines):
                 lines.append("- " + note[:400])
-                msgs.append("🧠 تذكّرت: " + note[:80])
+                msgs.append("تذكّرت: " + note[:80])
         else:
             keep = [l for l in lines if note.lower() not in l.lower()]
             if len(keep) != len(lines):
                 lines = keep
-                msgs.append("🧠 نسيت: " + note[:80])
+                msgs.append("نسيت: " + note[:80])
     if msgs:
         save_memory("\n".join(lines))
     return MARK_RE.sub("", text).rstrip(), msgs
@@ -2530,7 +2530,7 @@ class ToolRunner:
 import sys
 import traceback
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -2773,7 +2773,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.10.1"
+APP_VERSION = "2.11.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -3456,7 +3456,7 @@ class RunOutputDialog(QDialog):
         self.resize(720, 460)
         self.stop_event = stop_event
         lay = QVBoxLayout(self)
-        self.head = QLabel("⏳ يشتغل…")
+        self.head = QLabel("يشتغل…")
         lay.addWidget(self.head)
         self.cmd = QPlainTextEdit(_cut(code, 3000))
         self.cmd.setReadOnly(True)
@@ -3469,7 +3469,7 @@ class RunOutputDialog(QDialog):
         self.out.setFont(QFont("Consolas" if IS_WIN else "monospace", 10))
         lay.addWidget(self.out, 1)
         row = QHBoxLayout()
-        self.stop_btn = QPushButton("⏹ إيقاف")
+        self.stop_btn = QPushButton("إيقاف")
         self.stop_btn.clicked.connect(self.stop_event.set)
         self.copy_btn = QPushButton("⧉ نسخ الناتج")
         self.copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(self.out.toPlainText()))
@@ -3482,7 +3482,7 @@ class RunOutputDialog(QDialog):
         lay.addLayout(row)
 
     def done(self, text):
-        self.head.setText("✓ انتهى")
+        self.head.setText("انتهى")
         self.stop_btn.setEnabled(False)
         self.out.setPlainText(text)
 
@@ -3528,16 +3528,16 @@ class BrowserPanel(QWidget):
         nav = QHBoxLayout()
         nav.setContentsMargins(6, 6, 6, 4)
         nav.setSpacing(4)
-        self.b_back = self._navbtn("◀", "رجوع", lambda: self._cur() and self._cur().back())
-        self.b_fwd = self._navbtn("▶", "للأمام", lambda: self._cur() and self._cur().forward())
-        self.b_reload = self._navbtn("⟳", "تحديث / إيقاف", self._reload)
+        self.b_back = self._navbtn("رجوع", "رجوع", lambda: self._cur() and self._cur().back())
+        self.b_fwd = self._navbtn("للأمام", "للأمام", lambda: self._cur() and self._cur().forward())
+        self.b_reload = self._navbtn("تحديث", "تحديث / إيقاف", self._reload)
         self.url_edit = QLineEdit()
         self.url_edit.setLayoutDirection(Qt.LeftToRight)
         self.url_edit.setPlaceholderText("اكتب رابط أو كلمة بحث…")
         self.url_edit.returnPressed.connect(self._go)
         self.b_new = self._navbtn("+", "تبويب جديد", lambda: self.new_tab("https://www.google.com", focus=True))
-        self.b_ext = self._navbtn("↗", "افتح الصفحة في متصفحك العادي", self._external)
-        self.b_hide = self._navbtn("✕", "إخفاء اللوحة (المتصفح يظل يشتغل بالخلفية)", lambda: self.hide_requested.emit())
+        self.b_ext = self._navbtn("خارجي", "افتح الصفحة في متصفحك العادي", self._external)
+        self.b_hide = self._navbtn("إخفاء", "إخفاء اللوحة (المتصفح يظل يشتغل بالخلفية)", lambda: self.hide_requested.emit())
         for w in (self.b_back, self.b_fwd, self.b_reload):
             nav.addWidget(w)
         nav.addWidget(self.url_edit, 1)
@@ -3569,7 +3569,7 @@ class BrowserPanel(QWidget):
     def _navbtn(self, text, tip, fn):
         b = QPushButton(text)
         b.setToolTip(tip)
-        b.setFixedWidth(34)
+        b.setMinimumWidth(48)
         b.setObjectName("flat")
         b.clicked.connect(lambda _=False: fn())
         return b
@@ -3595,7 +3595,7 @@ class BrowserPanel(QWidget):
         except Exception:
             pass
         view._is_agent = agent
-        title = "🤖 " if agent else ""
+        title = "" if agent else ""
         idx = self.tabs.addTab(view, title + "جديد")
         view.titleChanged.connect(lambda t, vw=view: self._set_title(vw, t))
         view.urlChanged.connect(lambda u, vw=view: self._url_changed(vw, u))
@@ -3613,7 +3613,7 @@ class BrowserPanel(QWidget):
         if i >= 0:
             t = (t or "جديد").strip()
             t = t if len(t) <= 22 else t[:21] + "…"
-            self.tabs.setTabText(i, ("🤖 " if getattr(view, "_is_agent", False) else "") + t)
+            self.tabs.setTabText(i, ("" if getattr(view, "_is_agent", False) else "") + t)
             self.tabs.setTabToolTip(i, view.url().toString())
 
     def close_tab(self, i):
@@ -3644,7 +3644,7 @@ class BrowserPanel(QWidget):
         if not only_ui:
             view._loading = loading
         if view is self._cur():
-            self.b_reload.setText("✕" if loading else "⟳")
+            self.b_reload.setText("إيقاف" if loading else "تحديث")
             self.progress.setVisible(bool(loading))
 
     def _progress(self, view, p):
@@ -3800,7 +3800,7 @@ class FilePreviewDialog(QDialog):
             w.setPlainText("تعذّرت المعاينة: %s\n\n%s" % (e, body if kind != "chart" else ""))
         lay.addWidget(w, 1)
         row = QHBoxLayout()
-        b_save = QPushButton("💾 حفظ...")
+        b_save = QPushButton("حفظ...")
         b_save.setObjectName("primary")
         b_save.clicked.connect(lambda: on_save(kind, name, body))
         b_close = QPushButton("إغلاق")
@@ -3970,7 +3970,7 @@ class DeviceFilesDialog(QDialog):
         info = QLabel(
             "هذي الإعدادات خاصة بهذي المحادثة فقط، وأي محادثة جديدة تبدأ بدون أي صلاحية.\n"
             "القراءة: الموديل يقدر يقرأ الملفات داخل المجلدات اللي تضيفها هنا فقط.\n"
-            "التعديل: إذا فعّلت «السماح بإنشاء وتعديل الملفات»، يقدر ينشئ ويعدّل ملفات داخل المجلدات اللي علّمت عليها ✓.\n"
+            "التعديل: إذا فعّلت «السماح بإنشاء وتعديل الملفات»، يقدر ينشئ ويعدّل ملفات داخل المجلدات اللي علّمت عليها.\n"
             "محتوى أي ملف يتعامل معه الموديل يُرسل إلى خوادم DeepSeek، فلا تضف مجلدات فيها أشياء سرية."
         )
         info.setWordWrap(True)
@@ -3997,10 +3997,10 @@ class DeviceFilesDialog(QDialog):
         prow.addWidget(QLabel("قالب جاهز:"))
         self.preset_box = QComboBox()
         self.preset_box.addItem("— اختر قالب —", "")
-        self.preset_box.addItem("🔒 بدون صلاحيات", "none")
-        self.preset_box.addItem("👁 قراءة فقط", "read")
-        self.preset_box.addItem("💻 مبرمج (قراءة + تعديل + أوامر بإذنك)", "dev")
-        self.preset_box.addItem("🚀 حرية كاملة (بدون أسئلة)", "free")
+        self.preset_box.addItem("بدون صلاحيات", "none")
+        self.preset_box.addItem("قراءة فقط", "read")
+        self.preset_box.addItem("مبرمج (قراءة + تعديل + أوامر بإذنك)", "dev")
+        self.preset_box.addItem("حرية كاملة (بدون أسئلة)", "free")
         self.preset_box.activated.connect(self.apply_preset)
         prow.addWidget(self.preset_box, 1)
         lay.addLayout(prow)
@@ -4026,7 +4026,7 @@ class DeviceFilesDialog(QDialog):
         lay.addWidget(note2)
         self.write_box.toggled.connect(self.on_write_toggled)
 
-        lay.addWidget(QLabel("المجلدات المسموحة لهذي المحادثة (✎ يقدر يعدّل داخلها، 👁 قراءة فقط) — مرّر الماوس لرؤية المسار:"))
+        lay.addWidget(QLabel("المجلدات المسموحة لهذي المحادثة (تعديل = يقدر يعدّل داخلها، قراءة = قراءة فقط) — مرّر الماوس لرؤية المسار:"))
         self.list = QListWidget()
         self.list.setViewMode(QListWidget.ViewMode.IconMode)
         self.list.setResizeMode(QListWidget.ResizeMode.Adjust)
@@ -4101,7 +4101,7 @@ class DeviceFilesDialog(QDialog):
             name = os.path.basename(path.rstrip("/\\")) or path
         if len(name) > 14:
             name = name[:13] + "…"
-        it.setText(name + "\n" + ("✎ تعديل" if it.data(Qt.UserRole + 1) else "👁 قراءة"))
+        it.setText(name + "\n" + ("تعديل" if it.data(Qt.UserRole + 1) else "قراءة"))
 
     def on_write_toggled(self, on):
         if not on:
@@ -4208,10 +4208,10 @@ def undo_label(e):
     n = os.path.basename(str(e.get("path") or e.get("dst") or "").rstrip("\\/"))
     when = time.strftime("%H:%M", time.localtime(e.get("t", 0)))
     txt = {
-        "restore": "↺ استرجاع النسخة السابقة من " + n,
-        "remove": "🗑 حذف الملف الجديد " + n,
-        "rmdir": "🗑 حذف المجلد الجديد " + n,
-        "move_back": "↩ إرجاع %s إلى مكانه" % os.path.basename(str(e.get("dst") or "")),
+        "restore": "استرجاع النسخة السابقة من " + n,
+        "remove": "حذف الملف الجديد " + n,
+        "rmdir": "حذف المجلد الجديد " + n,
+        "move_back": "إرجاع %s إلى مكانه" % os.path.basename(str(e.get("dst") or "")),
         "noundo": "(ما ينعكس: ملف كبير أو غير محفوظ) " + n,
     }.get(op, op)
     return "%s   %s" % (when, txt)
@@ -4254,9 +4254,9 @@ class ProblemDialog(QDialog):
         self.box.setLayoutDirection(Qt.LeftToRight)
         lay.addWidget(self.box, 1)
         row = QHBoxLayout()
-        b = QPushButton("📋 نسخ التقرير")
+        b = QPushButton("نسخ التقرير")
         b.setObjectName("primary")
-        b.clicked.connect(lambda: (QApplication.clipboard().setText(report), b.setText("✓ تم النسخ")))
+        b.clicked.connect(lambda: (QApplication.clipboard().setText(report), b.setText("تم النسخ")))
         c = QPushButton("إغلاق")
         c.clicked.connect(self.accept)
         row.addWidget(b)
@@ -4268,7 +4268,7 @@ class ProblemDialog(QDialog):
 class MemoryDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
-        self.setWindowTitle("🧠 ذاكرة خبيلان")
+        self.setWindowTitle("ذاكرة خبيلان")
         self.resize(600, 460)
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(
@@ -4297,7 +4297,7 @@ class UndoDialog(QDialog):
         super().__init__(parent)
         from PySide6.QtWidgets import QListWidgetItem
 
-        self.setWindowTitle("↶ تراجع عن تعديلات خبيلان")
+        self.setWindowTitle("تراجع عن تعديلات خبيلان")
         self.resize(620, 440)
         self.entries = entries
         lay = QVBoxLayout(self)
@@ -4389,7 +4389,7 @@ class BarChart(QWidget):
 class UsageDialog(QDialog):
     def __init__(self, parent, chats):
         super().__init__(parent)
-        self.setWindowTitle("📊 الاستهلاك والتكلفة")
+        self.setWindowTitle("الاستهلاك والتكلفة")
         self.resize(680, 620)
         day, per = usage_stats(chats)
         now = time.time()
@@ -4428,7 +4428,7 @@ class ProjectsDialog(QDialog):
         super().__init__(parent)
         from PySide6.QtWidgets import QListWidgetItem
 
-        self.setWindowTitle("📁 المشاريع")
+        self.setWindowTitle("المشاريع")
         self.resize(760, 560)
         self.projects = [dict(p, dirs=list(p.get("dirs") or [])) for p in projects]
         self.start_dir = start_dir
@@ -4543,7 +4543,7 @@ class ActivityDialog(QDialog):
         super().__init__(parent)
         from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
 
-        self.setWindowTitle("📜 سجل النشاط")
+        self.setWindowTitle("سجل النشاط")
         self.resize(900, 600)
         self.rows = read_activity()
         lay = QVBoxLayout(self)
@@ -4555,7 +4555,7 @@ class ActivityDialog(QDialog):
         self.flt.currentIndexChanged.connect(self.fill)
         top.addWidget(self.flt)
         self.q = QLineEdit()
-        self.q.setPlaceholderText("🔍 بحث")
+        self.q.setPlaceholderText("بحث")
         self.q.textChanged.connect(self.fill)
         top.addWidget(self.q, 1)
         lay.addLayout(top)
@@ -4567,7 +4567,7 @@ class ActivityDialog(QDialog):
         self.table.setWordWrap(False)
         lay.addWidget(self.table, 1)
         row = QHBoxLayout()
-        b = QPushButton("📋 نسخ الظاهر كنص")
+        b = QPushButton("نسخ الظاهر كنص")
         b.clicked.connect(self.copy_all)
         c = QPushButton("إغلاق")
         c.clicked.connect(self.accept)
@@ -4598,7 +4598,7 @@ class ActivityDialog(QDialog):
         self.table.setRowCount(len(self.shown))
         for i, e in enumerate(self.shown):
             vals = [time.strftime("%m-%d %H:%M", time.localtime(e.get("t", 0))), str(e.get("chat", "")),
-                    str(e.get("desc", "")), "✓" if e.get("ok") else "✗ فشل"]
+                    str(e.get("desc", "")), "تم" if e.get("ok") else "فشل"]
             for j, v in enumerate(vals):
                 it = self._QTI(v)
                 it.setToolTip(str(e.get("desc", "")))
@@ -4614,13 +4614,211 @@ TRIGGERS = (("يدوي فقط", "manual"), ("كل ساعة", "hourly"), ("يوم
 WEEKDAYS = ("الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد")
 
 
+
+# ---------- Telegram bot link ----------
+def tg_call(token, method, params=None, timeout=35):
+    url = "https://api.telegram.org/bot%s/%s" % (token, method)
+    data = urllib.parse.urlencode(params or {}).encode("utf-8")
+    with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", errors="replace"))
+
+
+def tg_send(token, chat_id, text):
+    text = str(text or "").strip() or "(فاضي)"
+    for i in range(0, len(text), 3900):
+        try:
+            tg_call(token, "sendMessage", {"chat_id": chat_id, "text": text[i:i + 3900]}, timeout=20)
+        except Exception as e:
+            log_event("telegram send failed: %s" % e)
+            return False
+    return True
+
+
+class TgBridge(QObject):
+    """Receives Telegram messages on a background thread and hands them to the GUI thread."""
+    got = Signal(int, str)
+    paired = Signal(int, str)
+    reply = Signal(str)
+
+    def __init__(self, get_cfg):
+        super().__init__()
+        self.get_cfg = get_cfg
+        self.pair = None  # (code, expires_at)
+        self.offset = 0
+        self.stop = False
+        self.state = ""
+
+    def start(self):
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        fails = 0
+        while not self.stop:
+            tg = self.get_cfg() or {}
+            token = (tg.get("token") or "").strip()
+            if not token:
+                time.sleep(1)
+                continue
+            try:
+                res = tg_call(token, "getUpdates", {"offset": self.offset, "timeout": 25, "allowed_updates": '["message"]'}, timeout=40)
+                fails = 0
+                self.state = "ok"
+                for u in res.get("result") or []:
+                    self.offset = max(self.offset, int(u.get("update_id", 0)) + 1)
+                    m = u.get("message") or {}
+                    text = (m.get("text") or "").strip()
+                    cid = (m.get("chat") or {}).get("id")
+                    if not text or cid is None:
+                        continue
+                    paired_id = tg.get("chat_id")
+                    p = self.pair
+                    if p and time.time() < p[1] and text.split()[-1:] == [p[0]] and text.split()[0] in ("/start", "/pair"):
+                        self.pair = None
+                        name = ((m.get("from") or {}).get("first_name") or "") + " " + ((m.get("from") or {}).get("username") or "")
+                        self.paired.emit(int(cid), name.strip())
+                    elif paired_id and int(cid) == int(paired_id):
+                        self.got.emit(int(cid), text)
+                    # anyone else is ignored completely
+            except Exception as e:
+                fails += 1
+                self.state = "err: %s" % str(e)[:80]
+                time.sleep(min(60, 3 * fails))
+
+
+class TelegramDialog(QDialog):
+    def __init__(self, parent, tg, bridge):
+        super().__init__(parent)
+        self.setWindowTitle("ربط تليقرام")
+        self.tg = tg
+        self.bridge = bridge
+        self.resize(520, 430)
+        lay = QVBoxLayout(self)
+        info = QLabel(
+            "تربط خبيلان ببوت تليقرام خاص فيك: يوصلك إشعار لما تخلص مهمة، وتقدر تسولف معه وتشغّل مهامك من جوالك.\n"
+            "1) افتح @BotFather في تليقرام، أرسل /newbot، وخذ التوكن.\n"
+            "2) الصق التوكن تحت واضغط «حفظ وتحقق».\n"
+            "3) اضغط «ابدأ الربط»، وافتح الرابط (أو أرسل للبوت الأمر اللي يظهر) من حسابك.\n"
+            "تنبيه: نتيجة المهام والمحادثة تمر عبر خوادم تليقرام. التطبيق لازم يكون مفتوح. والبوت ما يرد إلا على حسابك المربوط.")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        self.token = QLineEdit(tg.get("token", ""))
+        self.token.setEchoMode(QLineEdit.Password)
+        self.token.setPlaceholderText("توكن البوت من BotFather")
+        self.token.setLayoutDirection(Qt.LeftToRight)
+        lay.addWidget(self.token)
+        row = QHBoxLayout()
+        self.b_save = QPushButton("حفظ وتحقق")
+        self.b_pair = QPushButton("ابدأ الربط")
+        self.b_test = QPushButton("أرسل رسالة تجربة")
+        self.b_unlink = QPushButton("فك الربط")
+        for b in (self.b_save, self.b_pair, self.b_test, self.b_unlink):
+            row.addWidget(b)
+        lay.addLayout(row)
+        self.notify = QCheckBox("أرسل لي إشعار لما تخلص أو تفشل مهمة خلفية")
+        self.notify.setChecked(tg.get("notify", True) is not False)
+        self.chat_on = QCheckBox("اسمح لي أسولف مع خبيلان من تليقرام (بدون صلاحيات على ملفات الجهاز)")
+        self.chat_on.setChecked(tg.get("chat", True) is not False)
+        lay.addWidget(self.notify)
+        lay.addWidget(self.chat_on)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
+        self.status.setOpenExternalLinks(True)
+        lay.addWidget(self.status)
+        lay.addStretch(1)
+        row2 = QHBoxLayout()
+        ok = QPushButton("تم")
+        ok.clicked.connect(self.accept)
+        row2.addStretch(1)
+        row2.addWidget(ok)
+        lay.addLayout(row2)
+        self.b_save.clicked.connect(self.save_check)
+        self.b_pair.clicked.connect(self.start_pair)
+        self.b_test.clicked.connect(self.test_msg)
+        self.b_unlink.clicked.connect(self.unlink)
+        self.tm = QTimer(self)
+        self.tm.timeout.connect(self.refresh)
+        self.tm.start(1000)
+        self.refresh()
+
+    def refresh(self):
+        if self.tg.get("chat_id"):
+            self.status.setText("مربوط بحسابك" + (" (%s)" % self.tg.get("who") if self.tg.get("who") else "") + ". الاتصال: " +
+                                ("شغال" if self.bridge.state == "ok" else (self.bridge.state or "…")))
+        elif self.bridge.pair:
+            code, _ = self.bridge.pair
+            self.status.setText("بانتظار الربط… افتح هذا الرابط وضغط Start:\n%s\nأو أرسل للبوت: /start %s" % (self.link(code), code))
+        elif not self.tg.get("token"):
+            self.status.setText("ما فيه توكن بعد.")
+        else:
+            self.status.setText("التوكن محفوظ، لكن ما تم الربط بحسابك.")
+
+    def link(self, code):
+        u = self.tg.get("username")
+        return "https://t.me/%s?start=%s" % (u, code) if u else "(اضغط حفظ وتحقق أول)"
+
+    def save_check(self):
+        tok = self.token.text().strip()
+        try:
+            r = tg_call(tok, "getMe", timeout=15)
+            if not r.get("ok"):
+                raise RuntimeError(str(r)[:100])
+        except Exception as e:
+            QMessageBox.warning(self, "تليقرام", "ما قدرت أتحقق من التوكن: %s" % str(e)[:160])
+            return
+        if tok != self.tg.get("token"):
+            self.tg["chat_id"] = 0
+            self.tg.pop("who", None)
+        self.tg["token"] = tok
+        self.tg["username"] = (r.get("result") or {}).get("username", "")
+        self.tg_changed()
+        QMessageBox.information(self, "تليقرام", "التوكن صحيح. البوت: @%s" % self.tg["username"])
+
+    def start_pair(self):
+        if not self.tg.get("username"):
+            self.save_check()
+            if not self.tg.get("username"):
+                return
+        import random
+        self.bridge.pair = ("%06d" % random.randint(0, 999999), time.time() + 600)
+        self.refresh()
+
+    def test_msg(self):
+        if not (self.tg.get("token") and self.tg.get("chat_id")):
+            QMessageBox.information(self, "تليقرام", "اربط حسابك أول.")
+            return
+        ok = tg_send(self.tg["token"], self.tg["chat_id"], "هلا، أنا خبيلان. الربط شغال.")
+        QMessageBox.information(self, "تليقرام", "انرسلت." if ok else "فشل الإرسال.")
+
+    def unlink(self):
+        self.tg["chat_id"] = 0
+        self.tg.pop("who", None)
+        self.bridge.pair = None
+        self.tg_changed()
+        self.refresh()
+
+    def tg_changed(self):
+        self.tg["notify"] = self.notify.isChecked()
+        self.tg["chat"] = self.chat_on.isChecked()
+        p = self.parent()
+        if hasattr(p, "save_cfg"):
+            p.cfg["tg"] = self.tg
+            p.save_cfg()
+
+    def done(self, r):
+        self.tg["notify"] = self.notify.isChecked()
+        self.tg["chat"] = self.chat_on.isChecked()
+        self.tg_changed()
+        super().done(r)
+
+
 class TasksDialog(QDialog):
     def __init__(self, parent, tasks, start_dir, run_cb):
         super().__init__(parent)
         from PySide6.QtCore import QTime
         from PySide6.QtWidgets import QTimeEdit
 
-        self.setWindowTitle("⏰ المهام التلقائية")
+        self.setWindowTitle("المهام التلقائية")
         self.resize(900, 700)
         self.tasks = [dict(t, dirs=list(t.get("dirs") or [])) for t in tasks]
         self.start_dir = start_dir
@@ -4663,7 +4861,7 @@ class TasksDialog(QDialog):
         row.addWidget(r)
         row.addStretch(1)
         right.addLayout(row)
-        self.write = QCheckBox("يقدر ينشئ ويعدّل ملفات داخل هذي المجلدات (بدون سؤال — تقدر ترجّع من زر ↶ تراجع)")
+        self.write = QCheckBox("يقدر ينشئ ويعدّل ملفات داخل هذي المجلدات (بدون سؤال — تقدر ترجّع من زر «تراجع»)")
         right.addWidget(self.write)
         trow = QHBoxLayout()
         trow.addWidget(QLabel("متى تشتغل:"))
@@ -4702,7 +4900,7 @@ class TasksDialog(QDialog):
         right.addLayout(orow)
         right.addWidget(QLabel("النتيجة تظهر كمحادثة جديدة بعلامة 🔔 في القائمة. البرنامج لازم يكون مفتوح (ولو فاتتك مهمة تشتغل أول ما تفتحه)."))
         brow = QHBoxLayout()
-        run = QPushButton("▶ شغّلها الحين")
+        run = QPushButton("شغّلها الحين")
         run.clicked.connect(self.run_now)
         brow.addWidget(run)
         brow.addStretch(1)
@@ -4728,7 +4926,7 @@ class TasksDialog(QDialog):
         self.lst.blockSignals(True)
         self.lst.clear()
         for t in self.tasks:
-            self.lst.addItem(("⏰ " if t.get("enabled", True) else "⏸ ") + t["name"])
+            self.lst.addItem(("" if t.get("enabled", True) else "(متوقفة) ") + t["name"])
         self.lst.blockSignals(False)
         if self.tasks:
             self.lst.setCurrentRow(min(sel, len(self.tasks) - 1))
@@ -4757,7 +4955,7 @@ class TasksDialog(QDialog):
             it = self.lst.item(self.cur)
             if it is not None:
                 t = self.tasks[self.cur]
-                it.setText(("⏰ " if t.get("enabled", True) else "⏸ ") + t["name"])
+                it.setText(("" if t.get("enabled", True) else "(متوقفة) ") + t["name"])
 
     def on_row(self, row):
         self.save_form()
@@ -5078,7 +5276,7 @@ class App(QMainWindow):
         sl = QVBoxLayout(side)
         sl.setContentsMargins(10, 12, 10, 10)
         sl.setSpacing(8)
-        brand = QLabel("✦ خبيلان")
+        brand = QLabel("خبيلان")
         brand.setObjectName("brand")
         sl.addWidget(brand)
         b_new = QPushButton("＋  محادثة جديدة")
@@ -5093,7 +5291,7 @@ class App(QMainWindow):
         prow_.addWidget(self.proj_box, 1)
         b_proj = QToolButton()
         b_proj.setObjectName("iconbtn")
-        b_proj.setText("📁")
+        b_proj.setText("مشاريع")
         b_proj.setToolTip("إدارة المشاريع")
         b_proj.clicked.connect(self.manage_projects)
         prow_.addWidget(b_proj)
@@ -5107,7 +5305,7 @@ class App(QMainWindow):
         srow.addWidget(self.search_edit, 1)
         self.arch_btn = QToolButton()
         self.arch_btn.setObjectName("iconbtn")
-        self.arch_btn.setText("🗄")
+        self.arch_btn.setText("أرشيف")
         self.arch_btn.setCheckable(True)
         self.arch_btn.setToolTip("إظهار المحادثات المؤرشفة")
         self.arch_btn.toggled.connect(lambda _c: self.refresh_list())
@@ -5124,7 +5322,7 @@ class App(QMainWindow):
         bottom = QHBoxLayout()
         self.settings_btn = QToolButton()
         self.settings_btn.setObjectName("iconbtn")
-        self.settings_btn.setText("⚙ إعدادات التطبيق")
+        self.settings_btn.setText("إعدادات التطبيق")
         self.settings_btn.setToolTip("إعدادات التطبيق (عامة لكل المحادثات): المفتاح، الثيم، عرض المحادثة، التحديثات")
         self.settings_btn.setFixedHeight(34)
         self.settings_btn.setCursor(Qt.PointingHandCursor)
@@ -5135,12 +5333,13 @@ class App(QMainWindow):
         bottom2 = QGridLayout()
         bottom2.setSpacing(2)
         for n_, (txt, tip, fn) in enumerate((
-                ("🧠 ذاكرة", "ملاحظات عنك يقرأها خبيلان بكل محادثة", self.open_memory),
-                ("📊 صرف", "كم صرفت: اليوم، الأسبوع، وأغلى المحادثات", self.open_usage),
-                ("🛠 مشكلة", "تقرير جاهز للنسخ لو صار خطأ", self.open_problem),
-                ("⏰ مهام", "مهام تشتغل لوحدها بجدول أو عند ظهور ملف جديد", self.open_tasks),
-                ("📜 سجل", "كل اللي سواه خبيلان على جهازك", self.open_activity),
-                ("🤖 خلفية", "شغّل مهمة طويلة بالخلفية وتكمل شغلك", self.new_bg_task))):
+                ("ذاكرة", "ملاحظات عنك يقرأها خبيلان بكل محادثة", self.open_memory),
+                ("صرف", "كم صرفت: اليوم، الأسبوع، وأغلى المحادثات", self.open_usage),
+                ("مشكلة", "تقرير جاهز للنسخ لو صار خطأ", self.open_problem),
+                ("مهام", "مهام تشتغل لوحدها بجدول أو عند ظهور ملف جديد", self.open_tasks),
+                ("سجل", "كل اللي سواه خبيلان على جهازك", self.open_activity),
+                ("خلفية", "شغّل مهمة طويلة بالخلفية وتكمل شغلك", self.new_bg_task),
+                ("تليقرام", "اربط خبيلان ببوت تليقرام: إشعارات ومحادثة من جوالك", self.open_telegram))):
             b = QToolButton()
             b.setObjectName("iconbtn")
             b.setText(txt)
@@ -5177,7 +5376,7 @@ class App(QMainWindow):
         self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.title_label.setMinimumWidth(60)
         hl.addWidget(self.title_label, 1)
-        self.update_btn = QPushButton("⬆  تحديث متوفر")
+        self.update_btn = QPushButton("تحديث متوفر")
         self.update_btn.setObjectName("banner")
         self.update_btn.clicked.connect(self.start_update)
         self.update_btn.setVisible(False)
@@ -5192,7 +5391,7 @@ class App(QMainWindow):
             b.setFixedHeight(34)
             return b
 
-        self.balance_btn = QPushButton("💰 ...")
+        self.balance_btn = QPushButton("الرصيد: ...")
         self.balance_btn.setObjectName("flat")
         self.balance_btn.setToolTip("الرصيد المتبقي في حساب DeepSeek — يتحدث تلقائيًا بعد كل رد، واضغط للتحديث الآن")
         self.balance_btn.clicked.connect(lambda: self.refresh_balance(force=True))
@@ -5201,16 +5400,16 @@ class App(QMainWindow):
         sep.setFrameShape(QFrame.VLine)
         sep.setObjectName("vsep")
         hl.addWidget(sep)
-        self.files_btn = icon_btn("📁 الملفات", "ملفات هذي المحادثة", True)
+        self.files_btn = icon_btn("الملفات", "ملفات هذي المحادثة", True)
         self.files_btn.toggled.connect(self.toggle_files_panel)
         hl.addWidget(self.files_btn)
-        self.browser_btn = icon_btn("🌐 المتصفح", "المتصفح المدمج (يشتغل بالخلفية حتى لو أخفيته)", True)
+        self.browser_btn = icon_btn("المتصفح", "المتصفح المدمج (يشتغل بالخلفية حتى لو أخفيته)", True)
         self.browser_btn.toggled.connect(self.toggle_browser)
         hl.addWidget(self.browser_btn)
-        self.chat_settings_btn = icon_btn("🎛 إعدادات المحادثة", "إعدادات هذي المحادثة فقط: الصلاحيات، الملفات، الأوامر")
+        self.chat_settings_btn = icon_btn("إعدادات المحادثة", "إعدادات هذي المحادثة فقط: الصلاحيات، الملفات، الأوامر")
         self.chat_settings_btn.clicked.connect(self.open_tools_dialog)
         hl.addWidget(self.chat_settings_btn)
-        self.undo_btn = icon_btn("↶ تراجع", "تراجع عن تعديلات الملفات اللي سواها خبيلان في هذي المحادثة")
+        self.undo_btn = icon_btn("تراجع", "تراجع عن تعديلات الملفات اللي سواها خبيلان في هذي المحادثة")
         self.undo_btn.clicked.connect(self.open_undo)
         self.undo_btn.setVisible(False)
         hl.addWidget(self.undo_btn)
@@ -5263,7 +5462,7 @@ class App(QMainWindow):
         self.queue_label = QLabel("")
         ql.addWidget(self.queue_label, 1)
         qc = QToolButton()
-        qc.setText("✕ إلغاء")
+        qc.setText("إلغاء")
         qc.setObjectName("flat")
         qc.clicked.connect(self.cancel_queued)
         ql.addWidget(qc)
@@ -5336,7 +5535,7 @@ class App(QMainWindow):
         self.files_panel.setObjectName("filespanel")
         fpl = QVBoxLayout(self.files_panel)
         fpl.setContentsMargins(10, 12, 10, 10)
-        fh = QLabel("📁 ملفات المحادثة")
+        fh = QLabel("ملفات المحادثة")
         fh.setObjectName("h2")
         fpl.addWidget(fh)
         sa = QScrollArea()
@@ -5397,6 +5596,12 @@ class App(QMainWindow):
         QTimer.singleShot(9000, self.tick_tasks)
         self.refresh_projects()
         self.proj_box.currentIndexChanged.connect(self.on_project_changed)
+        self._tg_busy = False
+        self.tg_bridge = TgBridge(lambda: self.cfg.get("tg") or {})
+        self.tg_bridge.got.connect(self.on_tg_msg)
+        self.tg_bridge.paired.connect(self.on_tg_paired)
+        self.tg_bridge.reply.connect(self.on_tg_reply)
+        self.tg_bridge.start()
         self.inp.setFocus()
 
     # ---------- reply to a part of a message ----------
@@ -5445,10 +5650,10 @@ class App(QMainWindow):
             chip = QToolButton()
             chip.setObjectName("quotechip")
             chip.setCursor(Qt.PointingHandCursor)
-            chip.setText("❝ %d  %s%s" % (i, bidi_fix(short), "  ✎" if q.get("c", "").strip() else ""))
+            chip.setText("اقتباس %d  %s%s" % (i, bidi_fix(short), "  (تعليق)" if q.get("c", "").strip() else ""))
             tip = t if len(t) <= 500 else t[:497] + "…"
             if q.get("c", "").strip():
-                tip += "\n\n← " + q["c"].strip()
+                tip += "\n\nتعليقك: " + q["c"].strip()
             chip.setToolTip(bidi_fix(tip) + "\n\n(اضغط للتفاصيل والتعليق)")
             chip.clicked.connect(lambda _=False, qq=q, b=chip: self.show_quote_card(qq, b))
             self.quotes_layout.addWidget(chip)
@@ -5478,7 +5683,7 @@ class App(QMainWindow):
         row = QHBoxLayout()
         done = QPushButton("تم")
         done.clicked.connect(card.close)
-        rm = QPushButton("🗑 حذف الاقتباس")
+        rm = QPushButton("حذف الاقتباس")
         rm.clicked.connect(lambda: (card.close(), self.remove_quote(q)))
         row.addWidget(done)
         row.addStretch(1)
@@ -5557,7 +5762,7 @@ class App(QMainWindow):
     def refresh_files_panel(self):
         entries = self.gather_files()
         sig = tuple((e["src"], e["name"], e["mi"]) for e in entries)
-        self.files_btn.setText("📁 الملفات (%d)" % len(entries) if entries else "📁 الملفات")
+        self.files_btn.setText("الملفات (%d)" % len(entries) if entries else "الملفات")
         if sig == getattr(self, "_files_sig", None):
             return
         self._files_sig = sig
@@ -5592,8 +5797,8 @@ class App(QMainWindow):
                     th.setIcon(QIcon(pm.scaled(56, 56, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
                     th.setIconSize(QSize(56, 56))
             if th.icon().isNull():
-                th.setText(icons.get(ext, "📎"))
-                th.setStyleSheet("font-size: 26px;")
+                th.setText(ext.lstrip(".").upper()[:4] or "ملف")
+                th.setStyleSheet("font-size: 13px; font-weight: bold;")
             th.clicked.connect(lambda _=False, ee=e: self.preview_entry(ee))
             top.addWidget(th)
             info = QVBoxLayout()
@@ -5608,11 +5813,11 @@ class App(QMainWindow):
             v.addLayout(top)
             row = QHBoxLayout()
             row.setSpacing(4)
-            for text, fn, tip in (("👁", self.preview_entry, "معاينة"), ("⤴", self.open_entry, "فتح الملف"),
-                                  ("📁", self.folder_entry, "إظهار في المجلد"), ("💾", self.save_entry, "حفظ باسم…")):
+            for text, fn, tip in (("معاينة", self.preview_entry, "معاينة"), ("فتح", self.open_entry, "فتح الملف"),
+                                  ("المجلد", self.folder_entry, "إظهار في المجلد"), ("حفظ", self.save_entry, "حفظ باسم…")):
                 b = QPushButton(text)
                 b.setToolTip(tip)
-                b.setFixedWidth(40)
+                b.setMinimumWidth(44)
                 b.clicked.connect(lambda _=False, f=fn, ee=e: f(ee))
                 row.addWidget(b)
             row.addStretch(1)
@@ -5831,7 +6036,7 @@ class App(QMainWindow):
                         shutil.copytree(sub, os.path.join(DATA_DIR, "files", c["id"]), dirs_exist_ok=True)
             self.persist()
             self.refresh_list()
-            QMessageBox.information(self, "استيراد", "تم استيراد %d محادثة جديدة ✓" % added)
+            QMessageBox.information(self, "استيراد", "تم استيراد %d محادثة جديدة" % added)
         except Exception as e:
             QMessageBox.warning(self, "استيراد", "تعذّر الاستيراد:\n%s" % e)
 
@@ -5946,18 +6151,18 @@ class App(QMainWindow):
         self.listw.setCurrentRow(self.listw.row(it))
         m = QMenu(self)
         c_ = self.current
-        m.addAction("📌  إلغاء التثبيت" if c_.get("pinned") else "📌  تثبيت في الأعلى", lambda: self.toggle_flag("pinned"))
-        m.addAction("🗄  إلغاء الأرشفة" if c_.get("archived") else "🗄  أرشفة (إخفاء بدون حذف)", lambda: self.toggle_flag("archived"))
-        m.addAction("✏  إعادة تسمية", self.rename_chat)
-        pm_ = m.addMenu("📁  نقل إلى مشروع")
+        m.addAction("إلغاء التثبيت" if c_.get("pinned") else "تثبيت في الأعلى", lambda: self.toggle_flag("pinned"))
+        m.addAction("إلغاء الأرشفة" if c_.get("archived") else "أرشفة (إخفاء بدون حذف)", lambda: self.toggle_flag("archived"))
+        m.addAction("إعادة تسمية", self.rename_chat)
+        pm_ = m.addMenu("نقل إلى مشروع")
         pm_.addAction("بدون مشروع", lambda: self.move_to_project(""))
         for p_ in self.cfg.get("projects") or []:
             pm_.addAction(p_["name"], lambda pid=p_["id"]: self.move_to_project(pid))
         m.addSeparator()
-        m.addAction("📤  تصدير Markdown", lambda: self.export_chat("md"))
-        m.addAction("📄  تصدير PDF", lambda: self.export_chat("pdf"))
+        m.addAction("تصدير Markdown", lambda: self.export_chat("md"))
+        m.addAction("تصدير PDF", lambda: self.export_chat("pdf"))
         m.addSeparator()
-        m.addAction("🗑  حذف", self.delete_chat)
+        m.addAction("حذف", self.delete_chat)
         m.exec(self.listw.mapToGlobal(pos))
 
     def add_user_bubble(self, text, names, quotes=None, idx=None):
@@ -6000,7 +6205,7 @@ class App(QMainWindow):
             ef.setForeground(QColor(col["accent"]))
             ef.setFontWeight(QFont.Weight.Normal)
             cc.insertText("      ", who)
-            cc.insertText("✎ تعديل", ef)
+            cc.insertText("(معدّلة)", ef)
         cc.insertBlock(QTextBlockFormat(), QTextCharFormat())
         firstline = True
         for q in quotes or []:
@@ -6008,9 +6213,9 @@ class App(QMainWindow):
             if not firstline:
                 cc.insertText("\u2028", self.fmt["dim"])
             firstline = False
-            cc.insertText(bidi_fix("↩ " + (t if len(t) <= 240 else t[:237] + "…")), self.fmt["dim"])
+            cc.insertText(bidi_fix("(ردّ على) " + (t if len(t) <= 240 else t[:237] + "…")), self.fmt["dim"])
             if q.get("c", "").strip():
-                cc.insertText(bidi_fix("\u2028← " + q["c"].strip()), self.fmt["bot"])
+                cc.insertText(bidi_fix("\u2028تعليقك: " + q["c"].strip()), self.fmt["bot"])
         if names:
             cc.insertText(("\u2028" if not firstline else "") + bidi_fix("مرفق: " + ", ".join(names)), self.fmt["file"])
             firstline = False
@@ -6277,7 +6482,7 @@ class App(QMainWindow):
     def _copy(self, text):
         try:
             QApplication.clipboard().setText(text or "")
-            self.statusBar().showMessage("تم النسخ ✓", 1500)
+            self.statusBar().showMessage("تم النسخ", 1500)
         except Exception:
             pass
 
@@ -6300,10 +6505,10 @@ class App(QMainWindow):
             parts.append("تحكم")
         if self.browser_enabled and self.web_ok:
             parts.append("متصفح")
-        self.access_btn.setText("🔓 " + "، ".join(parts) if parts else "🔒 بدون صلاحيات")
+        self.access_btn.setText("الصلاحيات: " + "، ".join(parts) if parts else "بدون صلاحيات")
         tip = ["صلاحيات هذي المحادثة فقط — اضغط للتعديل"]
         for d in self.allowed_dirs:
-            tip.append(("✎ " if d in self.writable_dirs else "👁 ") + d)
+            tip.append(("[تعديل] " if d in self.writable_dirs else "[قراءة] ") + d)
         self.access_btn.setToolTip("\n".join(tip))
 
     def eventFilter(self, obj, event):
@@ -6334,7 +6539,7 @@ class App(QMainWindow):
             QMessageBox.information(
                 self,
                 "ملفات الجهاز",
-                "اجعل مجلد واحد على الأقل بوضع ✎ تعديل على الأقل عشان يشتغل التعديل، أو ألغِ «السماح بإنشاء وتعديل الملفات».",
+                "اجعل مجلد واحد على الأقل بوضع «تعديل» على الأقل عشان يشتغل التعديل، أو ألغِ «السماح بإنشاء وتعديل الملفات».",
             )
             v["write_enabled"] = False
         merged = self.collect_settings()
@@ -6412,7 +6617,7 @@ class App(QMainWindow):
         self.listw.clear()
         for c in self.view_chats:
             pj = self.get_project(c.get("project"))
-            self.listw.addItem(("🔔 " if c.get("unread") else "") + ("📌 " if c.get("pinned") else "") + ("🗄 " if c.get("archived") else "") + c["title"]
+            self.listw.addItem(("[جديد] " if c.get("unread") else "") + ("[مثبّتة] " if c.get("pinned") else "") + ("[أرشيف] " if c.get("archived") else "") + c["title"]
                                + (("   ‹%s›" % pj["name"]) if pj and sel == "*" else ""))
         if self.current and self.current["id"] in self.order:
             self.listw.setCurrentRow(self.order.index(self.current["id"]))
@@ -6530,9 +6735,9 @@ class App(QMainWindow):
                 dur = time.time() - self.live["t0"]
             ds = self.fmt_dur(dur)
             if not steps:
-                c.insertText("✻ جاري التفكير…" + ((" · " + ds) if ds else ""), self.fmt["dim"])
+                c.insertText("جاري التفكير…" + ((" · " + ds) if ds else ""), self.fmt["dim"])
             else:
-                base = "✻ " + ("جاري العمل…" if live else "التفكير") + ((" · " + ds) if ds else "") + (" · %d عملية" % ops if ops else "")
+                base = "" + ("جاري العمل…" if live else "التفكير") + ((" · " + ds) if ds else "") + (" · %d عملية" % ops if ops else "")
                 f = QTextCharFormat()
                 f.setAnchor(True)
                 f.setAnchorHref("act:" + act_id)
@@ -6579,7 +6784,7 @@ class App(QMainWindow):
         rail = QColor(col["accent"])
         rail.setAlpha(150)
         tint = QColor(128, 128, 128, 22)
-        icons = {"read": "📄", "write": "✏️", "delete": "🗑", "shell": "⌨", "computer": "🖥", "browser": "🌐"}
+        icons = {"read": "قراءة: ", "write": "كتابة: ", "delete": "حذف: ", "shell": "أمر: ", "computer": "الجهاز: ", "browser": "متصفح: "}
 
         def sized(base, bold=False, delta=0):
             f = QTextCharFormat(base)
@@ -6622,7 +6827,7 @@ class App(QMainWindow):
             ops, bad = stats(node)
             dot = QTextCharFormat(dim_f)
             dot.setForeground(bad_c if bad else (ok_c if ops else idle_c))
-            cc.insertText("● ", dot)
+            cc.insertText("• ", dot)
             link = QTextCharFormat(title_fs[min(depth, 2)])
             link.setAnchor(True)
             link.setAnchorHref("sec:" + sec_id)
@@ -6650,18 +6855,18 @@ class App(QMainWindow):
                     cc.insertText(txt, think_f)
                 elif kind == "tool":
                     key = TOOL_GROUPS.get(s_.get("name"), ("other", ""))[0]
-                    ic = icons.get(key, "•") + " "
+                    ic = icons.get(key, "")
                     txt = _cut(txt, 220)
                     if s_.get("ok", True):
                         mark = QTextCharFormat(bot_f)
                         mark.setForeground(ok_c)
-                        cc.insertText("✓ ", mark)
+                        cc.insertText("تم  ", mark)
                         cc.insertText(ic + txt, bot_f)
                     else:
                         err = str(s_.get("err", "")).strip()
                         if err.startswith("Error:"):
                             err = err[6:].strip()
-                        cc.insertText("✗ " + ic + txt + (" — " + _cut(err, 160) if err else ""), err_f)
+                        cc.insertText("فشل  " + ic + txt + (" — " + _cut(err, 160) if err else ""), err_f)
                 else:
                     cc.insertText(txt, dim_f)
             for i, sub in enumerate(node["subs"], 1):
@@ -6741,7 +6946,7 @@ class App(QMainWindow):
             c.insertText("      ", h)
             r = QTextCharFormat(a)
             r.setAnchorHref("run:" + cid)
-            c.insertText("▶ تشغيل", r)
+            c.insertText("تشغيل", r)
         elif fam:
             c.insertText("      (أمر لنظام آخر — انسخه فقط)", h)
         cf = QTextCharFormat()
@@ -6778,7 +6983,15 @@ class App(QMainWindow):
             r = QTextCharFormat(a)
             r.setAnchorHref("regen:" + mid)
             c.insertText("    ", self.fmt["dim"])
-            c.insertText("🔄 إعادة توليد", r)
+            c.insertText("إعادة توليد", r)
+            try:
+                if self.current["msgs"][idx].get("cut"):
+                    k_ = QTextCharFormat(a)
+                    k_.setAnchorHref("cont:" + mid)
+                    c.insertText("    ", self.fmt["dim"])
+                    c.insertText("كمّل الرد", k_)
+            except Exception:
+                pass
         t = self.fmt_cost(cost)
         if t:
             c.insertText("    " + t, self.fmt["dim"])
@@ -6820,6 +7033,9 @@ class App(QMainWindow):
             return
         if s.startswith("regen:"):
             self.regenerate()
+            return
+        if s.startswith("cont:"):
+            self.continue_reply()
             return
         if s.startswith("edit:"):
             try:
@@ -7008,7 +7224,7 @@ class App(QMainWindow):
         if not key:
             QMessageBox.warning(self, "5belan", "اكتب مفتاح API أول.")
             return
-        txt, ok = QInputDialog.getMultiLineText(self, "🤖 مهمة بالخلفية",
+        txt, ok = QInputDialog.getMultiLineText(self, "مهمة بالخلفية",
                                                 "وش تبيه يسوي؟ يشتغل لوحده وتكمل شغلك، وتجيك النتيجة كمحادثة جديدة:", "")
         if not ok or not txt.strip():
             return
@@ -7016,7 +7232,7 @@ class App(QMainWindow):
         write = False
         if dirs and self.write_enabled and self.writable_dirs:
             write = QMessageBox.question(self, "صلاحية التعديل",
-                                         "تسمح له يعدّل ملفات في مجلدات هذي المحادثة بدون ما يسألك؟\n(تقدر ترجّع التعديلات من زر ↶ تراجع)") == YES
+                                         "تسمح له يعدّل ملفات في مجلدات هذي المحادثة بدون ما يسألك؟\n(تقدر ترجّع التعديلات من زر «تراجع»)") == YES
         t = {"id": "adhoc-" + uuid.uuid4().hex[:8], "name": txt.strip().replace("\n", " ")[:30], "prompt": txt.strip(),
              "dirs": dirs, "write": write, "think": "off", "model": self.model_box.currentText()}
         self.start_bg(t, manual=True)
@@ -7087,6 +7303,118 @@ class App(QMainWindow):
                 continue
             self.start_bg(t, files=files)
 
+    # ---------- Telegram ----------
+    def open_telegram(self):
+        tg = self.cfg.setdefault("tg", {})
+        TelegramDialog(self, tg, self.tg_bridge).exec()
+        self.cfg["tg"] = tg
+        self.save_cfg()
+
+    def tg_ready(self):
+        tg = self.cfg.get("tg") or {}
+        return tg if (tg.get("token") and tg.get("chat_id")) else None
+
+    def tg_notify(self, text):
+        tg = self.tg_ready()
+        if tg and tg.get("notify", True) is not False:
+            threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], text), daemon=True).start()
+
+    def on_tg_paired(self, cid, who):
+        tg = self.cfg.setdefault("tg", {})
+        tg["chat_id"] = cid
+        tg["who"] = who
+        self.save_cfg()
+        threading.Thread(target=tg_send, args=(tg.get("token", ""), cid, "تم الربط. اكتب /help لقائمة الأوامر."), daemon=True).start()
+        self.statusBar().showMessage("تم ربط تليقرام", 5000)
+
+    def tg_chat(self):
+        for c in self.chats:
+            if c.get("id") == "telegram":
+                return c
+        c = {"id": "telegram", "title": "تليقرام", "updated": time.time(), "msgs": [], "project": "",
+             "settings": clean_settings({"tools_enabled": False}, restrictive_settings())}
+        self.chats.append(c)
+        return c
+
+    def on_tg_msg(self, cid, text):
+        tg = self.tg_ready()
+        if not tg or int(cid) != int(tg["chat_id"]):
+            return
+        send = lambda t: threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], t), daemon=True).start()
+        cmd = text.split()[0].lower() if text.startswith("/") else ""
+        if cmd in ("/help", "/start"):
+            send("الأوامر:\n/status حالة التطبيق\n/tasks مهامك\n/run رقم_أو_اسم تشغيل مهمة\n/new محادثة جديدة\nوأي نص ثاني أرد عليه.")
+            return
+        if cmd == "/status":
+            send("التطبيق شغال. %s. مهام تشتغل: %d. %s" % ("مشغول برد" if self.busy else "فاضي", len(self._bg_running),
+                                                         self.peak_label.text() if self.peak_label.isVisible() else "ماهو وقت الذروة"))
+            return
+        if cmd == "/tasks":
+            ts = self.cfg.get("tasks") or []
+            send("\n".join("%d) %s%s" % (i + 1, t["name"], "" if t.get("enabled", True) else " (متوقفة)") for i, t in enumerate(ts)) or "ما عندك مهام.")
+            return
+        if cmd == "/run":
+            arg = text[4:].strip()
+            ts = self.cfg.get("tasks") or []
+            t = None
+            if arg.isdigit() and 1 <= int(arg) <= len(ts):
+                t = ts[int(arg) - 1]
+            else:
+                for x in ts:
+                    if arg and arg in x["name"]:
+                        t = x
+                        break
+            if not t:
+                send("ما لقيت المهمة. اكتب /tasks.")
+            else:
+                self.start_bg(t, manual=True)
+                send("بدأت: " + t["name"] + ". أبلغك لما تخلص.")
+            return
+        if cmd == "/new":
+            self.tg_chat()["msgs"] = []
+            self.persist()
+            send("بدأنا محادثة جديدة.")
+            return
+        if tg.get("chat", True) is False:
+            send("المحادثة من تليقرام مطفية بإعدادات الربط.")
+            return
+        key = self.key_edit.text().strip()
+        if not key:
+            send("مفتاح DeepSeek غير مكتوب بالتطبيق.")
+            return
+        if self._tg_busy:
+            send("لسه أرد على رسالتك السابقة، انتظر شوي.")
+            return
+        self._tg_busy = True
+        ch = self.tg_chat()
+        ch["msgs"].append({"role": "user", "content": text, "shown": text, "names": []})
+        hist = [{"role": m["role"], "content": m.get("content", "")} for m in ch["msgs"][-20:] if isinstance(m.get("content"), str)]
+        model = self.model_box.currentText()
+        system = (SYSTEM_PROMPT + "\n" + memory_prompt() +
+                  "\nYou are answering through a Telegram bot: keep replies short and plain text. You have no access to files or tools here.")
+
+        def work():
+            try:
+                msg, usage = api_chat(key, model, [{"role": "system", "content": system}] + hist, think="off", timeout=300)
+                out = (msg.get("content") or "").strip() or "(بدون رد)"
+            except Exception as e:
+                out = "تعذّر الرد: %s" % str(e)[:200]
+            self.tg_bridge.reply.emit(out)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_tg_reply(self, out):
+        self._tg_busy = False
+        ch = self.tg_chat()
+        out2, _ = apply_memory_marks(out)
+        ch["msgs"].append({"role": "assistant", "content": out2, "reasoning": ""})
+        ch["updated"] = time.time()
+        self.persist()
+        self.refresh_list()
+        tg = self.tg_ready()
+        if tg:
+            threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], out2), daemon=True).start()
+
     def start_bg(self, task, files=None, manual=False):
         key = self.key_edit.text().strip()
         if not key:
@@ -7102,11 +7430,11 @@ class App(QMainWindow):
                 if files:
                     t["seen"] = list(set(t.get("seen") or []) | {os.path.basename(f) for f in files})
         self.save_cfg()
-        self.statusBar().showMessage("🤖 بدأت المهمة: " + task.get("name", ""), 4000)
+        self.statusBar().showMessage("بدأت المهمة: " + task.get("name", ""), 4000)
         threading.Thread(target=self.bg_worker, args=(task, key, files or []), daemon=True).start()
 
     def bg_worker(self, task, key, files):
-        title = "🤖 " + task.get("name", "مهمة")
+        title = "" + task.get("name", "مهمة")
         cid = uuid.uuid4().hex
         try:
             roots = [d for d in (task.get("dirs") or []) if os.path.isdir(d)]
@@ -7175,7 +7503,7 @@ class App(QMainWindow):
             chat = {"id": cid, "title": title, "updated": time.time(), "project": task.get("project", ""), "bg": True, "unread": True,
                     "settings": clean_settings({"allowed_dirs": roots, "tools_enabled": bool(roots)}, restrictive_settings()),
                     "journal": runner.journal[-300:],
-                    "msgs": [{"role": "user", "content": prompt, "shown": "🤖 " + task.get("name", "") + "\n" + task.get("prompt", ""), "names": []},
+                    "msgs": [{"role": "user", "content": prompt, "shown": "" + task.get("name", "") + "\n" + task.get("prompt", ""), "names": []},
                              {"role": "assistant", "content": final or "(بدون رد)", "reasoning": "", "activity": steps,
                               "cost": dict(cost, t=time.time())}]}
             self.q.put(("bg_done", (task["id"], chat, "")))
@@ -7186,12 +7514,18 @@ class App(QMainWindow):
     def on_bg_done(self, task_id, chat, err):
         self._bg_running.discard(task_id)
         if chat is None:
-            self.statusBar().showMessage("🤖 فشلت المهمة: " + err[:120], 8000)
+            self.statusBar().showMessage("فشلت المهمة: " + err[:120], 8000)
+            self.tg_notify("فشلت المهمة: " + err[:300])
             return
         self.chats.append(chat)
+        try:
+            last = [m for m in chat["msgs"] if m["role"] == "assistant"][-1].get("content", "")
+            self.tg_notify("خلصت المهمة: %s\n\n%s" % (chat["title"], str(last)[:3000]))
+        except Exception:
+            pass
         self.persist()
         self.refresh_list()
-        self.statusBar().showMessage("🔔 خلصت: " + chat["title"], 10000)
+        self.statusBar().showMessage("خلصت: " + chat["title"], 10000)
         try:
             QApplication.alert(self, 5000)
         except Exception:
@@ -7217,7 +7551,7 @@ class App(QMainWindow):
         self.proj_box.addItem("كل المحادثات", "*")
         self.proj_box.addItem("بدون مشروع", "")
         for p in self.cfg.get("projects") or []:
-            self.proj_box.addItem("📁 " + p["name"], p["id"])
+            self.proj_box.addItem("" + p["name"], p["id"])
         i = self.proj_box.findData(cur)
         self.proj_box.setCurrentIndex(i if i >= 0 else 0)
         self.proj_box.blockSignals(False)
@@ -7280,7 +7614,7 @@ class App(QMainWindow):
         msgs, done = [], []
         for i in idxs:
             ok, m = undo_entry(j[i])
-            msgs.append(("✓ " if ok else "✗ ") + m)
+            msgs.append(("تم: " if ok else "فشل: ") + m)
             if ok:
                 done.append(i)
         for i in done:
@@ -7305,7 +7639,7 @@ class App(QMainWindow):
 
     def update_peak(self):
         if is_peak():
-            self.peak_label.setText("⏱ وقت الذروة: التكلفة ضعف العادي — يرخص بعد %s" % self.next_offpeak())
+            self.peak_label.setText("وقت الذروة: التكلفة ضعف العادي — يرخص بعد %s" % self.next_offpeak())
             self.peak_label.setToolTip("DeepSeek تضاعف السعر في ساعات الذروة (الاثنين–الجمعة 01–04 و06–10 UTC). المهام الكبيرة الأفضل خارجها.")
         else:
             self.peak_label.setText("")
@@ -7325,6 +7659,12 @@ class App(QMainWindow):
         c = self.inp.textCursor()
         c.movePosition(QTextCursor.End)
         self.inp.setTextCursor(c)
+
+    def continue_reply(self):
+        if self.busy or not self.current:
+            return
+        self.inp.setPlainText("كمّل من حيث توقفت بالضبط، بدون ما تعيد اللي قلته.")
+        self.send()
 
     def regenerate(self):
         if self.busy or not self.current:
@@ -7625,14 +7965,14 @@ class App(QMainWindow):
                     th.setPixmap(pm.scaled(36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                     h.addWidget(th)
             else:
-                h.addWidget(QLabel("📄"))
+                h.addWidget(QLabel("ملف"))
             nm = os.path.basename(p)
             lab = QLabel(nm if len(nm) <= 24 else nm[:21] + "...")
             lab.setLayoutDirection(Qt.LeftToRight)
             lab.setToolTip(p)
             h.addWidget(lab)
             x = QToolButton()
-            x.setText("✕")
+            x.setText("إزالة")
             x.setObjectName("flat")
             x.clicked.connect(lambda _=False, pp=p: self.remove_attachment(pp))
             h.addWidget(x)
@@ -7825,6 +8165,8 @@ class App(QMainWindow):
                 if obj.get("usage"):
                     self.q.put(("usage", (payload.get("model"), obj["usage"], time.time())))
                 try:
+                    if obj["choices"][0].get("finish_reason"):
+                        self._finish = obj["choices"][0]["finish_reason"]
                     delta = obj["choices"][0]["delta"]
                 except Exception:
                     continue
@@ -7875,6 +8217,7 @@ class App(QMainWindow):
                 if use_tools:
                     payload["tools"] = runner.tools()
                 try:
+                    self._finish = ""
                     content, reasoning, calls = self.stream_once(key, payload)
                     net_retries = 0
                 except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
@@ -7919,6 +8262,8 @@ class App(QMainWindow):
                     return
                 if not calls or not use_tools:
                     self.report_changes(runner)
+                    if getattr(self, "_finish", "") == "length":
+                        self._cut_flag = True
                     self.q.put(("done", (content, reasoning)))
                     return
                 rounds += 1
@@ -8067,13 +8412,13 @@ class App(QMainWindow):
     def refresh_balance(self, force=False):
         key = self.key_edit.text().strip()
         if not key:
-            self.balance_btn.setText("💰 —")
+            self.balance_btn.setText("الرصيد: —")
             return
         if getattr(self, "_bal_busy", False) and not force:
             return
         self._bal_busy = True
         if not force or self.balance_btn.text().endswith("..."):
-            self.balance_btn.setText("💰 ...")
+            self.balance_btn.setText("الرصيد: ...")
 
         def work():
             try:
@@ -8093,7 +8438,7 @@ class App(QMainWindow):
                             num = None
                 text = " | ".join(parts) if parts else "0"
                 if data.get("is_available") is False:
-                    text += " ⚠ غير كافي"
+                    text += " تنبيه: غير كافي"
                 self.q.put(("balance", (text, num)))
             except urllib.error.HTTPError as e:
                 self.q.put(("balance", "المفتاح غلط" if e.code == 401 else "خطأ %s" % e.code))
@@ -8181,13 +8526,13 @@ class App(QMainWindow):
                 m, silent = val
                 if m:
                     self.pending_update = m
-                    self.update_btn.setText("⬆  تحديث %s متوفر" % m.get("version"))
+                    self.update_btn.setText("تحديث %s متوفر" % m.get("version"))
                     self.update_btn.setEnabled(True)
                     self.update_btn.setVisible(True)
                     if not silent:
                         self.start_update()
                 elif not silent:
-                    QMessageBox.information(self, "التحديثات", "أنت على آخر إصدار (%s) ✓" % APP_VERSION)
+                    QMessageBox.information(self, "التحديثات", "أنت على آخر إصدار (%s)" % APP_VERSION)
             elif kind == "update_check_err":
                 self._upd_busy = False
                 if not val[1]:
@@ -8196,11 +8541,11 @@ class App(QMainWindow):
                 self.statusBar().showMessage(val, 4000)
             elif kind == "update_err":
                 self.update_btn.setEnabled(True)
-                self.update_btn.setText("⬆  أعد محاولة التحديث")
+                self.update_btn.setText("أعد محاولة التحديث")
                 QMessageBox.warning(self, "التحديث", "فشل التحديث ولم يتغير شي:\n" + val)
             elif kind == "update_done":
                 self.persist()
-                QMessageBox.information(self, "التحديث", "تم التحديث ✓ سيُعاد تشغيل البرنامج الحين.")
+                QMessageBox.information(self, "التحديث", "تم التحديث. سيُعاد تشغيل البرنامج الحين.")
                 try:
                     if self.remember_box.isChecked() and self.key_edit.text().strip():
                         self.cfg["api_key"] = self.key_edit.text().strip()
@@ -8235,12 +8580,12 @@ class App(QMainWindow):
                     d_ = getattr(self, "_bal_delta", None)
                     if d_ is not None and time.time() - getattr(self, "_bal_delta_t", 0) < 180:
                         shown += "  (%+.4f)" % d_
-                    self.balance_btn.setText("💰 " + shown)
+                    self.balance_btn.setText("الرصيد: " + shown)
                     self.balance_btn.setToolTip("رصيد حسابك في DeepSeek (مباشر من حسابك)\nآخر تحديث: %s%s\nيتحدث تلقائيًا بعد كل رد، واضغط للتحديث الآن" % (
                         time.strftime("%H:%M:%S"),
                         ("\nآخر تغيّر: %+.4f" % d_) if d_ is not None else ""))
                 else:
-                    self.balance_btn.setText("💰 " + str(val))
+                    self.balance_btn.setText("الرصيد: " + str(val))
             elif kind == "bg_done":
                 self.on_bg_done(*val)
             elif kind == "journal":
@@ -8274,6 +8619,9 @@ class App(QMainWindow):
                 for mm in mem_msgs:
                     self.statusBar().showMessage(mm, 5000)
                 msg = {"role": "assistant", "content": content, "reasoning": reasoning}
+                if getattr(self, "_cut_flag", False) or "⏹ أوقفتّه بطلبك" in content:
+                    msg["cut"] = True
+                self._cut_flag = False
                 if L is not None and L.get("cost"):
                     msg["cost"] = dict(L["cost"], t=time.time())
                 if getattr(self, "_srcs", None):
@@ -8378,7 +8726,7 @@ class App(QMainWindow):
             return
         steps = rs.get("steps") or []
         done = [str(s.get("text", ""))[:160] for s in steps if s.get("k") == "tool" and s.get("ok", True)]
-        lines = ["⚠ البرنامج سكّر فجأة وهو يشتغل على طلبك. هذا اللي كان تم قبل ما يسكّر (%d عملية):" % int(rs.get("total_steps", len(done)))]
+        lines = ["تنبيه: البرنامج سكّر فجأة وهو يشتغل على طلبك. هذا اللي كان تم قبل ما يسكّر (%d عملية):" % int(rs.get("total_steps", len(done)))]
         lines += ["- " + d for d in done[-40:]]
         body = str(rs.get("body", "")).strip()
         if body:
