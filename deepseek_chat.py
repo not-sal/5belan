@@ -3019,7 +3019,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.14.1"
+APP_VERSION = "2.14.2"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -6336,9 +6336,7 @@ class App(QMainWindow):
             return out
         for i, m in enumerate(self.current["msgs"]):
             if m["role"] == "user":
-                for f in m.get("files") or []:
-                    if isinstance(f, dict) and f.get("path"):
-                        out.append({"src": "user", "name": f.get("name") or os.path.basename(f["path"]), "path": f["path"], "mi": i})
+                continue  # files the user sent are not listed here, only what the assistant made
             else:
                 for kind, name, body in extract_files(m.get("content", "")):
                     out.append({"src": "bot", "kind": kind, "name": name, "body": body, "mi": i})
@@ -6405,7 +6403,7 @@ class App(QMainWindow):
         icons = {".docx": "📄", ".pdf": "📕", ".xlsx": "📊", ".csv": "📊", ".png": "🖼", ".svg": "🖼", ".jpg": "🖼",
                  ".jpeg": "🖼", ".html": "🌐", ".md": "📝", ".txt": "📝", ".py": "🐍", ".json": "🧾"}
         seq = []
-        for gname, want_user, empty in (("أرسلتها أنت", True, "ما أرسلت ملفات بعد."), ("أرسلها خبيلان", False, "ما أرسل ملفات بعد.")):
+        for gname, want_user, empty in (("أرسلها خبيلان", False, "ما أرسل ملفات بعد."),):
             grp = [e for e in entries if (e["src"] == "user") == want_user]
             seq.append(("h", "%s (%d)" % (gname, len(grp))))
             seq += [("e", e) for e in grp] if grp else [("n", empty)]
