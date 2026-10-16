@@ -2171,6 +2171,7 @@ from PySide6.QtGui import (
     QTextTableFormat,
 )
 from PySide6.QtWidgets import (
+    QStyle,
     QApplication,
     QSizePolicy,
     QCheckBox,
@@ -2384,7 +2385,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -2842,6 +2843,15 @@ class ChatView(QTextBrowser):
                     parts.append((sep if parts else "") + s)
             return strip_bidi("".join(parts)).replace(" ", "\n").replace(" ", "\n")
         return strip_bidi(self.textCursor().selectedText()).replace(" ", "\n").replace(" ", "\n")
+
+    def selection_positions(self):
+        """Document positions of every block touched by the selection."""
+        if self.has_visual_selection():
+            return sorted({blk.position() for blk, _tl, _l, _x0, _x1 in self._ordered()})
+        c = self.textCursor()
+        if c.hasSelection():
+            return [c.selectionStart(), c.selectionEnd()]
+        return []
 
     def has_selection(self):
         return self.has_visual_selection() or self.textCursor().hasSelection()
@@ -3557,9 +3567,8 @@ class AppSettingsDialog(QDialog):
 class DeviceFilesDialog(QDialog):
     """Choose which folders the model may read, and which of them it may also change."""
 
-    def __init__(self, parent, settings, start_dir, others=None):
+    def __init__(self, parent, settings, start_dir):
         super().__init__(parent)
-        self.others = others or []
         self.setWindowTitle("إعدادات هذه المحادثة")
         self.resize(660, 620)
         self.start_dir = start_dir
@@ -3608,21 +3617,19 @@ class DeviceFilesDialog(QDialog):
         note2 = QLabel("ملفات النظام (ويندوز، Program Files، الأقراص...) محمية دائماً ولا يمسها الموديل حتى مع الحرية الكاملة.")
         note2.setWordWrap(True)
         lay.addWidget(note2)
-        if self.others:
-            crow = QHBoxLayout()
-            crow.addWidget(QLabel("نسخ الإعدادات من محادثة:"))
-            self.copy_box = QComboBox()
-            self.copy_box.addItem("— اختر —", -1)
-            for i, (t, _s) in enumerate(self.others):
-                self.copy_box.addItem(t, i)
-            self.copy_box.activated.connect(self.copy_from)
-            crow.addWidget(self.copy_box, 1)
-            lay.addLayout(crow)
         self.write_box.toggled.connect(self.on_write_toggled)
 
-        lay.addWidget(QLabel("المجلدات المسموحة (✓ = يقدر يعدّل داخلها، بدون ✓ = قراءة فقط):"))
+        lay.addWidget(QLabel("المجلدات المسموحة لهذي المحادثة (✎ يقدر يعدّل داخلها، 👁 قراءة فقط) — مرّر الماوس لرؤية المسار:"))
         self.list = QListWidget()
-        self.list.setLayoutDirection(Qt.LeftToRight)
+        self.list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.list.setMovement(QListWidget.Movement.Static)
+        self.list.setWordWrap(True)
+        self.list.setIconSize(QSize(34, 34))
+        self.list.setGridSize(QSize(120, 100))
+        self.list.setSpacing(2)
+        self.list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.list.itemDoubleClicked.connect(lambda _it: self.toggle_mode())
         writable = set(settings.get("writable_dirs") or [])
         for d in settings.get("allowed_dirs") or []:
             self.add_path(d, d in writable)
@@ -3633,7 +3640,7 @@ class DeviceFilesDialog(QDialog):
         b_add.clicked.connect(self.add_dir)
         b_del = QPushButton("إزالة المحدد")
         b_del.clicked.connect(self.remove_dir)
-        b_tog = QPushButton("تبديل: تعديل / قراءة فقط")
+        b_tog = QPushButton("تبديل: تعديل ⇄ قراءة")
         b_tog.clicked.connect(self.toggle_mode)
         row.addWidget(b_add)
         row.addWidget(b_del)
@@ -3648,38 +3655,34 @@ class DeviceFilesDialog(QDialog):
         box.rejected.connect(self.reject)
         lay.addWidget(box)
 
-    def copy_from(self, _idx=None):
-        i = self.copy_box.currentData()
-        if i is None or i < 0:
-            return
-        s = self.others[i][1]
-        self.enable_box.setChecked(bool(s.get("tools_enabled")))
-        self.write_box.setChecked(bool(s.get("write_enabled")))
-        self.delete_box.setChecked(bool(s.get("delete_enabled")))
-        self.backup_box.setChecked(s.get("backup_enabled", True) is not False)
-        self.computer_box.setChecked(bool(s.get("computer_enabled")))
-        self.browser_box.setChecked(bool(s.get("browser_enabled")))
-        self.approval_box.setCurrentIndex(0 if s.get("confirm_edits", True) is not False else 1)
-        self.shell_box.setCurrentIndex({"off": 0, "ask": 1, "free": 2}.get(s.get("shell_mode", "off"), 0))
-        self.list.clear()
-        w = set(s.get("writable_dirs") or [])
-        for d in s.get("allowed_dirs") or []:
-            self.add_path(d, d in w)
-
     def add_path(self, path, writable):
         from PySide6.QtWidgets import QListWidgetItem
 
-        it = QListWidgetItem(path)
-        it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-        it.setCheckState(Qt.CheckState.Checked if writable else Qt.CheckState.Unchecked)
+        name = os.path.basename(path.rstrip("/\\")) or path
+        it = QListWidgetItem(self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon), "")
+        it.setData(Qt.UserRole, path)
+        it.setData(Qt.UserRole + 1, bool(writable))
+        it.setToolTip(path)
+        it.setSizeHint(QSize(112, 92))
         self.list.addItem(it)
+        self._label(it, name)
+
+    def _label(self, it, name=None):
+        path = it.data(Qt.UserRole)
+        if name is None:
+            name = os.path.basename(path.rstrip("/\\")) or path
+        if len(name) > 14:
+            name = name[:13] + "…"
+        it.setText(name + "\n" + ("✎ تعديل" if it.data(Qt.UserRole + 1) else "👁 قراءة"))
 
     def on_write_toggled(self, on):
         if not on:
             return
-        if all(self.list.item(i).checkState() != Qt.CheckState.Checked for i in range(self.list.count())):
+        if not any(self.list.item(i).data(Qt.UserRole + 1) for i in range(self.list.count())):
             for i in range(self.list.count()):
-                self.list.item(i).setCheckState(Qt.CheckState.Checked)
+                it = self.list.item(i)
+                it.setData(Qt.UserRole + 1, True)
+                self._label(it)
 
     def add_dir(self):
         d = QFileDialog.getExistingDirectory(self, "اختر مجلد", self.start_dir)
@@ -3695,7 +3698,7 @@ class DeviceFilesDialog(QDialog):
             )
             if ans != YES:
                 return
-        existing = [self.list.item(i).text() for i in range(self.list.count())]
+        existing = [self.list.item(i).data(Qt.UserRole) for i in range(self.list.count())]
         if d not in existing:
             self.add_path(d, self.write_box.isChecked())
 
@@ -3704,17 +3707,17 @@ class DeviceFilesDialog(QDialog):
             self.list.takeItem(self.list.row(it))
 
     def toggle_mode(self):
-        c = Qt.CheckState.Checked
         for it in self.list.selectedItems():
-            it.setCheckState(Qt.CheckState.Unchecked if it.checkState() == c else c)
+            it.setData(Qt.UserRole + 1, not it.data(Qt.UserRole + 1))
+            self._label(it)
 
     def values(self):
         dirs, writable = [], []
         for i in range(self.list.count()):
             it = self.list.item(i)
-            dirs.append(it.text())
-            if it.checkState() == Qt.CheckState.Checked:
-                writable.append(it.text())
+            dirs.append(it.data(Qt.UserRole))
+            if it.data(Qt.UserRole + 1):
+                writable.append(it.data(Qt.UserRole))
         return {
             "tools_enabled": self.enable_box.isChecked(),
             "write_enabled": self.write_box.isChecked(),
@@ -3802,7 +3805,7 @@ def make_qss(c):
     QPushButton#primary:disabled { background: %(border)s; color: %(dim)s; }
     QPushButton#flat, QToolButton#flat { background: transparent; border: none; color: %(dim)s; padding: 4px 8px; }
     QPushButton#flat:hover, QToolButton#flat:hover { color: %(text)s; background: %(hover)s; }
-    QPushButton#send { background: %(accent)s; color: white; border: none; border-radius: 16px; font-size: 16px; font-weight: bold; }
+    QPushButton#send { background: %(accent)s; color: white; border: none; border-radius: 20px; font-size: 20px; font-weight: bold; padding: 0; }
     QPushButton#send:disabled { background: %(border)s; }
     QPushButton#banner { background: %(accent)s; color: white; border: none; border-radius: 12px; padding: 4px 12px; }
     QComboBox { background: transparent; color: %(dim)s; border: none; padding: 4px 8px; }
@@ -3875,6 +3878,7 @@ class App(QMainWindow):
         self.last_dir = ""
         self._confirm_open = False
         self.copy_store = {}
+        self.reply_ranges = []
         self.web = None
         self.web_ok = False
         self.browser_container = None
@@ -3990,12 +3994,6 @@ class App(QMainWindow):
         self.update_btn.clicked.connect(self.start_update)
         self.update_btn.setVisible(False)
         hl.addWidget(self.update_btn)
-        self.reply_btn = QPushButton("↩ رد")
-        self.reply_btn.setObjectName("banner")
-        self.reply_btn.setToolTip("حدّد جزء من الكلام بالماوس ثم اضغط للرد عليه")
-        self.reply_btn.clicked.connect(self.add_quote_from_selection)
-        self.reply_btn.setVisible(False)
-        hl.addWidget(self.reply_btn)
         def icon_btn(text, tip, checkable=False):
             b = QToolButton()
             b.setObjectName("iconbtn")
@@ -4043,6 +4041,18 @@ class App(QMainWindow):
         self.files_bar.setVisible(False)
         ml.addWidget(self.files_bar)
 
+        self.reply_btn = QPushButton("رد على المحدد")
+        self.reply_btn.setObjectName("banner")
+        self.reply_btn.setToolTip("حدّد جزء من رد خبيلان بالماوس ثم اضغط للرد عليه")
+        self.reply_btn.clicked.connect(self.add_quote_from_selection)
+        self.reply_btn.setVisible(False)
+        rrow = QHBoxLayout()
+        rrow.setContentsMargins(0, 2, 0, 2)
+        rrow.addStretch(1)
+        rrow.addWidget(self.reply_btn)
+        rrow.addStretch(1)
+        ml.addLayout(rrow)
+
         # ---------- composer (rounded box like the Claude app) ----------
         wrap = QWidget()
         wl = QHBoxLayout(wrap)
@@ -4077,16 +4087,16 @@ class App(QMainWindow):
         self.inp.image_requested.connect(self.add_pasted_image)
         self.inp.text_requested.connect(self.add_pasted_text)
         cl.addWidget(self.inp)
-        brow = QHBoxLayout()
+        brow_w = QWidget()
+        brow_w.setLayoutDirection(Qt.RightToLeft)
+        brow = QHBoxLayout(brow_w)
+        brow.setContentsMargins(0, 0, 0, 0)
         brow.setSpacing(4)
         self.plus_btn = QToolButton()
-        self.plus_btn.setText("＋")
+        self.plus_btn.setText("📎")
         self.plus_btn.setObjectName("flat")
-        self.plus_btn.setPopupMode(QToolButton.InstantPopup)
-        pm = QMenu(self.plus_btn)
-        pm.addAction("📎  إرفاق ملفات أو صور…", self.pick_files)
-        pm.addAction("📋  لصق من الحافظة", self.paste_clipboard)
-        self.plus_btn.setMenu(pm)
+        self.plus_btn.setToolTip("إرفاق ملفات أو صور")
+        self.plus_btn.clicked.connect(self.pick_files)
         brow.addWidget(self.plus_btn)
         self.access_btn = QPushButton()
         self.access_btn.setObjectName("flat")
@@ -4105,10 +4115,11 @@ class App(QMainWindow):
         brow.addWidget(self.model_box)
         self.btn = QPushButton("↑")
         self.btn.setObjectName("send")
-        self.btn.setFixedSize(34, 34)
+        self.btn.setFixedSize(40, 40)
         self.btn.clicked.connect(self.send)
-        brow.addWidget(self.btn)
-        cl.addLayout(brow)
+        brow.addWidget(self.btn, 0, Qt.AlignVCenter)
+        brow.setAlignment(Qt.AlignVCenter)
+        cl.addWidget(brow_w)
         wl.addStretch(1)
         wl.addWidget(composer, 100)
         wl.addStretch(1)
@@ -4166,17 +4177,28 @@ class App(QMainWindow):
         self.inp.setFocus()
 
     # ---------- reply to a part of a message ----------
+    def selection_in_replies(self):
+        """True only when everything selected lies inside خبيلان's replies."""
+        try:
+            pos = self.view.selection_positions()
+        except Exception:
+            return False
+        if not pos:
+            return False
+        rr = getattr(self, "reply_ranges", [])
+        return all(any(a <= p <= b for a, b in rr) for p in pos)
+
     def on_selection(self):
         try:
             t = self.view.selected_text().strip()
         except Exception:
             t = ""
-        self.reply_btn.setVisible(bool(t))
+        self.reply_btn.setVisible(bool(t) and self.selection_in_replies())
 
     def add_quote_from_selection(self):
         sel = self.view.selected_text().strip()
-        if not sel:
-            self.statusBar().showMessage("حدّد جزء من الكلام بالماوس أول", 2500)
+        if not sel or not self.selection_in_replies():
+            self.statusBar().showMessage("حدّد جزء من رد خبيلان بالماوس أول", 2500)
             return
         if len(sel) > 1500:
             sel = sel[:1500] + "…"
@@ -5052,9 +5074,7 @@ class App(QMainWindow):
         self.update_settings_summary()
 
     def open_tools_dialog(self):
-        others = [(c["title"], dict(c["settings"])) for c in self.chats
-                  if c is not self.current and isinstance(c.get("settings"), dict)]
-        dlg = DeviceFilesDialog(self, self.collect_settings(), self.default_dir(), others)
+        dlg = DeviceFilesDialog(self, self.collect_settings(), self.default_dir())
         if not dlg.exec():
             return
         v = dlg.values()
@@ -5065,7 +5085,7 @@ class App(QMainWindow):
             QMessageBox.information(
                 self,
                 "ملفات الجهاز",
-                "علّم ✓ على مجلد واحد على الأقل عشان يشتغل التعديل، أو ألغِ «السماح بإنشاء وتعديل الملفات».",
+                "اجعل مجلد واحد على الأقل بوضع ✎ تعديل على الأقل عشان يشتغل التعديل، أو ألغِ «السماح بإنشاء وتعديل الملفات».",
             )
             v["write_enabled"] = False
         merged = self.collect_settings()
@@ -5137,6 +5157,7 @@ class App(QMainWindow):
         sb = self.view.verticalScrollBar()
         keep = sb.value()
         self.view.clear()
+        self.reply_ranges = []
         self.copy_store.clear()
         self.show_files("")
         if not self.current:
@@ -5242,8 +5263,10 @@ class App(QMainWindow):
         for w in warns:
             c.insertText("[" + w + "]\n", self.fmt["file"])
         if body:
+            r0 = c.position()
             self.insert_rich_body(c, body, act_id)
             if not live:
+                self.reply_ranges.append((r0, self._end_cursor().position()))
                 self._insert_reply_copy(c, act_id, body)
 
     def _render_details(self, c, steps, act_id="x", live=False):
