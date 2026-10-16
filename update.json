@@ -1,10 +1,10 @@
 {
-  "version": "2.3.0",
-  "notes": "New: natural text selection, boxed chat bubbles, quote chips, redesigned thinking, tabbed background browser, safer long commands",
+  "version": "2.4.0",
+  "notes": "Icon toolbar, run/copy buttons for shell blocks, auto chat titles, chat separators, quote chips, new thinking view, background tabbed browser, natural selection incl. words, live balance",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "95a97e2af027c4eafd066fbc7ddde246f94ce8b35c1ea096cd2c9e0f842fbea7"
+      "sha256": "6203a82e35e4ca53d9afe9ddb992e7188a5ae4f87ce5700cca3c856964552ab9"
     },
     {
       "name": "guard.py",

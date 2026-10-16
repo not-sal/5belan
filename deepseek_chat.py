@@ -2166,6 +2166,7 @@ from PySide6.QtGui import (
     QTextFrameFormat,
     QTextImageFormat,
     QTextLength,
+    QTextLine,
     QTextOption,
     QTextTableFormat,
 )
@@ -2383,7 +2384,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -2626,6 +2627,8 @@ class ChatView(QTextBrowser):
         self._last_pos = None
         self._clicks = 0
         self._click_t = 0.0
+        self._force = False        # a word/paragraph selection may be narrower than the drag threshold
+        self._word = None          # anchor word while dragging after a double-click
         self._auto = QTimer(self)
         self._auto.setInterval(30)
         self._auto.timeout.connect(self._auto_scroll)
@@ -2746,7 +2749,68 @@ class ChatView(QTextBrowser):
 
     # ----- public API
     def has_visual_selection(self):
-        return self._a is not None and self._b is not None and (abs(self._a.x() - self._b.x()) > 2 or abs(self._a.y() - self._b.y()) > 2)
+        if self._a is None or self._b is None:
+            return False
+        return self._force or abs(self._a.x() - self._b.x()) > 2 or abs(self._a.y() - self._b.y()) > 2
+
+    def _word_at(self, pt):
+        """The word under a document point: its visual box (lo..hi), reading-order edges and line y."""
+        import unicodedata
+        la = self._line_at(pt)
+        if not la:
+            return None
+        blk, tl, i = la
+        line = tl.lineAt(i)
+        n = line.textLength()
+        txt = blk.text()
+        if n <= 0:
+            return None
+        ox = tl.position().x()
+        a = line.textStart()
+        pos = line.xToCursor(pt.x() - ox, QTextLine.CursorOnCharacter)
+        pos = max(a, min(pos, a + n - 1))
+        if pos >= len(txt):
+            return None
+
+        def isw(c):
+            return c.isalnum() or c == "_" or unicodedata.category(c).startswith("M")
+
+        s_, e_ = pos, pos + 1
+        if isw(txt[pos]):
+            while s_ > a and isw(txt[s_ - 1]):
+                s_ -= 1
+            while e_ < a + n and e_ < len(txt) and isw(txt[e_]):
+                e_ += 1
+        xs = line.cursorToX(s_)[0] + ox
+        xe = line.cursorToX(e_)[0] + ox
+        lo, hi = min(xs, xe), max(xs, xe)
+        y = tl.position().y() + line.rect().center().y()
+        prtl = self._is_rtl(txt)
+        return {"key": (blk.position(), i), "lo": lo, "hi": hi, "y": y,
+                "lead": hi if prtl else lo, "trail": lo if prtl else hi, "rtl": prtl}
+
+    def _set_word_sel(self, w):
+        self._a = QPointF(w["lo"], w["y"])
+        self._b = QPointF(w["hi"], w["y"])
+        self._force = True
+
+    def _select_block(self, pos):
+        la = self._line_at(self._to_doc(pos))
+        if not la:
+            return
+        blk, tl, _i = la
+        if tl.lineCount() == 0:
+            return
+        rtl = self._is_rtl(blk.text())
+        ox = tl.position().x()
+        first, last = tl.lineAt(0), tl.lineAt(tl.lineCount() - 1)
+        flo, fhi = self._line_extent(tl, first)
+        llo, lhi = self._line_extent(tl, last)
+        y1 = tl.position().y() + first.rect().center().y()
+        y2 = tl.position().y() + last.rect().center().y()
+        self._a = QPointF((fhi if rtl else flo) + ox, y1)
+        self._b = QPointF((llo if rtl else lhi) + ox, y2)
+        self._force = True
 
     def selected_text(self):
         if self.has_visual_selection():
@@ -2776,6 +2840,8 @@ class ChatView(QTextBrowser):
     def clear_selection(self):
         changed = self._a is not None or self.textCursor().hasSelection()
         self._a = self._b = None
+        self._force = False
+        self._word = None
         c = self.textCursor()
         c.clearSelection()
         self.setTextCursor(c)
@@ -2823,11 +2889,13 @@ class ChatView(QTextBrowser):
         self._press_prev = pos
         if self._on_link:
             return super().mousePressEvent(e)
-        if self._clicks >= 2:
-            cur = self.cursorForPosition(pos)
-            cur.select(QTextCursor.BlockUnderCursor if self._clicks >= 3 else QTextCursor.WordUnderCursor)
-            self._a = self._b = None
-            self.setTextCursor(cur)
+        self._word = None
+        self._force = False
+        if self._clicks >= 3:
+            self._select_block(pos)
+            c0 = self.textCursor()
+            c0.clearSelection()
+            self.setTextCursor(c0)
             self.viewport().update()
             self.selection_changed.emit()
             return
@@ -2845,6 +2913,28 @@ class ChatView(QTextBrowser):
     _press_prev = None
     _on_link = False
 
+    def mouseDoubleClickEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return super().mouseDoubleClickEvent(e)
+        pos = e.position().toPoint()
+        if self.anchorAt(pos):
+            return super().mouseDoubleClickEvent(e)
+        w = self._word_at(self._to_doc(pos))
+        self._clicks = 2
+        self._click_t = time.time()
+        self._press_prev = pos
+        self._press = pos
+        self._drag = False
+        self._on_link = False
+        c0 = self.textCursor()
+        c0.clearSelection()
+        self.setTextCursor(c0)
+        if w:
+            self._word = w
+            self._set_word_sel(w)
+        self.viewport().update()
+        self.selection_changed.emit()
+
     def mouseMoveEvent(self, e):
         pos = e.position().toPoint()
         if (e.buttons() & Qt.LeftButton) and self._press is not None and not self._on_link:
@@ -2852,7 +2942,20 @@ class ChatView(QTextBrowser):
                 return
             self._drag = True
             self._last_pos = pos
-            self._b = self._to_doc(pos)
+            if self._word is not None:
+                w2 = self._word_at(self._to_doc(pos))
+                if w2:
+                    w1 = self._word
+                    def rd(w):  # position in reading order inside a line
+                        return -w["lo"] if w["rtl"] else w["lo"]
+                    after = w2["key"] > w1["key"] or (w2["key"] == w1["key"] and rd(w2) >= rd(w1))
+                    if after:
+                        self._a, self._b = QPointF(w1["lead"], w1["y"]), QPointF(w2["trail"], w2["y"])
+                    else:
+                        self._a, self._b = QPointF(w1["trail"], w1["y"]), QPointF(w2["lead"], w2["y"])
+                    self._force = True
+            else:
+                self._b = self._to_doc(pos)
             self.viewport().update()
             vh = self.viewport().height()
             if pos.y() < 8 or pos.y() > vh - 8:
@@ -2878,7 +2981,8 @@ class ChatView(QTextBrowser):
         else:
             self._auto.stop()
             return
-        self._b = self._to_doc(self._last_pos)
+        if self._word is None:
+            self._b = self._to_doc(self._last_pos)
         self.viewport().update()
         self.selection_changed.emit()
 
@@ -2888,6 +2992,7 @@ class ChatView(QTextBrowser):
             self._on_link = False
             return super().mouseReleaseEvent(e)
         self._press = None
+        self._word = None if not self._drag else self._word
         if not self._drag and self._clicks == 1:
             self._a = self._b = None
             self.viewport().update()
@@ -2914,6 +3019,59 @@ class ChatView(QTextBrowser):
         a2 = m.addAction("تحديد الكل")
         a2.triggered.connect(lambda: (setattr(self, "_a", None), self.selectAll(), self.viewport().update(), self.selection_changed.emit()))
         m.exec(e.globalPos())
+
+
+SHELL_LANGS_WIN = {"powershell", "ps1", "pwsh", "cmd", "bat", "batch", "psh"}
+SHELL_LANGS_UNIX = {"bash", "sh", "zsh", "shell", "console", "terminal", "fish"}
+
+
+def shell_family(lang):
+    l = (lang or "").strip().lower()
+    if l in SHELL_LANGS_WIN:
+        return "win"
+    if l in SHELL_LANGS_UNIX:
+        return "unix"
+    return None
+
+
+class RunOutputDialog(QDialog):
+    """Shows a command that the user chose to run from a reply, then its output."""
+
+    def __init__(self, parent, code, stop_event):
+        super().__init__(parent)
+        self.setWindowTitle("تشغيل الأمر")
+        self.resize(720, 460)
+        self.stop_event = stop_event
+        lay = QVBoxLayout(self)
+        self.head = QLabel("⏳ يشتغل…")
+        lay.addWidget(self.head)
+        self.cmd = QPlainTextEdit(_cut(code, 3000))
+        self.cmd.setReadOnly(True)
+        self.cmd.setFixedHeight(90)
+        self.cmd.setLayoutDirection(Qt.LeftToRight)
+        lay.addWidget(self.cmd)
+        self.out = QPlainTextEdit()
+        self.out.setReadOnly(True)
+        self.out.setLayoutDirection(Qt.LeftToRight)
+        self.out.setFont(QFont("Consolas" if IS_WIN else "monospace", 10))
+        lay.addWidget(self.out, 1)
+        row = QHBoxLayout()
+        self.stop_btn = QPushButton("⏹ إيقاف")
+        self.stop_btn.clicked.connect(self.stop_event.set)
+        self.copy_btn = QPushButton("⧉ نسخ الناتج")
+        self.copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(self.out.toPlainText()))
+        close = QPushButton("إغلاق")
+        close.clicked.connect(self.close)
+        row.addWidget(self.stop_btn)
+        row.addWidget(self.copy_btn)
+        row.addStretch(1)
+        row.addWidget(close)
+        lay.addLayout(row)
+
+    def done(self, text):
+        self.head.setText("✓ انتهى")
+        self.stop_btn.setEnabled(False)
+        self.out.setPlainText(text)
 
 
 class BrowserPanel(QWidget):
@@ -3158,6 +3316,47 @@ class BrowserPanel(QWidget):
     def agent_back(self):
         self.agent_page()
         self.agent_view.back()
+
+
+def html_to_text(html_txt):
+    """(title, readable text) from an HTML page, without scripts and styles."""
+    from html.parser import HTMLParser
+
+    class P(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.skip = 0
+            self.title = ""
+            self.in_title = False
+            self.parts = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style", "noscript", "svg"):
+                self.skip += 1
+            elif tag == "title":
+                self.in_title = True
+            elif tag in ("p", "br", "div", "li", "tr", "h1", "h2", "h3", "h4", "section", "article"):
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in ("script", "style", "noscript", "svg") and self.skip:
+                self.skip -= 1
+            elif tag == "title":
+                self.in_title = False
+
+        def handle_data(self, data):
+            if self.in_title:
+                self.title += data
+            elif not self.skip and data.strip():
+                self.parts.append(data.strip() + " ")
+
+    p = P()
+    try:
+        p.feed(html_txt)
+    except Exception:
+        pass
+    text = re.sub(r"\n\s*\n+", "\n\n", "".join(p.parts)).strip()
+    return p.title.strip(), text
 
 
 def to_url(target):
@@ -3540,6 +3739,10 @@ def make_qss(c):
     QMainWindow, QDialog { background: %(bg)s; }
     QTextBrowser { background: %(bg)s; border: none; }
     QWidget#side, QWidget#filespanel { background: %(side)s; }
+    QToolButton#iconbtn { background: transparent; border: 1px solid transparent; border-radius: 9px; font-size: 17px; padding: 2px; }
+    QToolButton#iconbtn:hover { background: %(hover)s; }
+    QToolButton#iconbtn:checked { background: %(bubble)s; border-color: %(accent)s; }
+    QFrame#vsep { color: %(border)s; }
     QToolButton#quotechip { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 9px; padding: 3px 9px; color: %(text)s; }
     QToolButton#quotechip:hover { border-color: %(accent)s; }
     QFrame#quotecard { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 10px; }
@@ -3551,9 +3754,9 @@ def make_qss(c):
     QLabel#h2 { font-size: 14px; font-weight: bold; padding-top: 8px; }
     QLabel#chip { color: %(dim)s; }
     QListWidget#chats { background: transparent; border: none; padding: 0; }
-    QListWidget#chats::item { padding: 8px 10px; border-radius: 8px; color: %(text)s; }
+    QListWidget#chats::item { padding: 10px 10px; border: none; border-bottom: 1px solid %(border)s; border-radius: 0; color: %(text)s; }
     QListWidget#chats::item:hover { background: %(hover)s; }
-    QListWidget#chats::item:selected { background: %(bubble)s; color: %(text)s; }
+    QListWidget#chats::item:selected { background: %(bubble)s; color: %(text)s; border-right: 3px solid %(accent)s; }
     QPlainTextEdit { background: transparent; color: %(text)s; border: none; padding: 4px; }
     QFrame#composer { background: %(input)s; border: 1px solid %(border)s; border-radius: 18px; }
     QFrame#composer QWidget { background: transparent; }
@@ -3720,14 +3923,26 @@ class App(QMainWindow):
         self.listw.setContextMenuPolicy(Qt.CustomContextMenu)
         self.listw.customContextMenuRequested.connect(self.chat_menu)
         sl.addWidget(self.listw, 1)
-        self.settings_btn = QPushButton("⚙  الإعدادات")
-        self.settings_btn.setObjectName("flat")
+        bottom = QHBoxLayout()
+        self.settings_btn = QToolButton()
+        self.settings_btn.setObjectName("iconbtn")
+        self.settings_btn.setText("⚙")
+        self.settings_btn.setToolTip("إعدادات التطبيق (عامة لكل المحادثات): الثيم، الخط، التحديثات")
+        self.settings_btn.setFixedSize(38, 34)
+        self.settings_btn.setCursor(Qt.PointingHandCursor)
         self.settings_btn.clicked.connect(self.open_app_settings)
-        sl.addWidget(self.settings_btn)
+        bottom.addWidget(self.settings_btn)
+        bottom.addStretch(1)
+        sl.addLayout(bottom)
         side.setMinimumWidth(230)
         side.setMaximumWidth(360)
         splitter.addWidget(side)
         QTimer.singleShot(1200, self.refresh_balance)
+        self._bal_num = None
+        self._bal_changed = False
+        self.bal_timer = QTimer(self)
+        self.bal_timer.timeout.connect(lambda: self.refresh_balance())
+        self.bal_timer.start(5 * 60 * 1000)
 
         # ---------- main area ----------
         main = QWidget()
@@ -3751,25 +3966,38 @@ class App(QMainWindow):
         self.update_btn.clicked.connect(self.start_update)
         self.update_btn.setVisible(False)
         hl.addWidget(self.update_btn)
-        self.reply_btn = QPushButton("↩ رد على المحدد")
+        self.reply_btn = QPushButton("↩ رد")
         self.reply_btn.setObjectName("banner")
         self.reply_btn.setToolTip("حدّد جزء من الكلام بالماوس ثم اضغط للرد عليه")
         self.reply_btn.clicked.connect(self.add_quote_from_selection)
         self.reply_btn.setVisible(False)
         hl.addWidget(self.reply_btn)
-        self.files_btn = QPushButton("📁 الملفات")
-        self.files_btn.setCheckable(True)
-        self.files_btn.toggled.connect(self.toggle_files_panel)
-        hl.addWidget(self.files_btn)
-        self.browser_btn = QPushButton("🌐 المتصفح")
-        self.browser_btn.setCheckable(True)
-        self.browser_btn.toggled.connect(self.toggle_browser)
-        hl.addWidget(self.browser_btn)
-        self.balance_btn = QPushButton("💰 الرصيد: ...")
+        def icon_btn(text, tip, checkable=False):
+            b = QToolButton()
+            b.setObjectName("iconbtn")
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setCheckable(checkable)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedSize(38, 34)
+            return b
+
+        self.balance_btn = QPushButton("💰 ...")
+        self.balance_btn.setObjectName("flat")
         self.balance_btn.setToolTip("الرصيد المتبقي في حساب DeepSeek — يتحدث تلقائيًا بعد كل رد، واضغط للتحديث الآن")
         self.balance_btn.clicked.connect(lambda: self.refresh_balance(force=True))
         hl.addWidget(self.balance_btn)
-        self.chat_settings_btn = QPushButton("⚙ إعدادات المحادثة")
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setObjectName("vsep")
+        hl.addWidget(sep)
+        self.files_btn = icon_btn("📁", "ملفات هذي المحادثة", True)
+        self.files_btn.toggled.connect(self.toggle_files_panel)
+        hl.addWidget(self.files_btn)
+        self.browser_btn = icon_btn("🌐", "المتصفح المدمج (يشتغل بالخلفية حتى لو أخفيته)", True)
+        self.browser_btn.toggled.connect(self.toggle_browser)
+        hl.addWidget(self.browser_btn)
+        self.chat_settings_btn = icon_btn("🎛", "إعدادات هذي المحادثة فقط: الصلاحيات، الملفات، الأوامر")
         self.chat_settings_btn.clicked.connect(self.open_tools_dialog)
         hl.addWidget(self.chat_settings_btn)
         header.setFixedHeight(52)  # constant height: showing/hiding the reply button must never move the chat text
@@ -3816,7 +4044,6 @@ class App(QMainWindow):
         self.inp = PasteEdit()
         self.inp.setFont(QFont(FONT["family"], TEXT_FONT_SIZE))
         self.inp.setFixedHeight(46)
-        self.inp.setPlaceholderText("اكتب رسالتك هنا…  (Enter للإرسال، Shift+Enter لسطر جديد، Ctrl+V للصق صورة أو ملف)")
         self.inp.setLayoutDirection(Qt.RightToLeft)
         self.inp.document().setDefaultTextOption(auto_direction_option())
         self.inp.installEventFilter(self)
@@ -4049,7 +4276,7 @@ class App(QMainWindow):
     def refresh_files_panel(self):
         entries = self.gather_files()
         sig = tuple((e["src"], e["name"], e["mi"]) for e in entries)
-        self.files_btn.setText("📁 الملفات (%d)" % len(entries) if entries else "📁 الملفات")
+        self.files_btn.setText("📁 %d" % len(entries) if entries else "📁")
         if sig == getattr(self, "_files_sig", None):
             return
         self._files_sig = sig
@@ -4463,7 +4690,7 @@ class App(QMainWindow):
         fn.setPointSizeF(max(8, TEXT_FONT_SIZE - 3))
         who.setFont(fn)
         lb = QTextBlockFormat()
-        lb.setAlignment(Qt.AlignRight)
+        lb.setAlignment(Qt.AlignLeading)
         lb.setLayoutDirection(Qt.RightToLeft)
         cc.setBlockFormat(lb)
         cc.insertText("أنت", who)
@@ -4626,6 +4853,32 @@ class App(QMainWindow):
         except Exception:
             self._resolve(slot, "opened")
 
+    def _text_browser(self, action, kw, slot):
+        """No browser engine on this system: open/read still work in text mode (download the page and read its text)."""
+        if action == "open":
+            url = to_url(kw.get("target", ""))
+
+            def work():
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (5belan text mode)"})
+                    with urllib.request.urlopen(req, timeout=25) as r:
+                        raw = r.read(3 * 1024 * 1024)
+                        ctype = r.headers.get_content_charset() or "utf-8"
+                        final = r.geturl()
+                    html_txt = raw.decode(ctype, errors="replace")
+                    title, text = html_to_text(html_txt)
+                    self._text_page = {"title": title, "url": final, "text": text}
+                    self._resolve(slot, "opened (text mode): %s — %s" % (title, final))
+                except Exception as e:
+                    self._resolve(slot, "Error: could not open the page: %s" % e)
+
+            threading.Thread(target=work, daemon=True).start()
+        elif action == "read":
+            p = getattr(self, "_text_page", None)
+            self._resolve(slot, self._fmt_read(json.dumps(p)) if p else "Error: no page is open yet; call browser_open first")
+        else:
+            self._resolve(slot, "Error: this system has no browser engine, so only opening and reading pages works (install PySide6-WebEngine for clicking and typing)")
+
     def _fmt_read(self, r):
         d = {}
         try:
@@ -4642,7 +4895,7 @@ class App(QMainWindow):
     def _do_browser(self, val):
         action, kw, slot = val
         if not self.ensure_browser(silent=True):
-            self._resolve(slot, "Error: the built-in browser is not available (install PySide6-WebEngine)")
+            self._text_browser(action, kw, slot)
             return
         try:
             page = self.web.agent_page()
@@ -4670,6 +4923,49 @@ class App(QMainWindow):
         except Exception as e:
             self._resolve(slot, "Error: " + str(e))
 
+    def run_snippet(self, cid):
+        """Run a command block from a reply on this computer, after asking and after the OS-protection check."""
+        code = self.copy_store.get(cid, "")
+        if not code.strip():
+            return
+        danger = shell_danger(code)
+        if danger:
+            QMessageBox.warning(self, "5belan", "رفضت تشغيله: %s.\nالبرنامج ما يلمس ملفات النظام أبداً." % danger)
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("تشغيل الأمر")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("تشغيل هذا الأمر على جهازك؟")
+        box.setDetailedText(_cut(code, 20000))
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        runner = ToolRunner(roots=[], shell_mode="free")
+        stop = threading.Event()
+        runner.stop_event = stop
+        dlg = RunOutputDialog(self, code, stop)
+        holder = {}
+
+        def work():
+            try:
+                holder["out"] = runner.run_command({"command": code, "explanation": "run from reply"})
+            except Exception as e:
+                holder["out"] = "Error: %s" % e
+
+        threading.Thread(target=work, daemon=True).start()
+        tm = QTimer(dlg)
+
+        def poll_run():
+            if "out" in holder:
+                tm.stop()
+                dlg.done(holder["out"])
+
+        tm.timeout.connect(poll_run)
+        tm.start(250)
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.show()
+
     # ---------- copy / quote ----------
     def _copy(self, text):
         try:
@@ -4687,21 +4983,26 @@ class App(QMainWindow):
         self.statusBar().showMessage("ما فيه رد بعد", 1500)
 
     def update_settings_summary(self):
-        """The small access chip under the message box shows what this chat may do on the computer."""
-        parts = []
+        """The small chip under the message box shows, with symbols only, what this chat may do on the computer."""
+        icons, names = [], []
         if self.tools_enabled:
             if self.write_enabled and self.writable_dirs:
-                parts.append("ملفات: قراءة وتعديل")
+                icons.append("📂✎")
+                names.append("ملفات: قراءة وتعديل")
             else:
-                parts.append("ملفات: قراءة")
+                icons.append("📂")
+                names.append("ملفات: قراءة")
         if self.shell_mode in ("ask", "free"):
-            parts.append("أوامر")
+            icons.append("⌨")
+            names.append("أوامر" + (" (تستأذن)" if self.shell_mode == "ask" else ""))
         if self.computer_enabled:
-            parts.append("تحكم")
+            icons.append("🖥")
+            names.append("تحكم بالجهاز")
         if self.browser_enabled and self.web_ok:
-            parts.append("متصفح")
-        self.access_btn.setText("🔓 " + "، ".join(parts) if parts else "🔒 بدون صلاحيات")
-        tip = ["صلاحيات هذي المحادثة فقط — اضغط للتعديل"]
+            icons.append("🌐")
+            names.append("متصفح")
+        self.access_btn.setText(" ".join(icons) if icons else "🔒")
+        tip = ["صلاحيات هذي المحادثة فقط — اضغط للتعديل", ""] + (names or ["بدون صلاحيات"])
         for d in self.allowed_dirs:
             tip.append(("✎ " if d in self.writable_dirs else "👁 ") + d)
         self.access_btn.setToolTip("\n".join(tip))
@@ -4768,6 +5069,8 @@ class App(QMainWindow):
                     "title": c["title"],
                     "updated": c["updated"],
                     "settings": c.get("settings"),
+                    "renamed": bool(c.get("renamed")),
+                    "auto_titled": bool(c.get("auto_titled")),
                     "msgs": [strip_for_save(m) for m in c["msgs"]],
                 }
             )
@@ -5080,6 +5383,14 @@ class App(QMainWindow):
         a.setForeground(QColor(col["accent"]))
         a.setFontWeight(QFont.Weight.Bold)
         c.insertText("⧉ نسخ", a)
+        fam = shell_family(lang)
+        if fam == ("win" if IS_WIN else "unix"):
+            c.insertText("      ", h)
+            r = QTextCharFormat(a)
+            r.setAnchorHref("run:" + cid)
+            c.insertText("▶ تشغيل", r)
+        elif fam:
+            c.insertText("      (أمر لنظام آخر — انسخه فقط)", h)
         cf = QTextCharFormat()
         cf.setForeground(QColor(col["code_text"]))
         cf.setFontFamilies(["Consolas", "DejaVu Sans Mono", "Courier New", "monospace"])
@@ -5128,6 +5439,9 @@ class App(QMainWindow):
         if s.startswith("copy:"):
             self._copy(self.copy_store.get(s[5:], ""))
             return
+        if s.startswith("run:"):
+            self.run_snippet(s[4:])
+            return
         if s.startswith("copyreply:"):
             self._copy(self.copy_store.get("reply:" + s[len("copyreply:"):], ""))
             return
@@ -5171,6 +5485,7 @@ class App(QMainWindow):
         name, ok = QInputDialog.getText(self, "إعادة تسمية", "العنوان الجديد:", text=self.current["title"])
         if ok and name.strip():
             self.current["title"] = name.strip()[:80]
+            self.current["renamed"] = True
             self.persist()
             self.refresh_list()
 
@@ -5716,16 +6031,45 @@ class App(QMainWindow):
         names = "، ".join(os.path.basename(p.rstrip("\\/")) for p in new)
         self.q.put(("note", "تم التعديل على جهازك: " + (names if len(names) <= 200 else "%d عنصر" % len(new))))
 
+    def auto_title(self, chat, ask, reply):
+        """After the first question and first answer, ask the model for a short summary and use it as the chat title."""
+        key = self.key_edit.text().strip()
+        if not key:
+            return
+        model = self.model_box.currentText()
+        cid = chat["id"]
+        chat["auto_titled"] = True
+
+        def work():
+            try:
+                msgs = [
+                    {"role": "system", "content": "You write very short chat titles. Reply with ONLY the title: 3 to 6 words, in the same language as the conversation (Arabic if it is Arabic), no quotes, no final punctuation."},
+                    {"role": "user", "content": "First question:\n" + ask[:1200] + "\n\nFirst answer:\n" + reply[:1500] + "\n\nTitle:"},
+                ]
+                payload = {"model": model, "messages": msgs, "stream": False, "max_tokens": 40, "thinking": {"type": "disabled"}}
+                req = urllib.request.Request(API_URL, data=json.dumps(payload).encode("utf-8"),
+                                             headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
+                with urllib.request.urlopen(req, timeout=40) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                t = str(data["choices"][0]["message"].get("content") or "")
+                t = re.sub(r"[\"“”«»*#`]", "", t).strip().split("\n")[0].strip(" .،:؛-")[:60]
+                if t:
+                    self.q.put(("title", (cid, t)))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
     def refresh_balance(self, force=False):
         key = self.key_edit.text().strip()
         if not key:
-            self.balance_btn.setText("💰 الرصيد: حط المفتاح")
+            self.balance_btn.setText("💰 —")
             return
         if getattr(self, "_bal_busy", False) and not force:
             return
         self._bal_busy = True
         if not force or self.balance_btn.text().endswith("..."):
-            self.balance_btn.setText("💰 الرصيد: ...")
+            self.balance_btn.setText("💰 ...")
 
         def work():
             try:
@@ -5733,14 +6077,20 @@ class App(QMainWindow):
                 with urllib.request.urlopen(req, timeout=20) as r:
                     data = json.loads(r.read().decode("utf-8"))
                 parts = []
+                num = None
                 for b in data.get("balance_infos", []):
                     cur = b.get("currency", "")
                     sym = {"USD": "$", "CNY": "¥"}.get(cur, cur + " ")
                     parts.append("%s%s" % (sym, b.get("total_balance", "?")))
+                    if num is None:
+                        try:
+                            num = float(b.get("total_balance"))
+                        except Exception:
+                            num = None
                 text = " | ".join(parts) if parts else "0"
                 if data.get("is_available") is False:
                     text += " ⚠ غير كافي"
-                self.q.put(("balance", text))
+                self.q.put(("balance", (text, num)))
             except urllib.error.HTTPError as e:
                 self.q.put(("balance", "المفتاح غلط" if e.code == 401 else "خطأ %s" % e.code))
             except Exception:
@@ -5854,9 +6204,36 @@ class App(QMainWindow):
                     return
                 QApplication.quit()
                 return
+            elif kind == "title":
+                cid_, t_ = val
+                for ch_ in self.chats:
+                    if ch_["id"] == cid_ and not ch_.get("renamed"):
+                        ch_["title"] = t_
+                        ch_["auto_titled"] = True
+                        self.persist()
+                        self.refresh_list()
+                        break
             elif kind == "balance":
                 self._bal_busy = False
-                self.balance_btn.setText("💰 الرصيد: " + val)
+                if isinstance(val, tuple):
+                    text, num = val
+                    prev = getattr(self, "_bal_num", None)
+                    if num is not None and prev is not None and abs(num - prev) > 1e-9:
+                        self._bal_delta = num - prev
+                        self._bal_delta_t = time.time()
+                        self._bal_changed = True
+                    if num is not None:
+                        self._bal_num = num
+                    shown = text
+                    d_ = getattr(self, "_bal_delta", None)
+                    if d_ is not None and time.time() - getattr(self, "_bal_delta_t", 0) < 180:
+                        shown += "  (%+.4f)" % d_
+                    self.balance_btn.setText("💰 " + shown)
+                    self.balance_btn.setToolTip("رصيد حسابك في DeepSeek (مباشر من حسابك)\nآخر تحديث: %s%s\nيتحدث تلقائيًا بعد كل رد، واضغط للتحديث الآن" % (
+                        time.strftime("%H:%M:%S"),
+                        ("\nآخر تغيّر: %+.4f" % d_) if d_ is not None else ""))
+                else:
+                    self.balance_btn.setText("💰 " + str(val))
             elif kind == "done":
                 content, reasoning = val
                 msg = {"role": "assistant", "content": content, "reasoning": reasoning}
@@ -5865,6 +6242,10 @@ class App(QMainWindow):
                 if L is not None and L.get("t0"):
                     msg["dur"] = int(time.time() - L["t0"])
                 self.current["msgs"].append(msg)
+                ch_ = self.current
+                if (len(ch_["msgs"]) == 2 and not ch_.get("renamed") and not ch_.get("auto_titled")
+                        and content and not str(content).startswith("⏹")):
+                    self.auto_title(ch_, ch_["msgs"][0].get("shown") or str(ch_["msgs"][0].get("content", "")), str(content))
                 if "live" in self.open_acts:
                     self.open_acts.discard("live")
                     self.open_acts.add("m%d" % (len(self.current["msgs"]) - 1))
@@ -5977,8 +6358,9 @@ class App(QMainWindow):
     def finish(self):
         self.clear_resume()
         write_state(last_event="reply finished", busy=False)
-        QTimer.singleShot(700, lambda: self.refresh_balance(force=True))
-        QTimer.singleShot(7000, lambda: self.refresh_balance(force=True))
+        self._bal_changed = False
+        for ms in (700, 4000, 12000, 30000, 70000):  # the provider can take a little while to update the balance
+            QTimer.singleShot(ms, lambda: (not self._bal_changed) and self.refresh_balance(force=True))
         self.busy = False
         self.set_send_mode("send")
         self.inp.setFocus()
@@ -5992,8 +6374,14 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("5belan.chat.app")
         except Exception:
             pass
-    if hasattr(os, "geteuid") and os.geteuid() == 0 and "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
-        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox"  # Chromium refuses to start as root otherwise
+    if "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
+        fl = []
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            fl.append("--no-sandbox")  # Chromium refuses to start as root otherwise
+        if sys.platform.startswith("linux") and os.uname().machine.lower().startswith(("arm", "aarch")):
+            fl.append("--disable-gpu")  # small ARM boards (Orange Pi...) often have no usable GPU driver for Chromium
+        if fl:
+            os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(fl)
     try:
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     except Exception:
