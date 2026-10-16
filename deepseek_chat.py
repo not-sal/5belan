@@ -3019,7 +3019,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.14.2"
+APP_VERSION = "2.15.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5496,6 +5496,9 @@ def make_qss(c):
     QPushButton#flat:hover, QToolButton#flat:hover { color: %(text)s; background: %(hover)s; }
     QPushButton#send { background: %(accent)s; color: white; border: none; border-radius: 20px; font-size: 14px; font-weight: bold; padding: 0; }
     QPushButton#send:disabled { background: %(border)s; }
+    QToolButton#updbadge { background: #f28c28; color: white; border: none; border-radius: 12px; padding: 2px 12px; font-weight: bold; }
+    QToolButton#updbadge:hover { background: #ff9f43; }
+    QToolButton#updbadge:disabled { background: #c9873f; color: white; }
     QPushButton#banner { background: %(accent)s; color: white; border: none; border-radius: 12px; padding: 4px 12px; }
     QComboBox { background: transparent; color: %(dim)s; border: none; padding: 4px 8px; }
     QComboBox:hover { color: %(text)s; background: %(hover)s; border-radius: 8px; }
@@ -5919,6 +5922,15 @@ class App(QMainWindow):
         tbl.setSpacing(2)
         self.tools_bar.setLayoutDirection(Qt.RightToLeft)
         tbl.addStretch(1)  # first in a right-to-left row = far right, so the buttons sit at the left edge
+        self.update_btn = QToolButton()  # orange badge next to "ذاكرة": shows when a new version is out
+        self.update_btn.setObjectName("updbadge")
+        self.update_btn.setText("نزل تحديث")
+        self.update_btn.setCursor(Qt.PointingHandCursor)
+        self.update_btn.setFixedHeight(26)
+        self.update_btn.setToolTip("نزل إصدار جديد من خبيلان")
+        self.update_btn.clicked.connect(self.start_update)
+        self.update_btn.setVisible(False)
+        tbl.addWidget(self.update_btn)
         groups = (
             (("ذاكرة", "ملاحظات عنك يقرأها خبيلان بكل محادثة", self.open_memory),
              ("صرف", "كم صرفت: اليوم، الأسبوع، وأغلى المحادثات", self.open_usage)),
@@ -5972,11 +5984,6 @@ class App(QMainWindow):
         self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.title_label.setMinimumWidth(60)
         hl.addWidget(self.title_label, 1)
-        self.update_btn = QPushButton("تحديث متوفر")
-        self.update_btn.setObjectName("banner")
-        self.update_btn.clicked.connect(self.start_update)
-        self.update_btn.setVisible(False)
-        hl.addWidget(self.update_btn)
         def icon_btn(text, tip, checkable=False):
             b = QToolButton()
             b.setObjectName("iconbtn")
@@ -6180,9 +6187,14 @@ class App(QMainWindow):
         self.apply_width()
         QTimer.singleShot(900, self.recover_after_crash)
         QTimer.singleShot(4000, lambda: self.check_updates(silent=True))
+        self._upd_applying = False
+        self._upd_restart = False
+        self._auto_upd = False
+        self.idle_timer = QTimer(self)
+        self.idle_timer.timeout.connect(self.try_restart_after_update)
         self.upd_timer = QTimer(self)
         self.upd_timer.timeout.connect(lambda: self.check_updates(silent=True))
-        self.upd_timer.start(6 * 3600 * 1000)
+        self.upd_timer.start(3 * 60 * 1000)  # a tiny file; a new version is noticed within minutes
         for keys, fn in (("Ctrl+N", self.new_chat), ("Ctrl+K", lambda: (self.search_edit.setFocus(), self.search_edit.selectAll())),
                          ("Ctrl+L", lambda: self.inp.setFocus()), ("Ctrl+Shift+C", self.copy_last_reply),
                          ("Esc", self.esc_pressed)):
@@ -6697,6 +6709,46 @@ class App(QMainWindow):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def auto_apply(self):
+        """A new version was published: download it right away; the restart waits until nothing is running."""
+        m = self.pending_update
+        if not m or self._upd_applying or self._upd_restart:
+            return
+        self._upd_applying = True
+        self._auto_upd = True
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("جاري التحديث…")
+
+        def work():
+            try:
+                n = apply_update(m, lambda s: self.q.put(("update_progress", s)))
+                self.q.put(("update_done", n))
+            except Exception as e:
+                self.q.put(("update_err", str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def try_restart_after_update(self):
+        if not self._upd_restart:
+            self.idle_timer.stop()
+            return
+        if self.work_running() or self.inp.toPlainText().strip() or self.attachments:
+            return  # never cut a reply, a task, or a message being typed
+        self.idle_timer.stop()
+        self.restart_now()
+
+    def restart_now(self):
+        try:
+            if self.remember_box.isChecked() and self.key_edit.text().strip():
+                self.cfg["api_key"] = self.key_edit.text().strip()
+                self.save_cfg()
+            self._quitting = True
+            restart_app(self.key_edit.text().strip())
+        except Exception as e:
+            QMessageBox.warning(self, "التحديث", "افتح البرنامج يدويًا: %s" % e)
+            return
+        QApplication.quit()
+
     def start_update(self):
         m = self.pending_update
         if not m:
@@ -6709,6 +6761,8 @@ class App(QMainWindow):
             m.get("version"), APP_VERSION, ("\n" + notes) if notes else "")
         if QMessageBox.question(self, "تحديث 5belan", msg) != YES:
             return
+        self._auto_upd = False
+        self._upd_applying = True
         self.update_btn.setEnabled(False)
         self.update_btn.setText("جاري التحديث…")
 
@@ -8249,6 +8303,11 @@ class App(QMainWindow):
         tg = self.cfg.get("tg") or {}
         return tg if (tg.get("token") and tg.get("chat_id")) else None
 
+    def tg_notify_force(self, text):
+        tg = self.tg_ready()
+        if tg:
+            threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], text), daemon=True).start()
+
     def tg_notify(self, text):
         tg = self.tg_ready()
         if tg and tg.get("notify", True) is not False:
@@ -8278,7 +8337,41 @@ class App(QMainWindow):
         send = lambda t: threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], t), daemon=True).start()
         cmd = text.split()[0].lower() if text.startswith("/") else ""
         if cmd in ("/help", "/start"):
-            send("الأوامر:\n/status حالة التطبيق\n/tasks مهامك\n/run رقم_أو_اسم تشغيل مهمة\n/new محادثة جديدة\nوأي نص ثاني أرد عليه.")
+            send("الأوامر:\n/chats محادثاتك اللي بالتطبيق\n/open رقم اختيار محادثة وكمّلها من هنا\n/read [عدد] قراءة آخر رسائل المحادثة المختارة\n"
+                 "/where أي محادثة مختارة الحين\n/new محادثة تليقرام جديدة (منفصلة)\n/status حالة التطبيق\n/tasks مهامك\n/run رقم_أو_اسم تشغيل مهمة\n"
+                 "وأي نص ثاني يروح للمحادثة المختارة (بدون اختيار: محادثة تليقرام الخاصة).")
+            return
+        if cmd == "/chats":
+            lst = sorted([c for c in self.chats if c.get("id") != "telegram" and c.get("msgs")], key=lambda c: -float(c.get("updated", 0)))[:12]
+            self._tg_map = [c["id"] for c in lst]
+            now = time.time()
+            def ago(t):
+                d = max(0, int(now - float(t or 0)))
+                return "الحين" if d < 90 else ("%d د" % (d // 60) if d < 3600 else ("%d س" % (d // 3600) if d < 172800 else "%d يوم" % (d // 86400)))
+            send("\n".join("%d) %s · %s" % (i + 1, (c.get("title") or "بدون عنوان")[:45], ago(c.get("updated"))) for i, c in enumerate(lst))
+                 + "\n\nاكتب /open رقم عشان تختار وحدة." if lst else "ما فيه محادثات.")
+            return
+        if cmd == "/open":
+            arg = text[5:].strip()
+            m_ = getattr(self, "_tg_map", [])
+            if not arg.isdigit() or not (1 <= int(arg) <= len(m_)):
+                send("اكتب /chats أول ثم /open رقم.")
+                return
+            ch_ = next((c for c in self.chats if c["id"] == m_[int(arg) - 1]), None)
+            if ch_ is None:
+                send("المحادثة ما عادت موجودة.")
+                return
+            self._tg_target = ch_["id"]
+            send("اخترت: %s\n\n%s\n\nأي رسالة تكتبها الحين تكمل هذي المحادثة." % (ch_.get("title") or "", self._tg_tail(ch_, 2)))
+            return
+        if cmd == "/read":
+            arg = text[5:].strip()
+            n_ = int(arg) if arg.isdigit() else 4
+            send(self._tg_tail(self._tg_target_chat(), max(1, min(n_, 10))))
+            return
+        if cmd == "/where":
+            ch_ = self._tg_target_chat()
+            send("المختارة: " + ("محادثة تليقرام الخاصة" if ch_.get("id") == "telegram" else (ch_.get("title") or "بدون عنوان")))
             return
         if cmd == "/status":
             send("التطبيق شغال. %s. مهام تشتغل: %d. %s" % ("مشغول برد" if self.busy else "فاضي", len(self._bg_running),
@@ -8306,6 +8399,7 @@ class App(QMainWindow):
                 send("بدأت: " + t["name"] + ". أبلغك لما تخلص.")
             return
         if cmd == "/new":
+            self._tg_target = "telegram"
             self.tg_chat()["msgs"] = []
             self.persist()
             send("بدأنا محادثة جديدة.")
@@ -8316,6 +8410,10 @@ class App(QMainWindow):
         key = self.key_edit.text().strip()
         if not key:
             send("مفتاح DeepSeek غير مكتوب بالتطبيق.")
+            return
+        tgt = self._tg_target_chat()
+        if tgt.get("id") != "telegram":
+            self.tg_continue(tgt, text, send)
             return
         if self._tg_busy:
             send("لسه أرد على رسالتك السابقة، انتظر شوي.")
@@ -8337,6 +8435,55 @@ class App(QMainWindow):
             self.tg_bridge.reply.emit(out)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _tg_target_chat(self):
+        tid = getattr(self, "_tg_target", "telegram")
+        for c in self.chats:
+            if c.get("id") == tid:
+                return c
+        return self.tg_chat()
+
+    @staticmethod
+    def _tg_tail(chat, n):
+        out = []
+        for m in [m for m in chat.get("msgs", []) if isinstance(m, dict)][-n * 2:][-max(n, 1) * 2:]:
+            if m.get("role") == "user":
+                t = m.get("shown") or (m.get("content") if isinstance(m.get("content"), str) else "")
+                out.append("أنت: " + _cut(str(t), 600))
+            else:
+                out.append("خبيلان: " + _cut(clean_reply(str(m.get("content", ""))), 1200))
+        return "\n\n".join(out) or "(المحادثة فاضية)"
+
+    def tg_continue(self, chat, text, send):
+        """A Telegram message continues a real chat of the app, with that chat's own settings; the reply goes back to Telegram."""
+        if not self.key_edit.text().strip():
+            send("مفتاح DeepSeek غير مكتوب بالتطبيق.")
+            return
+        if self.busy:
+            send("التطبيق مشغول برد حالياً، انتظر يخلص وارسل من جديد.")
+            return
+        prev_txt, prev_att, prev_q = self.inp.toPlainText(), self.attachments, self.quotes
+        self.attachments, self.quotes = [], []
+        self.current = chat
+        self.apply_settings(self.chat_settings(chat))
+        self.title_label.setText(chat.get("title", ""))
+        self.refresh_list()
+        self.render_chat()
+        self._tg_wait = {"chat": chat, "n": len(chat["msgs"])}
+        self.inp.setPlainText(text)
+        try:
+            self.send()
+        finally:
+            self.attachments, self.quotes = prev_att, prev_q
+            self.refresh_quotes()
+            self.refresh_files_label()
+            if prev_txt and not self.inp.toPlainText().strip():
+                self.inp.setPlainText(prev_txt)
+        if not self.busy and getattr(self, "_tg_wait", None):
+            self._tg_wait = None
+            send("ما قدرت أرسل للمحادثة (تأكد من المفتاح والإعدادات).")
+        else:
+            send("وصلت للمحادثة «%s»، أنتظر الرد…" % _cut(chat.get("title") or "", 40))
 
     def on_tg_reply(self, out):
         self._tg_busy = False
@@ -9600,13 +9747,18 @@ class App(QMainWindow):
             elif kind == "update_check":
                 self._upd_busy = False
                 m, silent = val
-                if m:
+                if m and self._upd_restart:
+                    pass  # already downloaded, waiting for a quiet moment to restart
+                elif m:
                     self.pending_update = m
-                    self.update_btn.setText("تحديث %s متوفر" % m.get("version"))
-                    self.update_btn.setEnabled(True)
+                    if not self._upd_applying:
+                        self.update_btn.setText("نزل تحديث %s" % m.get("version"))
+                        self.update_btn.setEnabled(True)
                     self.update_btn.setVisible(True)
                     if not silent:
                         self.start_update()
+                    elif self.cfg.get("auto_update", True) is not False:
+                        self.auto_apply()
                 elif not silent:
                     QMessageBox.information(self, "التحديثات", "أنت على آخر إصدار (%s)" % APP_VERSION)
             elif kind == "update_check_err":
@@ -9616,21 +9768,24 @@ class App(QMainWindow):
             elif kind == "update_progress":
                 self.statusBar().showMessage(val, 4000)
             elif kind == "update_err":
+                self._upd_applying = False
                 self.update_btn.setEnabled(True)
                 self.update_btn.setText("أعد محاولة التحديث")
-                QMessageBox.warning(self, "التحديث", "فشل التحديث ولم يتغير شي:\n" + val)
+                if not self._auto_upd:
+                    QMessageBox.warning(self, "التحديث", "فشل التحديث ولم يتغير شي:\n" + val)
+                self._auto_upd = False
             elif kind == "update_done":
+                self._upd_applying = False
                 self.persist()
-                QMessageBox.information(self, "التحديث", "تم التحديث. سيُعاد تشغيل البرنامج الحين.")
-                try:
-                    if self.remember_box.isChecked() and self.key_edit.text().strip():
-                        self.cfg["api_key"] = self.key_edit.text().strip()
-                        self.save_cfg()
-                    restart_app(self.key_edit.text().strip())
-                except Exception as e:
-                    QMessageBox.warning(self, "التحديث", "افتح البرنامج يدويًا: %s" % e)
+                if self._auto_upd:
+                    self._upd_restart = True
+                    self.update_btn.setText("تحدّث · يعيد التشغيل لما تفضى")
+                    self.update_btn.setEnabled(False)
+                    self.idle_timer.start(3000)
+                    self.try_restart_after_update()
                     return
-                QApplication.quit()
+                QMessageBox.information(self, "التحديث", "تم التحديث. سيُعاد تشغيل البرنامج الحين.")
+                self.restart_now()
                 return
             elif kind == "title":
                 cid_, t_ = val
@@ -9852,6 +10007,14 @@ class App(QMainWindow):
         self.busy = False
         self.set_send_mode("send")
         self.inp.setFocus()
+        w_ = getattr(self, "_tg_wait", None)
+        if w_:
+            self._tg_wait = None
+            ms_ = w_["chat"].get("msgs", [])
+            if len(ms_) > w_["n"] and ms_[-1].get("role") == "assistant":
+                self.tg_notify_force("خبيلان:\n" + clean_reply(str(ms_[-1].get("content", ""))))
+            else:
+                self.tg_notify_force("صار خطأ ولا قدر يرد على هذي الرسالة.")
         while self._bg_pending:
             t_, c_ = self._bg_pending.pop(0)
             self.merge_bg(t_, c_)
