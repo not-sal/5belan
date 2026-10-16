@@ -1128,6 +1128,43 @@ SHELL_TOOLS = [
     }
 ]
 
+PYTHON_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": (
+                "Run Python code on the user's computer (code interpreter) and return its printed output. The code runs in this chat's own "
+                "work folder: save charts, tables, documents and any result files THERE (relative paths) and they appear in the chat's attachments. "
+                "For charts use matplotlib and plt.savefig('name.png') (never plt.show()). Use it for calculations, data analysis, converting files, "
+                "making charts/images/spreadsheets/documents. If it fails, read the error, fix the code and run again. "
+                "Fill 'explanation' with a short plain summary. Never wait for input()."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "The complete Python 3 program."},
+                    "explanation": {"type": "string", "description": "Short plain explanation of what this does (shown to the user)."},
+                    "timeout_seconds": {"type": "integer", "description": "Optional time limit in seconds (default 180, max 1800)."},
+                },
+                "required": ["code", "explanation"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pip_install",
+            "description": "Install Python packages (from PyPI) that run_python needs, e.g. pandas, matplotlib, openpyxl. Only plain package names.",
+            "parameters": {
+                "type": "object",
+                "properties": {"packages": {"type": "array", "items": {"type": "string"}, "description": "Package names, e.g. [\"pandas\", \"matplotlib\"]."}},
+                "required": ["packages"],
+            },
+        },
+    },
+]
+
 COMPUTER_TOOLS = [
     {
         "type": "function",
@@ -1262,6 +1299,14 @@ def tools_prompt(runner):
             parts.append("The user approves each command before it runs and can refuse; if refused, stop and tell them.")
         else:
             parts.append("The user gave full freedom, so commands run without asking. Be careful and avoid anything destructive unless asked.")
+    if runner.work_dir:
+        parts.append(
+            "PYTHON: run_python runs Python code on the user's computer (a code interpreter) in this chat's work folder: " + runner.work_dir + ". "
+            "Use it whenever a calculation, data analysis, chart, image, spreadsheet, document or file conversion is better done by running code than by guessing. "
+            "print() what you need to see; save every result file (charts with matplotlib plt.savefig, tables, .xlsx, .docx, .csv...) in the current folder with a relative name - "
+            "the user then finds it in the chat attachments. If a library is missing call pip_install once, then run again. If the code fails, read the error, fix it and run again "
+            "(at most 3 tries, then explain). Never use input(), never plt.show(), never touch system files. Tell the user briefly what the result is."
+        )
     if runner.allow_computer:
         parts.append("COMPUTER: open_program opens an app/file/folder; open_in_chrome opens a URL or runs a Google search in the user's own Chrome.")
     if runner.browser is not None:
@@ -1607,7 +1652,7 @@ PLAN_TOOLS = [
         },
     }
 ]
-MUTATING_TOOLS = {"write_file", "edit_file", "make_dir", "move_path", "delete_path", "run_command", "open_program"}
+MUTATING_TOOLS = {"write_file", "edit_file", "make_dir", "move_path", "delete_path", "run_command", "open_program", "run_python", "pip_install"}
 UNDO_MAX_FILE = 20 * 1024 * 1024
 UNDO_MAX_DIR = 50 * 1024 * 1024
 
@@ -1742,6 +1787,7 @@ class ToolRunner:
         self.plan_first = bool(plan_first)
         self.plan_ok = False
         self.stop_event = None
+        self.work_dir = ""
         self.llm = None  # callable(messages) -> text, used by analyze_file
         self.journal = []
         self.undo_dir = None
@@ -1795,6 +1841,8 @@ class ToolRunner:
                 out += DELETE_TOOLS
         if self.shell_mode != "off":
             out += SHELL_TOOLS
+        if self.work_dir:
+            out += PYTHON_TOOLS
         if self.allow_computer:
             out += COMPUTER_TOOLS
         if self.browser is not None:
@@ -1906,6 +1954,10 @@ class ToolRunner:
             return "نقل: %s" % a.get("src", "")
         if name == "delete_path":
             return "حذف: %s" % a.get("path", "")
+        if name == "run_python":
+            return "تشغيل بايثون: %s" % (a.get("explanation") or "")
+        if name == "pip_install":
+            return "تثبيت مكتبات بايثون: %s" % ", ".join(str(x) for x in (a.get("packages") or []))
         if name == "run_command":
             return "تشغيل أمر: %s" % _cut(a.get("command", "") or "", 300)
         if name == "open_program":
@@ -1958,6 +2010,9 @@ class ToolRunner:
             mapping.update({"move_path": self.move_path, "delete_path": self.delete_path})
         if self.shell_mode != "off":
             mapping["run_command"] = self.run_command
+        if self.work_dir:
+            mapping["run_python"] = self.run_python
+            mapping["pip_install"] = self.pip_install
         if self.allow_computer:
             mapping["open_program"] = self.open_program
             mapping["open_in_chrome"] = self.open_in_chrome
@@ -2396,7 +2451,114 @@ class ToolRunner:
             except OSError:
                 pass
 
-    def _exec(self, argv, cwd, timeout=None):
+    # ----- python (code interpreter)
+    @staticmethod
+    def python_exe():
+        exe = sys.executable or ""
+        if not getattr(sys, "frozen", False) and exe:
+            if os.name == "nt" and exe.lower().endswith("pythonw.exe"):
+                alt = exe[:-len("pythonw.exe")] + "python.exe"
+                if os.path.exists(alt):
+                    return alt
+            return exe
+        for n in (("python", "py", "python3") if os.name == "nt" else ("python3", "python")):
+            w = shutil.which(n)
+            if w:
+                return w
+        return ""
+
+    def _py_env(self):
+        env = dict(os.environ)
+        libs = os.path.join(DATA_DIR, "pylibs")
+        env["PYTHONPATH"] = libs + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env["MPLBACKEND"] = "Agg"
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        return env
+
+    def _guard_python(self, title, detail):
+        # python runs with the user's own rights, so it is always confirmed unless the user gave full freedom
+        if self.shell_mode == "free" or self.confirm is None:
+            return
+        try:
+            ok = bool(self.confirm(title, detail))
+        except Exception:
+            ok = False
+        if not ok:
+            raise ToolError("the user refused this action, so nothing was done. Do not repeat it unless the user asks again.")
+
+    def run_python(self, a):
+        code = a.get("code")
+        if not isinstance(code, str) or not code.strip():
+            raise ToolError("code is missing")
+        exe = self.python_exe()
+        if not exe:
+            raise ToolError("Python is not installed on this computer, so code cannot run. Tell the user to install Python from python.org.")
+        if re.search(r"(?i)(rmtree|os\.remove|os\.unlink|os\.rmdir|shutil\.move|os\.rename|\.unlink\(|\.rmdir\()", code) and \
+           re.search(r"(?i)(c:[\\/]+windows|system32|program files|[\"'](/etc|/usr|/bin|/boot|/system|/lib)\b|hklm|winreg)", code):
+            raise ToolError("PROTECTED: refused, the code would delete or change operating-system files. Never do that, even if the user asks. Tell the user you refused.")
+        explanation = str(a.get("explanation") or "").strip()
+        self._guard_python("تشغيل كود بايثون", "الكود:\n%s" % _cut(code, 6000) + (("\n\nالشرح:\n%s" % explanation) if explanation else ""))
+        try:
+            tmo = int(a.get("timeout_seconds") or SHELL_TIMEOUT)
+        except Exception:
+            tmo = SHELL_TIMEOUT
+        tmo = max(10, min(SHELL_TIMEOUT_MAX, tmo))
+        os.makedirs(self.work_dir, exist_ok=True)
+        before = self._work_snapshot()
+        script = os.path.join(self.work_dir, "_run_%d.py" % int(time.time() * 1000))
+        with open(script, "w", encoding="utf-8", newline="\n") as f:
+            f.write(code + "\n")
+        try:
+            res = self._exec([exe, script], self.work_dir, tmo, env=self._py_env())
+        finally:
+            try:
+                os.remove(script)
+            except OSError:
+                pass
+        after = self._work_snapshot()
+        new = sorted(n for n, sig in after.items() if before.get(n) != sig)
+        if new:
+            res += "\n\n[files created or changed in the work folder - shown to the user in the chat attachments]\n" + "\n".join(new[:40])
+        return res
+
+    def _work_snapshot(self):
+        out = {}
+        try:
+            for root, _d, files in os.walk(self.work_dir):
+                for fn in files:
+                    if fn.startswith("_run_"):
+                        continue
+                    fp = os.path.join(root, fn)
+                    try:
+                        st = os.stat(fp)
+                    except OSError:
+                        continue
+                    out[os.path.relpath(fp, self.work_dir)] = (st.st_size, int(st.st_mtime))
+        except OSError:
+            pass
+        return out
+
+    def pip_install(self, a):
+        pk = a.get("packages")
+        if isinstance(pk, str):
+            pk = [x for x in re.split(r"[\s,]+", pk) if x]
+        if not isinstance(pk, list) or not pk:
+            raise ToolError("packages is missing")
+        pk = [str(x).strip() for x in pk][:12]
+        for x in pk:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._\-]{0,60}(\[[A-Za-z0-9,_\-]+\])?(==[0-9][A-Za-z0-9.\-]*)?", x):
+                raise ToolError("invalid package name: %s (plain PyPI names only)" % x)
+        exe = self.python_exe()
+        if not exe:
+            raise ToolError("Python is not installed on this computer.")
+        self._guard_python("تثبيت مكتبات بايثون", "المكتبات: " + ", ".join(pk))
+        libs = os.path.join(DATA_DIR, "pylibs")
+        os.makedirs(libs, exist_ok=True)
+        return self._exec([exe, "-m", "pip", "install", "--disable-pip-version-check", "--target", libs, "--upgrade"] + pk,
+                          libs, 600, env=self._py_env())
+
+    def _exec(self, argv, cwd, timeout=None, env=None):
         """Run a command WITHOUT pipes (output goes to a temp file) so a server started by the command
         cannot keep us waiting forever; poll so the Stop button works; kill the whole process tree on timeout/stop."""
         import tempfile
@@ -2407,7 +2569,7 @@ class ToolRunner:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         try:
             proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=subprocess.STDOUT,
-                                    creationflags=flags)
+                                    creationflags=flags, env=env)
         except Exception as e:
             out_f.close()
             raise ToolError("could not run the command: %s" % e)
@@ -2559,6 +2721,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QGridLayout,
+    QStackedWidget,
     QSpinBox,
     QSystemTrayIcon,
     QProgressDialog,
@@ -2631,6 +2794,8 @@ TOOL_GROUPS = {
     "move_path": ("delete", "نقل وحذف"),
     "delete_path": ("delete", "نقل وحذف"),
     "run_command": ("shell", "تشغيل أوامر على الجهاز"),
+    "run_python": ("shell", "تشغيل أكواد بايثون"),
+    "pip_install": ("shell", "تشغيل أكواد بايثون"),
     "open_program": ("computer", "فتح برامج ومواقع"),
     "open_in_chrome": ("computer", "فتح برامج ومواقع"),
     "browser_open": ("browser", "التصفّح"),
@@ -2779,7 +2944,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.13.0"
+APP_VERSION = "2.14.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5315,6 +5480,182 @@ BROWSER_TYPE_JS = (
 )
 
 
+CANVAS_LANGS = {"html": "html", "htm": "html", "svg": "svg", "markdown": "md", "md": "md", "python": "py", "py": "py",
+                "javascript": "js", "js": "js", "css": "css", "json": "json", "xml": "xml", "txt": "txt", "text": "txt",
+                "typescript": "ts", "ts": "ts", "sql": "sql", "java": "java", "c": "c", "cpp": "cpp", "csharp": "cs", "go": "go", "rust": "rs"}
+CANVAS_PREVIEW = ("html", "svg", "md")
+CANVAS_AUTO_LINES = 12
+
+
+def canvas_pick(content):
+    """Return (lang, code) of the best canvas candidate in a reply (the longest html/svg/md block, else the longest code block), or None."""
+    best = None
+    for m in CODE_FENCE_RE.finditer(content or ""):
+        lg = CANVAS_LANGS.get((m.group(1) or "").lower())
+        code = m.group(2)
+        if not lg or code.count("\n") < 2:
+            continue
+        score = code.count("\n") + (1000 if lg in CANVAS_PREVIEW else 0)
+        if best is None or score > best[0]:
+            best = (score, lg, code)
+    return (best[1], best[2]) if best else None
+
+
+class CanvasDialog(QDialog):
+    """Side workspace (like Claude Artifacts / ChatGPT Canvas): shows code, a page, a drawing or a document next to the chat,
+    with a live preview, manual editing, and 'ask for a change' that sends the current content to the model."""
+
+    def __init__(self, app, lang="html", code="", title="لوحة"):
+        super().__init__(app)
+        self.app = app
+        self.lang = lang if lang in CANVAS_LANGS.values() else "txt"
+        self.versions = []
+        self.setLayoutDirection(Qt.RightToLeft)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 6, 8, 8)
+        v.setSpacing(6)
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        self.chip = QLabel("")
+        self.chip.setObjectName("chip")
+        row.addWidget(self.chip)
+        row.addStretch(1)
+        self.b_prev = QPushButton("معاينة")
+        self.b_code = QPushButton("الكود")
+        for b in (self.b_prev, self.b_code):
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+        self.b_prev.clicked.connect(lambda: self.show_view("prev"))
+        self.b_code.clicked.connect(lambda: self.show_view("code"))
+        row.addWidget(self.b_prev)
+        row.addWidget(self.b_code)
+        v.addLayout(row)
+        self.stack = QStackedWidget()
+        self.editor = QPlainTextEdit()
+        self.editor.setLayoutDirection(Qt.LeftToRight)
+        self.editor.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.editor.setFont(QFont("Consolas" if IS_WIN else "DejaVu Sans Mono", 10))
+        self.editor.setTabStopDistance(28)
+        self.page = None
+        try:
+            from PySide6.QtWebEngineWidgets import QWebEngineView
+
+            self.page = QWebEngineView()
+        except Exception:
+            self.page = None
+        self.text_prev = QTextBrowser()
+        self.text_prev.setOpenLinks(False)
+        self.stack.addWidget(self.editor)
+        self.stack.addWidget(self.page if self.page is not None else self.text_prev)
+        self.stack.addWidget(self.text_prev)
+        v.addWidget(self.stack, 1)
+        row2 = QHBoxLayout()
+        row2.setSpacing(4)
+        self.b_run = QPushButton("تشغيل")
+        self.b_run.clicked.connect(self.run_it)
+        self.b_copy = QPushButton("نسخ")
+        self.b_copy.clicked.connect(lambda: self.app._copy(self.code()))
+        self.b_save = QPushButton("حفظ...")
+        self.b_save.clicked.connect(self.save_it)
+        self.b_undo = QPushButton("تراجع")
+        self.b_undo.setToolTip("ارجع للنسخة السابقة من اللوحة")
+        self.b_undo.clicked.connect(self.undo)
+        self.b_undo.setEnabled(False)
+        for b in (self.b_run, self.b_copy, self.b_save, self.b_undo):
+            row2.addWidget(b)
+        row2.addStretch(1)
+        v.addLayout(row2)
+        row3 = QHBoxLayout()
+        row3.setSpacing(4)
+        self.req = QLineEdit()
+        self.req.setPlaceholderText("اطلب تعديل على اللوحة… مثال: خلّ الألوان أغمق وأضف زر")
+        self.req.returnPressed.connect(self.ask)
+        self.b_ask = QPushButton("عدّل")
+        self.b_ask.setObjectName("primary")
+        self.b_ask.clicked.connect(self.ask)
+        row3.addWidget(self.req, 1)
+        row3.addWidget(self.b_ask)
+        v.addLayout(row3)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.refresh_preview)
+        self.editor.textChanged.connect(lambda: self._timer.start(500))
+        self.title = title
+        self._loading = False
+        self.set_code(code, self.lang, push=False)
+
+    def code(self):
+        return self.editor.toPlainText()
+
+    def set_code(self, code, lang=None, push=True):
+        if lang and lang in CANVAS_LANGS.values():
+            self.lang = lang
+        cur = self.code()
+        if push and cur.strip() and cur != code:
+            self.versions.append((self.lang, cur))
+            self.versions = self.versions[-30:]
+        self.b_undo.setEnabled(bool(self.versions))
+        self.editor.setPlainText(code)
+        names = {"html": "صفحة HTML", "svg": "رسم SVG", "md": "مستند", "py": "بايثون"}
+        self.chip.setText(names.get(self.lang, self.lang.upper()))
+        self.b_run.setVisible(self.lang == "py")
+        can_prev = self.lang in CANVAS_PREVIEW
+        self.b_prev.setVisible(can_prev)
+        self.show_view("prev" if can_prev else "code")
+        self.refresh_preview()
+
+    def show_view(self, which):
+        if which == "prev" and self.lang not in CANVAS_PREVIEW:
+            which = "code"
+        self.b_prev.setChecked(which == "prev")
+        self.b_code.setChecked(which == "code")
+        if which == "code":
+            self.stack.setCurrentIndex(0)
+        else:
+            self.refresh_preview()
+            self.stack.setCurrentIndex(1 if (self.page is not None and self.lang in ("html", "svg")) else 2)
+
+    def refresh_preview(self):
+        code = self.code()
+        if self.lang in ("html", "svg") and self.page is not None:
+            html = code if self.lang == "html" else '<html><body style="margin:0;background:#fff">%s</body></html>' % code
+            self.page.setHtml(html)
+        elif self.lang in ("html", "svg"):
+            self.text_prev.setHtml(code)
+        elif self.lang == "md":
+            self.text_prev.setMarkdown(code)
+            self.text_prev.document().setDefaultTextOption(auto_direction_option())
+
+    def undo(self):
+        if not self.versions:
+            return
+        lg, code = self.versions.pop()
+        self.b_undo.setEnabled(bool(self.versions))
+        self.lang = lg
+        self.editor.setPlainText(code)
+        self.set_code(code, lg, push=False)
+
+    def run_it(self):
+        self.app.run_code(self.code(), py=True)
+
+    def save_it(self):
+        ext = {"py": ".py", "md": ".md", "txt": ".txt", "js": ".js"}.get(self.lang, "." + self.lang)
+        dst, _ = QFileDialog.getSaveFileName(self, "حفظ اللوحة", os.path.join(self.app.default_dir(), "canvas" + ext))
+        if dst:
+            try:
+                with open(dst, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(self.code())
+            except Exception as ex:
+                QMessageBox.warning(self, "5belan", "تعذّر الحفظ: %s" % ex)
+
+    def ask(self):
+        t = self.req.text().strip()
+        if not t:
+            return
+        if self.app.canvas_request(t):
+            self.req.clear()
+
+
 class DockFrame(QFrame):
     """A side column with a small close button. Used for the browser, attachments, tasks, memory, usage..."""
     def __init__(self, title, widget, on_close, want_width=380):
@@ -5501,7 +5842,8 @@ class App(QMainWindow):
         groups = (
             (("ذاكرة", "ملاحظات عنك يقرأها خبيلان بكل محادثة", self.open_memory),
              ("صرف", "كم صرفت: اليوم، الأسبوع، وأغلى المحادثات", self.open_usage)),
-            (("مهام", "مهام تشتغل لوحدها بجدول أو عند ظهور ملف جديد", self.open_tasks),
+            (("لوحة", "مساحة جانبية للكود والصفحات والمستندات مع معاينة مباشرة وتعديل بالطلب", self.open_canvas),
+             ("مهام", "مهام تشتغل لوحدها بجدول أو عند ظهور ملف جديد", self.open_tasks),
              ("مهمة سريعة", "اكتب طلب واحد وشغّله الحين بالخلفية داخل هذي المحادثة وتكمل شغلك (بدون حفظ أو جدول)", self.new_bg_task),
              ("سجل", "كل اللي سواه خبيلان على جهازك", self.open_activity)),
             (("تليقرام", "اربط خبيلان ببوت تليقرام: إشعارات ومحادثة من جوالك", self.open_telegram),
@@ -5916,7 +6258,19 @@ class App(QMainWindow):
             else:
                 for kind, name, body in extract_files(m.get("content", "")):
                     out.append({"src": "bot", "kind": kind, "name": name, "body": body, "mi": i})
-        return out[::-1][:200]
+        out = out[::-1]
+        wd = os.path.join(self.chat_dir(), "work")
+        try:
+            for root, _d, files in os.walk(wd):
+                for fn in sorted(files):
+                    if fn.startswith("_run_"):
+                        continue
+                    fp = os.path.join(root, fn)
+                    rel = os.path.relpath(fp, wd).replace("\\", "/")
+                    out.append({"src": "work", "name": rel, "path": fp, "mi": int(os.path.getmtime(fp))})
+        except OSError:
+            pass
+        return out[:200]
 
     def apply_width(self):
         mx = CHAT_WIDTHS.get(self.cfg.get("chat_width", "wide"), CHAT_WIDTHS["wide"])[1]
@@ -5992,7 +6346,7 @@ class App(QMainWindow):
             th.setObjectName("flat")
             th.setFixedSize(60, 60)
             th.setToolTip("معاينة")
-            if e["src"] == "user" and ext in IMAGE_MIME and os.path.exists(e["path"]):
+            if e["src"] in ("user", "work") and ext in IMAGE_MIME and os.path.exists(e["path"]):
                 pm = QPixmap(e["path"])
                 if not pm.isNull():
                     th.setIcon(QIcon(pm.scaled(56, 56, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
@@ -6006,7 +6360,7 @@ class App(QMainWindow):
             nm = QLabel(e["name"] if len(e["name"]) <= 26 else e["name"][:23] + "...")
             nm.setLayoutDirection(Qt.LeftToRight)
             nm.setToolTip(e["name"])
-            meta = QLabel("مرفقك" if e["src"] == "user" else "من خبيلان")
+            meta = QLabel("مرفقك" if e["src"] == "user" else ("ناتج الكود" if e["src"] == "work" else "من خبيلان"))
             meta.setObjectName("chip")
             info.addWidget(nm)
             info.addWidget(meta)
@@ -6040,7 +6394,7 @@ class App(QMainWindow):
 
     def preview_entry(self, e):
         try:
-            if e["src"] == "user":
+            if e["src"] in ("user", "work"):
                 p = e["path"]
                 if not os.path.exists(p):
                     QMessageBox.information(self, "5belan", "الملف الأصلي ما عاد موجود.")
@@ -6063,7 +6417,7 @@ class App(QMainWindow):
             QMessageBox.warning(self, "5belan", "تعذّرت المعاينة: %s" % ex)
 
     def entry_path(self, e):
-        if e["src"] == "user":
+        if e["src"] in ("user", "work"):
             return e["path"] if os.path.exists(e["path"]) else None
         folder = os.path.join(self.chat_dir(), "m%d" % e["mi"])
         os.makedirs(folder, exist_ok=True)
@@ -6102,7 +6456,7 @@ class App(QMainWindow):
             open_path(os.path.dirname(p))
 
     def save_entry(self, e):
-        if e["src"] == "user":
+        if e["src"] in ("user", "work"):
             self.save_user_file(e["path"])
         else:
             self._bot_assets(e)
@@ -6639,25 +6993,28 @@ class App(QMainWindow):
         except Exception as e:
             self._resolve(slot, "Error: " + str(e))
 
-    def run_snippet(self, cid):
+    def run_snippet(self, cid, py=False):
         """Run a command block from a reply on this computer, after asking and after the OS-protection check."""
-        code = self.copy_store.get(cid, "")
+        self.run_code(self.copy_store.get(cid, ""), py)
+
+    def run_code(self, code, py=False):
         if not code.strip():
             return
-        danger = shell_danger(code)
+        danger = None if py else shell_danger(code)
         if danger:
             QMessageBox.warning(self, "5belan", "رفضت تشغيله: %s.\nالبرنامج ما يلمس ملفات النظام أبداً." % danger)
             return
         box = QMessageBox(self)
-        box.setWindowTitle("تشغيل الأمر")
+        box.setWindowTitle("تشغيل الكود" if py else "تشغيل الأمر")
         box.setIcon(QMessageBox.Icon.Question)
-        box.setText("تشغيل هذا الأمر على جهازك؟")
+        box.setText("تشغيل كود بايثون هذا على جهازك؟ النتائج تنحفظ في مرفقات المحادثة." if py else "تشغيل هذا الأمر على جهازك؟")
         box.setDetailedText(_cut(code, 20000))
         box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         box.setDefaultButton(QMessageBox.StandardButton.No)
         if box.exec() != QMessageBox.StandardButton.Yes:
             return
         runner = ToolRunner(roots=[], shell_mode="free")
+        runner.work_dir = os.path.join(self.chat_dir(), "work") if self.current else os.path.join(DATA_DIR, "work")
         stop = threading.Event()
         runner.stop_event = stop
         dlg = RunOutputDialog(self, code, stop)
@@ -6665,7 +7022,7 @@ class App(QMainWindow):
 
         def work():
             try:
-                holder["out"] = runner.run_command({"command": code, "explanation": "run from reply"})
+                holder["out"] = (runner.run_python({"code": code}) if py else runner.run_command({"command": code, "explanation": "run from reply"}))
             except Exception as e:
                 holder["out"] = "Error: %s" % e
 
@@ -6676,6 +7033,9 @@ class App(QMainWindow):
             if "out" in holder:
                 tm.stop()
                 dlg.done(holder["out"])
+                if py:
+                    self._files_sig = None
+                    self.refresh_files_panel()
 
         tm.timeout.connect(poll_run)
         tm.start(250)
@@ -7146,7 +7506,20 @@ class App(QMainWindow):
         a.setFontWeight(QFont.Weight.Bold)
         c.insertText("⧉ نسخ", a)
         fam = shell_family(lang)
-        if fam == ("win" if IS_WIN else "unix"):
+        lg_ = CANVAS_LANGS.get((lang or "").lower())
+        if lg_ == "py":
+            c.insertText("      ", h)
+            r = QTextCharFormat(a)
+            r.setAnchorHref("runpy:" + cid)
+            c.insertText("تشغيل", r)
+        if lg_ and code.count("\n") >= 5:
+            c.insertText("      ", h)
+            r = QTextCharFormat(a)
+            r.setAnchorHref("canvas:" + cid + ":" + lg_)
+            c.insertText("افتح في اللوحة", r)
+        if lg_ == "py":
+            pass
+        elif fam == ("win" if IS_WIN else "unix"):
             c.insertText("      ", h)
             r = QTextCharFormat(a)
             r.setAnchorHref("run:" + cid)
@@ -7231,6 +7604,13 @@ class App(QMainWindow):
             return
         if s.startswith("run:"):
             self.run_snippet(s[4:])
+            return
+        if s.startswith("runpy:"):
+            self.run_snippet(s[6:], py=True)
+            return
+        if s.startswith("canvas:"):
+            _cid, _, lg_ = s[7:].rpartition(":")
+            self.open_canvas(self.copy_store.get(_cid, ""), lg_)
             return
         if s.startswith("src:"):
             self.open_source(s[4:])
@@ -7515,6 +7895,51 @@ class App(QMainWindow):
         frame.show()
         dlg.show()
         self.relayout()
+
+    def open_canvas(self, code="", lang="html"):
+        fr = self.docks.get("canvas")
+        if fr is not None:
+            if code:
+                fr.inner.set_code(code, lang)
+            return fr.inner
+        if not code:
+            code = "<!doctype html>\n<html dir=\"rtl\" lang=\"ar\">\n<head><meta charset=\"utf-8\"><title>صفحة جديدة</title></head>\n<body>\n<h1>اللوحة</h1>\n<p>اطلب من خبيلان ينشئ لك شي هنا، أو اكتب مباشرة.</p>\n</body>\n</html>\n"
+            lang = "html"
+        self.open_dock("canvas", "اللوحة", lambda: CanvasDialog(self, lang, code), None, 520)
+        return self.docks["canvas"].inner
+
+    def canvas_request(self, text):
+        """Ask the model to change what is in the canvas; the current content is sent along, the chat only shows the short request."""
+        fr = self.docks.get("canvas")
+        if fr is None:
+            return False
+        if self.busy:
+            QMessageBox.information(self, "5belan", "خبيلان مشغول بالرد الحين. انتظر يخلص أو أوقفه.")
+            return False
+        cv = fr.inner
+        lg = {"py": "python", "md": "markdown"}.get(cv.lang, cv.lang)
+        self._shown_override = "[اللوحة] " + text
+        self.inp.setPlainText(
+            "هذا المحتوى الحالي في اللوحة (%s):\n```%s\n%s\n```\n\nطلب التعديل: %s\n\n"
+            "أعد المحتوى كامل بعد التعديل في كتلة كود واحدة بنفس النوع (%s)، وبعدها اشرح التغيير في سطر أو سطرين فقط." % (lg, lg, cv.code(), text, lg))
+        self.send()
+        self._shown_override = None
+        if self.inp.toPlainText().startswith("هذا المحتوى الحالي في اللوحة"):
+            self.inp.clear()
+            return False
+        return True
+
+    def canvas_from_reply(self, content):
+        pick = canvas_pick(content)
+        if pick is None:
+            return
+        lg, code = pick
+        fr = self.docks.get("canvas")
+        if fr is not None:
+            if lg == fr.inner.lang or lg in CANVAS_PREVIEW:
+                fr.inner.set_code(code, lg)
+        elif lg in ("html", "svg") and code.count("\n") >= CANVAS_AUTO_LINES and self.cfg.get("canvas_auto", True):
+            self.open_canvas(code, lg)
 
     def close_dock(self, key):
         frame = self.docks.pop(key, None)
@@ -8543,7 +8968,8 @@ class App(QMainWindow):
                 stored.append({"name": os.path.basename(dst), "path": dst})
         except Exception as ex:
             log_event("could not copy attachments: %s" % ex)
-        msg = {"role": "user", "content": content, "shown": text, "names": names}
+        shown_text = getattr(self, "_shown_override", None) or text
+        msg = {"role": "user", "content": content, "shown": shown_text, "names": names}
         if quotes:
             msg["quotes"] = quotes
         if stored:
@@ -8560,7 +8986,7 @@ class App(QMainWindow):
         self.quotes = []
         self.refresh_quotes()
         self.inp.clear()
-        self.add_user_bubble(text, names, quotes, len(self.current["msgs"]) - 1)
+        self.add_user_bubble(shown_text, names, quotes, len(self.current["msgs"]) - 1)
         self.refresh_files_panel()
         self.attachments = []
         self.refresh_files_label()
@@ -8581,7 +9007,7 @@ class App(QMainWindow):
         allow_computer = bool(self.computer_enabled)
         use_browser = bool(self.browser_enabled and self.web_ok)
         runner = None
-        if roots or shell_mode != "off" or allow_computer or use_browser:
+        if True:  # the code interpreter is always available, so there is always a runner
             runner = ToolRunner(
                 roots,
                 writable=wroots,
@@ -8596,6 +9022,7 @@ class App(QMainWindow):
             )
             runner.stop_event = self.stop_event
             runner.undo_dir = os.path.join(self.chat_dir(), "undo")
+            runner.work_dir = os.path.join(self.chat_dir(), "work")
         if runner is not None:
             runner.llm = self.make_llm(key, lambda u: self.q.put(("usage", (MODELS[0], u, time.time()))))
         self._act_title = self.current.get("title", "")
@@ -9129,6 +9556,10 @@ class App(QMainWindow):
                 self.persist()
                 self.refresh_list()
                 self.render_chat()
+                try:
+                    self.canvas_from_reply(content)
+                except Exception as ex:
+                    log_event("canvas: %s" % ex)
                 self.finish()
             elif kind == "err":
                 if L is not None:
