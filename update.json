@@ -1,10 +1,10 @@
 {
-  "version": "2.2.1",
-  "notes": "Fix text jumping when selecting text (header height now fixed)",
+  "version": "2.3.0",
+  "notes": "New: natural text selection, boxed chat bubbles, quote chips, redesigned thinking, tabbed background browser, safer long commands",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "e2a13983341caa47d8e4d5ac0953d7b6e0973470f2311b412e941dcb98e88d77"
+      "sha256": "95a97e2af027c4eafd066fbc7ddde246f94ce8b35c1ea096cd2c9e0f842fbea7"
     },
     {
       "name": "guard.py",
@@ -20,7 +20,10 @@
     },
     {
       "name": "requirements.txt",
-      "sha256": "1f6b78861c746c1f477d0dc9210f833e281de8472bf86d56b8ddc8df2a8bba98"
+      "sha256": "57aa0e5a6c24527ec89139dc7c6658fb8d06077d200d6632a90e164b24758470"
     }
+  ],
+  "pip": [
+    "PySide6-WebEngine"
   ]
 }

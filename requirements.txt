@@ -1,5 +1,6 @@
 PySide6-Essentials
 PySide6-Addons
+PySide6-WebEngine; platform_machine == "x86_64" or platform_machine == "AMD64" or platform_machine == "arm64"
 pypdf
 python-docx
 openpyxl
