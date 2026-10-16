@@ -2773,7 +2773,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.12.0"
+APP_VERSION = "2.12.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5378,11 +5378,12 @@ class App(QMainWindow):
         tbl.setContentsMargins(12, 4, 12, 4)
         tbl.setSpacing(2)
         self.tools_bar.setLayoutDirection(Qt.RightToLeft)
+        tbl.addStretch(1)  # first in a right-to-left row = far right, so the buttons sit at the left edge
         groups = (
             (("ذاكرة", "ملاحظات عنك يقرأها خبيلان بكل محادثة", self.open_memory),
              ("صرف", "كم صرفت: اليوم، الأسبوع، وأغلى المحادثات", self.open_usage)),
             (("مهام", "مهام تشتغل لوحدها بجدول أو عند ظهور ملف جديد", self.open_tasks),
-             ("خلفية", "شغّل مهمة طويلة بالخلفية وتكمل شغلك", self.new_bg_task),
+             ("مهمة سريعة", "اكتب طلب واحد وشغّله الحين بالخلفية داخل هذي المحادثة وتكمل شغلك (بدون حفظ أو جدول)", self.new_bg_task),
              ("سجل", "كل اللي سواه خبيلان على جهازك", self.open_activity)),
             (("تليقرام", "اربط خبيلان ببوت تليقرام: إشعارات ومحادثة من جوالك", self.open_telegram),
              ("مشكلة", "تقرير جاهز للنسخ لو صار خطأ", self.open_problem)))
@@ -5401,7 +5402,6 @@ class App(QMainWindow):
                 b.setFixedHeight(28)
                 b.clicked.connect(fn)
                 tbl.addWidget(b)
-        tbl.addStretch(1)
         side.setMinimumWidth(230)
         side.setMaximumWidth(360)
         splitter.addWidget(side)
@@ -5420,6 +5420,7 @@ class App(QMainWindow):
 
         ml.addWidget(self.tools_bar)
         header = QWidget()
+        header.setLayoutDirection(Qt.RightToLeft)  # title on the right, the buttons gather at the left edge
         hl = QHBoxLayout(header)
         hl.setContentsMargins(16, 8, 16, 4)
         self.title_label = QLabel("محادثة جديدة")
