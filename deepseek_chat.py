@@ -2556,6 +2556,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QGridLayout,
+    QSpinBox,
     QStyle,
     QApplication,
     QSizePolicy,
@@ -2773,7 +2774,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.12.3"
+APP_VERSION = "2.12.4"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4812,11 +4813,49 @@ class TelegramDialog(QDialog):
         super().done(r)
 
 
+class TwoDigitSpin(QSpinBox):
+    def textFromValue(self, v):
+        return "%02d" % v
+
+
+class TimeBox(QWidget):
+    """HH : MM picker made of two spin boxes (QTimeEdit prints the digits reversed in a right-to-left window)."""
+    def __init__(self):
+        super().__init__()
+        from PySide6.QtCore import QTime
+        self._QTime = QTime
+        self.setLayoutDirection(Qt.LeftToRight)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(2)
+        self.hh = TwoDigitSpin()
+        self.hh.setRange(0, 23)
+        self.hh.setWrapping(True)
+        self.hh.setFixedWidth(56)
+        self.mm = TwoDigitSpin()
+        self.mm.setRange(0, 59)
+        self.mm.setWrapping(True)
+        self.mm.setFixedWidth(56)
+        h.addWidget(self.hh)
+        h.addWidget(QLabel(":"))
+        h.addWidget(self.mm)
+
+    def time(self):
+        return self._QTime(self.hh.value(), self.mm.value())
+
+    def setTime(self, t):
+        self.hh.setValue(t.hour())
+        self.mm.setValue(t.minute())
+
+    def setEnabled(self, on):
+        super().setEnabled(on)
+
+
 class TasksDialog(QDialog):
     def __init__(self, parent, tasks, start_dir, run_cb):
         super().__init__(parent)
         from PySide6.QtCore import QTime
-        from PySide6.QtWidgets import QTimeEdit
+        
 
         self.setWindowTitle("المهام التلقائية")
         self.resize(900, 700)
@@ -4830,9 +4869,14 @@ class TasksDialog(QDialog):
         lay.setSpacing(6)
         # --- the list of saved tasks (compact) with its two buttons
         self.lst = QListWidget()
-        self.lst.setMaximumHeight(120)
+        self.lst.setFrameShape(QFrame.NoFrame)
+        self.lst.setSpacing(1)
         self.lst.currentRowChanged.connect(self.on_row)
         lay.addWidget(self.lst)
+        self.empty_lbl = QLabel("ما عندك مهام محفوظة بعد. اضغط «مهمة جديدة».")
+        self.empty_lbl.setObjectName("chip")
+        self.empty_lbl.setWordWrap(True)
+        lay.addWidget(self.empty_lbl)
         lrow = QHBoxLayout()
         lrow.setSpacing(6)
         b_new = QPushButton("مهمة جديدة")
@@ -4876,9 +4920,7 @@ class TasksDialog(QDialog):
             self.trigger.addItem(t)
         self.trigger.currentIndexChanged.connect(self.sync)
         trow.addWidget(self.trigger, 1)
-        self.time = QTimeEdit()
-        self.time.setDisplayFormat("HH:mm")
-        self.time.setLayoutDirection(Qt.LeftToRight)
+        self.time = TimeBox()
         trow.addWidget(self.time)
         self.weekday = QComboBox()
         for w in WEEKDAYS:
@@ -4962,6 +5004,10 @@ class TasksDialog(QDialog):
             self.lst.addItem(("" if t.get("enabled", True) else "(متوقفة) ") + t["name"])
             self.lst.item(self.lst.count() - 1).setSizeHint(QSize(0, 34))
         self.lst.blockSignals(False)
+        n_ = len(self.tasks)
+        self.lst.setVisible(n_ > 0)  # no empty box when there are no tasks yet
+        self.lst.setFixedHeight(min(n_, 4) * 36 + 6)
+        self.empty_lbl.setVisible(n_ == 0)
         if self.tasks:
             self.lst.setCurrentRow(min(sel, len(self.tasks) - 1))
             self.on_row(self.lst.currentRow())
