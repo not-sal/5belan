@@ -3019,7 +3019,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.15.0"
+APP_VERSION = "2.15.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -8337,25 +8337,21 @@ class App(QMainWindow):
         send = lambda t: threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], t), daemon=True).start()
         cmd = text.split()[0].lower() if text.startswith("/") else ""
         if cmd in ("/help", "/start"):
-            send("الأوامر:\n/chats محادثاتك اللي بالتطبيق\n/open رقم اختيار محادثة وكمّلها من هنا\n/read [عدد] قراءة آخر رسائل المحادثة المختارة\n"
+            send("الأوامر:\n/chats محادثاتك اللي بالتطبيق\n/open عرض المحادثات، و/open رقم لاختيار وحدة وكمّلها من هنا\n/read [عدد] قراءة آخر رسائل المحادثة المختارة\n"
                  "/where أي محادثة مختارة الحين\n/new محادثة تليقرام جديدة (منفصلة)\n/status حالة التطبيق\n/tasks مهامك\n/run رقم_أو_اسم تشغيل مهمة\n"
                  "وأي نص ثاني يروح للمحادثة المختارة (بدون اختيار: محادثة تليقرام الخاصة).")
             return
-        if cmd == "/chats":
+        if cmd in ("/chats", "/open") and not (cmd == "/open" and text[5:].strip()):
             lst = sorted([c for c in self.chats if c.get("id") != "telegram" and c.get("msgs")], key=lambda c: -float(c.get("updated", 0)))[:12]
             self._tg_map = [c["id"] for c in lst]
-            now = time.time()
-            def ago(t):
-                d = max(0, int(now - float(t or 0)))
-                return "الحين" if d < 90 else ("%d د" % (d // 60) if d < 3600 else ("%d س" % (d // 3600) if d < 172800 else "%d يوم" % (d // 86400)))
-            send("\n".join("%d) %s · %s" % (i + 1, (c.get("title") or "بدون عنوان")[:45], ago(c.get("updated"))) for i, c in enumerate(lst))
-                 + "\n\nاكتب /open رقم عشان تختار وحدة." if lst else "ما فيه محادثات.")
+            send(("\n".join("%d) %s" % (i + 1, (c.get("title") or "بدون عنوان")[:45]) for i, c in enumerate(lst))
+                  + "\n\nاكتب /open ورقم المحادثة، مثال: /open 1") if lst else "ما فيه محادثات.")
             return
         if cmd == "/open":
             arg = text[5:].strip()
-            m_ = getattr(self, "_tg_map", [])
+            m_ = getattr(self, "_tg_map", None) or [c["id"] for c in sorted([c for c in self.chats if c.get("id") != "telegram" and c.get("msgs")], key=lambda c: -float(c.get("updated", 0)))[:12]]
             if not arg.isdigit() or not (1 <= int(arg) <= len(m_)):
-                send("اكتب /chats أول ثم /open رقم.")
+                send("رقم غلط. اكتب /open لعرض المحادثات.")
                 return
             ch_ = next((c for c in self.chats if c["id"] == m_[int(arg) - 1]), None)
             if ch_ is None:
