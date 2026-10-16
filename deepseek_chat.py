@@ -925,6 +925,8 @@ def strip_for_save(msg):
         out["sources"] = msg["sources"]
     if msg.get("sugg"):
         out["sugg"] = msg["sugg"][:3]
+    if msg.get("skill_offer"):
+        out["skill_offer"] = msg["skill_offer"]
     if msg.get("activity"):
         # keep the file small: only the last steps, each shortened (full logs were making chats.json huge)
         out["activity"] = [dict(s, text=str(s.get("text", ""))[:3000]) for s in msg["activity"][-60:]]
@@ -1633,6 +1635,220 @@ def memory_prompt():
     if mem:
         out += "\nUSER NOTES:\n" + mem
     return out
+
+
+# ---------- skills: reusable instructions (SKILL.md files) the user turns on per chat ----------
+SKILLS_DIR = os.path.join(DATA_DIR, "skills")
+SKILL_BODY_MAX = 15000
+SKILLS_PROMPT_MAX = 40000
+SKILL_OFFER_RE = re.compile(r"\[\[\s*skill-offer\s*\]\](.*?)\[\[\s*/\s*skill-offer\s*\]\]", re.S | re.I)
+SKILL_OFFER_TAIL_RE = re.compile(r"\[\[\s*skill-offer\s*\]\].*$", re.S | re.I)
+
+
+def parse_skill(text, fallback_name=""):
+    """Read a SKILL.md: '---' front matter with name/description, then the instructions. Returns (name, desc, body)."""
+    text = (text or "").replace("\r\n", "\n").lstrip("﻿")
+    meta, body = {}, text
+    m = re.match(r"^---[ \t]*\n(.*?)\n---[ \t]*(?:\n|$)", text, re.S)
+    if m:
+        body = text[m.end():]
+        key = None
+        for ln in m.group(1).splitlines():
+            km = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*)$", ln)
+            if km:
+                key, val = km.group(1).lower(), km.group(2).strip()
+                meta[key] = "" if val in (">", "|", ">-", "|-") else val.strip("\"'")
+            elif key and ln.startswith((" ", "\t")):
+                meta[key] = (meta[key] + " " + ln.strip()).strip()
+    name = meta.get("name") or ""
+    desc = meta.get("description") or ""
+    body = body.strip()
+    if not name:
+        h = re.search(r"^#\s+(.+)$", body, re.M)
+        name = h.group(1).strip() if h else fallback_name
+    if not desc:
+        for ln in body.splitlines():
+            ln = ln.strip()
+            if ln and not ln.startswith("#"):
+                desc = ln
+                break
+    return name.strip()[:80], desc.strip()[:400], body
+
+
+def skill_text(name, desc, body):
+    one = lambda s: re.sub(r"\s+", " ", s or "").strip()
+    return "---\nname: %s\ndescription: %s\n---\n\n%s\n" % (one(name), one(desc), (body or "").strip())
+
+
+def list_skills():
+    out = []
+    try:
+        names = sorted(os.listdir(SKILLS_DIR))
+    except Exception:
+        return out
+    for sid in names:
+        p = os.path.join(SKILLS_DIR, sid, "SKILL.md")
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                name, desc, body = parse_skill(f.read(), sid)
+        except Exception:
+            continue
+        src = ""
+        try:
+            with open(os.path.join(SKILLS_DIR, sid, "source.txt"), "r", encoding="utf-8") as f:
+                src = f.read().strip()
+        except Exception:
+            pass
+        out.append({"id": sid, "name": name or sid, "desc": desc, "body": body, "path": p, "source": src})
+    return out
+
+
+def skill_slug(name):
+    s = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")[:40]
+    return s or "skill-" + hashlib.sha1((name or str(time.time())).encode("utf-8")).hexdigest()[:6]
+
+
+def save_skill(name, desc, body, source="", sid=None):
+    """Write a skill to DATA_DIR/skills/<id>/SKILL.md. A new skill never overwrites another one. Returns its id."""
+    if not sid:
+        base = skill_slug(name)
+        sid, n = base, 2
+        while os.path.exists(os.path.join(SKILLS_DIR, sid)):
+            sid, n = "%s-%d" % (base, n), n + 1
+    d = os.path.join(SKILLS_DIR, sid)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as f:
+        f.write(skill_text(name, desc, body))
+    if source:
+        with open(os.path.join(d, "source.txt"), "w", encoding="utf-8") as f:
+            f.write(source)
+    return sid
+
+
+def delete_skill(sid):
+    d = os.path.join(SKILLS_DIR, os.path.basename(sid or ""))
+    if sid and os.path.isdir(d):
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def skill_from_file(path):
+    """A .md/.txt file, or a .zip/.skill archive holding a SKILL.md. Returns (name, desc, body)."""
+    base = os.path.splitext(os.path.basename(path))[0]
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as z:
+            cands = sorted((n for n in z.namelist() if n.lower().endswith("skill.md")), key=len)
+            if not cands:
+                cands = sorted((n for n in z.namelist() if n.lower().endswith(".md")), key=len)
+            if not cands:
+                raise ValueError("الملف المضغوط ما فيه SKILL.md")
+            raw = z.read(cands[0])[:2_000_000]
+            folder = os.path.basename(os.path.dirname(cands[0].rstrip("/"))) or base
+            return parse_skill(decode_text(raw), folder)
+    with open(path, "rb") as f:
+        raw = f.read(2_000_000)
+    if os.path.basename(path).lower() == "skill.md":
+        base = os.path.basename(os.path.dirname(os.path.abspath(path))) or base
+    return parse_skill(decode_text(raw), base)
+
+
+def skills_prompt(ids, offers=True):
+    """The instructions of the skills turned on for this chat, plus how to offer a new skill."""
+    out = ""
+    on = [s for s in list_skills() if s["id"] in set(ids or [])]
+    if on:
+        out += ("\nSKILLS: the user turned on these skills for this chat. Each one is a set of instructions for a kind of task. "
+                "When a request matches a skill's description, follow that skill's instructions.\n")
+        used = 0
+        for s in on:
+            body = _cut(s["body"], SKILL_BODY_MAX)
+            if used + len(body) > SKILLS_PROMPT_MAX:
+                out += "\n### SKILL: %s\n%s\n(instructions left out: too long)\n" % (s["name"], s["desc"])
+                continue
+            used += len(body)
+            out += "\n### SKILL: %s\nWhen to use: %s\n%s\n" % (s["name"], s["desc"], body)
+    if offers:
+        names = ", ".join(s["name"] for s in list_skills()[:60])
+        out += (
+            "\nSKILL OFFERS: when, in this conversation, you worked out a reusable way of doing a kind of task (a multi-step procedure, "
+            "a checklist, a format or style the user corrected you into, a workflow with specific tools or commands) that would clearly help "
+            "in future conversations, offer to save it as a skill. At the very END of that reply add exactly one block:\n"
+            "[[skill-offer]]\nname: short name (2-5 words, in the user's language)\ndescription: one sentence: what it does and when to use it\n---\n"
+            "the instructions in Markdown: when to use it, the steps, the rules and pitfalls you learned\n[[/skill-offer]]\n"
+            "The app hides the block and shows the user a button to add it. At most one offer per reply, only after real work "
+            "(never for simple questions; facts about the user go to memory instead), never for something already saved, "
+            "and never offer the same thing again if the user ignored it." + ("\nSaved skills: " + names if names else "")
+        )
+    return out
+
+
+def extract_skill_offer(text):
+    """Pull the [[skill-offer]] block out of a reply. Returns (clean_text, offer or None)."""
+    m = SKILL_OFFER_RE.search(text or "")
+    if not m:
+        return SKILL_OFFER_TAIL_RE.sub("", text or "").rstrip(), None
+    raw = m.group(1).strip()
+    head, sep, body = raw.partition("\n---")
+    meta = {}
+    for ln in head.splitlines():
+        km = re.match(r"^\s*(name|description)\s*:\s*(.+)$", ln, re.I)
+        if km:
+            meta[km.group(1).lower()] = km.group(2).strip().strip("\"'")
+    body = body.strip() if sep else ""
+    clean = SKILL_OFFER_RE.sub("", text).rstrip()
+    if not meta.get("name") or len(body) < 20:
+        return clean, None
+    return clean, {"name": meta["name"][:80], "desc": meta.get("description", "")[:400], "body": body[:SKILL_BODY_MAX]}
+
+
+GH_API = "https://api.github.com"
+
+
+def gh_get(path, accept="application/vnd.github+json", limit=3_000_000, timeout=25):
+    url = path if path.startswith("https://") else GH_API + path
+    req = urllib.request.Request(url, headers={"User-Agent": "5belan", "Accept": accept})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read(limit + 1)
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            raise RuntimeError("GitHub رافض الطلب الحين (حد البحث بدون حساب). انتظر دقيقة وجرب.")
+        if e.code == 404:
+            raise RuntimeError("ما لقيت الصفحة على GitHub.")
+        raise RuntimeError("GitHub: HTTP %s" % e.code)
+    if len(data) > limit:
+        raise RuntimeError("الملف كبير مرة")
+    return data
+
+
+def gh_search_skill_repos(query):
+    """Repositories that look like skill collections, most stars first."""
+    q = (query or "").strip()
+    m = re.match(r"^(?:https?://github\.com/)?([\w.-]+/[\w.-]+?)(?:\.git)?/?$", q)
+    if m:  # owner/repo or a github.com link: open that repository directly
+        items = [json.loads(gh_get("/repos/" + m.group(1)))]
+    else:
+        q = (q + " skill") if q else "topic:agent-skills"
+        items = json.loads(gh_get("/search/repositories?" + urllib.parse.urlencode({"q": q, "sort": "stars", "order": "desc", "per_page": 25}))).get("items")
+    out = []
+    for r in items or []:
+        out.append({"full": r.get("full_name", ""), "desc": r.get("description") or "", "stars": r.get("stargazers_count", 0),
+                    "branch": r.get("default_branch") or "main"})
+    return out
+
+
+def gh_repo_skills(full, branch):
+    """Paths of the SKILL.md files in a repository."""
+    full = urllib.parse.quote(full, safe="/")
+    data = json.loads(gh_get("/repos/%s/git/trees/%s?recursive=1" % (full, urllib.parse.quote(branch, safe=""))))
+    paths = [t["path"] for t in data.get("tree") or [] if t.get("type") == "blob" and t.get("path", "").lower().endswith("skill.md")]
+    return sorted(paths)[:300]
+
+
+def gh_raw(full, branch, path):
+    url = "https://raw.githubusercontent.com/%s/%s/%s" % (full, urllib.parse.quote(branch, safe=""), urllib.parse.quote(path))
+    return decode_text(gh_get(url, accept="*/*", limit=2_000_000))
 
 
 PLAN_TOOLS = [
@@ -3021,7 +3237,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.16.0"
+APP_VERSION = "2.17.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -3081,6 +3297,7 @@ def restrictive_settings(model="deepseek-flash", thinking="high"):
         "allowed_dirs": [], "writable_dirs": [], "tools_enabled": False, "write_enabled": False,
         "delete_enabled": False, "confirm_edits": True, "backup_enabled": True, "shell_mode": "off",
         "computer_enabled": False, "browser_enabled": False, "model": model, "thinking": thinking, "plan_first": False,
+        "skills": [],
     }
 
 
@@ -3102,6 +3319,7 @@ def clean_settings(s, fallback):
     out["model"] = m if m in MODELS else fallback.get("model", MODELS[0])
     t = s.get("thinking")
     out["thinking"] = t if t in THINKING_LEVELS else fallback.get("thinking", "high")
+    out["skills"] = [x for x in (s.get("skills") or []) if isinstance(x, str)][:50]
     if not out["allowed_dirs"]:
         out["tools_enabled"] = False
     if not out["writable_dirs"]:
@@ -4126,10 +4344,10 @@ CHAT_WIDTHS = {
 class AppSettingsDialog(QDialog):
     """Application-wide settings (like the Settings page in the Claude app): account, appearance, updates."""
 
-    def __init__(self, parent, key, remember, theme, update_url, width="wide", suggest=True, auto_update=True):
+    def __init__(self, parent, key, remember, theme, update_url, width="wide", suggest=True, auto_update=True, skill_offers=True, khaled=False):
         super().__init__(parent)
         self.setWindowTitle("إعدادات التطبيق")
-        self.resize(560, 420)
+        self.resize(600, 560)
         self.check_requested = False
         self.import_requested = False
         lay = QVBoxLayout(self)
@@ -4165,6 +4383,31 @@ class AppSettingsDialog(QDialog):
         self.auto_box = QCheckBox("حدّث البرنامج تلقائياً لما ينزل إصدار جديد")
         self.auto_box.setChecked(bool(auto_update))
         lay.addWidget(self.auto_box)
+        hs = QLabel("المهارات")
+        hs.setObjectName("h2")
+        lay.addWidget(hs)
+        rows = QHBoxLayout()
+        self.skills_label = QLabel()
+        rows.addWidget(self.skills_label, 1)
+        bs = QPushButton("إضافة وإدارة المهارات…")
+        bs.clicked.connect(self._skills)
+        rows.addWidget(bs)
+        lay.addLayout(rows)
+        self.offer_box = QCheckBox("لما يتعلّم طريقة شغل جديدة يقترح عليّ أحفظها كمهارة")
+        self.offer_box.setChecked(bool(skill_offers))
+        lay.addWidget(self.offer_box)
+        hk = QLabel("زر خالد")
+        hk.setObjectName("h2")
+        lay.addWidget(hk)
+        rowk = QHBoxLayout()
+        self.khaled_box = QCheckBox("زر خالد: إذا ما حرّكت الجهاز دقيقة وخبيلان يفكر، أول ما يخلص تومض الشاشة أخضر غامق وأسود 5 ثواني")
+        self.khaled_box.setChecked(bool(khaled))
+        rowk.addWidget(self.khaled_box, 1)
+        bk = QPushButton("جرّبه")
+        bk.clicked.connect(lambda: setattr(self, "_kf", khaled_flash(KHALED_SECONDS)))
+        rowk.addWidget(bk)
+        lay.addLayout(rowk)
+        self._count_skills()
         h3 = QLabel("التحديثات")
         h3.setObjectName("h3")
         h3.setObjectName("h2")
@@ -4202,6 +4445,14 @@ class AppSettingsDialog(QDialog):
         self.import_requested = True
         self.accept()
 
+    def _count_skills(self):
+        n = len(list_skills())
+        self.skills_label.setText(("عندك %d مهارة. تختار اللي تبيها لكل محادثة من «إعدادات المحادثة»." % n) if n else "ما عندك مهارات للحين.")
+
+    def _skills(self):
+        SkillsDialog(self).exec()
+        self._count_skills()
+
     def _check(self):
         self.check_requested = True
         self.accept()
@@ -4215,7 +4466,408 @@ class AppSettingsDialog(QDialog):
             "update_url": self.url_edit.text().strip(),
             "suggest": self.suggest_box.isChecked(),
             "auto_update": self.auto_box.isChecked(),
+            "skill_offers": self.offer_box.isChecked(),
+            "khaled": self.khaled_box.isChecked(),
         }
+
+
+KHALED_IDLE = 60      # seconds without mouse/keyboard before «زر خالد» flashes
+KHALED_SECONDS = 5
+
+
+def system_idle_seconds():
+    """Seconds since the last mouse/keyboard input anywhere on the computer, or None when it cannot be read."""
+    try:
+        if IS_WIN:
+            import ctypes
+
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+            li = LASTINPUTINFO()
+            li.cbSize = ctypes.sizeof(li)
+            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(li)):
+                return None
+            return ((ctypes.windll.kernel32.GetTickCount() - li.dwTime) & 0xFFFFFFFF) / 1000.0
+        if IS_MAC:
+            out = subprocess.run(["ioreg", "-c", "IOHIDSystem"], capture_output=True, text=True, timeout=3).stdout
+            m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
+            return int(m.group(1)) / 1e9 if m else None
+        if shutil.which("xprintidle"):
+            out = subprocess.run(["xprintidle"], capture_output=True, text=True, timeout=3).stdout.strip()
+            return int(out) / 1000.0 if out.isdigit() else None
+    except Exception:
+        pass
+    return None
+
+
+class KhaledFlash(QWidget):
+    """«زر خالد»: a full-screen dark green / black flash for a few seconds, so a user who looked away sees the reply is done."""
+
+    COLORS = ("#006400", "#000000")
+
+    def __init__(self, geo, seconds=5):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setGeometry(geo)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl = QLabel("خبيلان خلص ورد عليك", self)
+        self.lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl.setGeometry(0, 0, geo.width(), geo.height())
+        self._i = 0
+        self._tick()
+        self.t = QTimer(self)
+        self.t.timeout.connect(self._tick)
+        self.t.start(350)
+        QTimer.singleShot(int(seconds * 1000), self.close)
+
+    def _tick(self):
+        c = self.COLORS[self._i % 2]
+        self._i += 1
+        self.setStyleSheet("background:%s;" % c)
+        self.lbl.setStyleSheet("background:transparent; color:#ffffff; font-size:40px; font-weight:bold;")
+
+    def mousePressEvent(self, e):
+        self.close()
+
+    def keyPressEvent(self, e):
+        self.close()
+
+
+def khaled_flash(seconds=5):
+    """Flash every screen; returns the windows so they are not garbage-collected."""
+    wins = []
+    for sc in QApplication.screens():
+        w = KhaledFlash(sc.geometry(), seconds)
+        w.show()
+        w.raise_()
+        wins.append(w)
+    return wins
+
+
+def run_later(widget, fn, done):
+    """Run fn() in a thread and call done(result, error) on the UI thread (polled, so no signals are needed)."""
+    box = {}
+
+    def work():
+        try:
+            box["r"] = fn()
+        except Exception as e:
+            box["e"] = e
+
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    t = QTimer(widget)
+
+    def poll():
+        if th.is_alive():
+            return
+        t.stop()
+        t.deleteLater()
+        done(box.get("r"), box.get("e"))
+
+    t.timeout.connect(poll)
+    t.start(120)
+
+
+class SkillEditDialog(QDialog):
+    """Write or change one skill: name, short bio (when to use it) and the instructions."""
+
+    def __init__(self, parent, name="", desc="", body="", title="مهارة"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(620, 560)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("الاسم:"))
+        self.name_edit = QLineEdit(name)
+        lay.addWidget(self.name_edit)
+        lay.addWidget(QLabel("النبذة (وش تسوي ومتى تنستخدم):"))
+        self.desc_edit = QLineEdit(desc)
+        lay.addWidget(self.desc_edit)
+        lay.addWidget(QLabel("التعليمات:"))
+        self.body_edit = QPlainTextEdit(body)
+        lay.addWidget(self.body_edit, 1)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        box.button(QDialogButtonBox.StandardButton.Ok).setText("حفظ")
+        box.button(QDialogButtonBox.StandardButton.Cancel).setText("إلغاء")
+        box.accepted.connect(self._ok)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+
+    def _ok(self):
+        if not self.name_edit.text().strip() or not self.body_edit.toPlainText().strip():
+            QMessageBox.information(self, "مهارة", "اكتب الاسم والتعليمات.")
+            return
+        self.accept()
+
+    def values(self):
+        return self.name_edit.text().strip(), self.desc_edit.text().strip(), self.body_edit.toPlainText().strip()
+
+
+class GitHubSkillsDialog(QDialog):
+    """Search GitHub for skill collections (repositories with SKILL.md files) and add the chosen skills."""
+
+    def __init__(self, parent):
+        from PySide6.QtWidgets import QListWidgetItem
+
+        super().__init__(parent)
+        self._Item = QListWidgetItem
+        self.setWindowTitle("بحث عن مهارات في GitHub")
+        self.resize(760, 600)
+        self.added = 0
+        self.repos, self.paths, self.repo = [], [], None
+        self._preview = {}
+        lay = QVBoxLayout(self)
+        row = QHBoxLayout()
+        self.q_edit = QLineEdit()
+        self.q_edit.setPlaceholderText("وش تدور؟ مثلاً: excel, pdf, marketing — أو اسم مستودع مثل anthropics/skills (فاضي = أشهر المهارات)")
+        self.q_edit.returnPressed.connect(self.search)
+        b = QPushButton("بحث")
+        b.clicked.connect(self.search)
+        row.addWidget(self.q_edit, 1)
+        row.addWidget(b)
+        lay.addLayout(row)
+        self.status = QLabel("ابحث، اختر مستودع، بعدين اختر المهارات اللي تبيها.")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        split = QSplitter(Qt.Vertical)
+        self.repo_list = QListWidget()
+        self.repo_list.currentRowChanged.connect(self.open_repo)
+        self.skill_list = QListWidget()
+        self.skill_list.currentRowChanged.connect(self.preview)
+        self.prev = QPlainTextEdit()
+        self.prev.setReadOnly(True)
+        split.addWidget(self.repo_list)
+        split.addWidget(self.skill_list)
+        split.addWidget(self.prev)
+        split.setChildrenCollapsible(False)
+        split.setSizes([150, 170, 200])
+        lay.addWidget(split, 1)
+        row2 = QHBoxLayout()
+        self.add_btn = QPushButton("أضف المهارات المعلّمة")
+        self.add_btn.clicked.connect(self.add_checked)
+        close = QPushButton("إغلاق")
+        close.clicked.connect(self.accept)
+        row2.addWidget(self.add_btn)
+        row2.addStretch(1)
+        row2.addWidget(close)
+        lay.addLayout(row2)
+        QTimer.singleShot(0, self.search)
+
+    def search(self):
+        self.status.setText("أبحث في GitHub…")
+        self.repo_list.clear()
+        self.skill_list.clear()
+        self.prev.clear()
+        q = self.q_edit.text()
+
+        def done(r, e):
+            if e:
+                self.status.setText("ما قدرت أبحث: %s" % e)
+                return
+            self.repos = r or []
+            self.repo_list.blockSignals(True)
+            for x in self.repos:
+                it = self._Item("%s   ★%s\n%s" % (x["full"], x["stars"], _cut(x["desc"], 140)))
+                it.setToolTip(x["desc"])
+                self.repo_list.addItem(it)
+            self.repo_list.setCurrentRow(-1)
+            self.repo_list.blockSignals(False)
+            self.status.setText("لقيت %d مستودع. اختر واحد عشان أشوف المهارات اللي فيه." % len(self.repos) if self.repos else "ما لقيت شي، جرب كلمة ثانية بالإنجليزي.")
+
+        run_later(self, lambda: gh_search_skill_repos(q), done)
+
+    def open_repo(self, row):
+        if not (0 <= row < len(self.repos)):
+            return
+        self.repo = self.repos[row]
+        self.skill_list.clear()
+        self.prev.clear()
+        self.status.setText("أقرأ المستودع %s…" % self.repo["full"])
+        repo = self.repo
+
+        def done(r, e):
+            if repo is not self.repo:
+                return
+            if e:
+                self.status.setText("ما قدرت أقرأ المستودع: %s" % e)
+                return
+            self.paths = r or []
+            have = {s["source"] for s in list_skills()}
+            for p in self.paths:
+                folder = os.path.dirname(p) or repo["full"].split("/")[-1]
+                it = self._Item(folder + ("   (مضافة)" if self._src(p) in have else ""))
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(Qt.CheckState.Unchecked)
+                it.setToolTip(p)
+                self.skill_list.addItem(it)
+            self.status.setText(("فيه %d مهارة. علّم على اللي تبيها واضغط «أضف»، واضغط على أي وحدة تشوف تعليماتها." % len(self.paths))
+                                if self.paths else "هذا المستودع ما فيه ملفات SKILL.md.")
+
+        run_later(self, lambda: gh_repo_skills(repo["full"], repo["branch"]), done)
+
+    def _src(self, path):
+        return "https://github.com/%s/blob/%s/%s" % (self.repo["full"], self.repo["branch"], path)
+
+    def preview(self, row):
+        if not (0 <= row < len(self.paths)) or not self.repo:
+            return
+        p, repo = self.paths[row], self.repo
+        key = (repo["full"], p)
+        if key in self._preview:
+            n, d, b = parse_skill(self._preview[key], os.path.basename(os.path.dirname(p)))
+            self.prev.setPlainText("%s\n%s\n\n%s" % (n, d, b))
+            return
+        self.prev.setPlainText("أحمّل…")
+
+        def done(r, e):
+            if e:
+                self.prev.setPlainText("ما قدرت أحمّلها: %s" % e)
+                return
+            self._preview[key] = r
+            if self.repo is repo and self.skill_list.currentRow() == row:
+                n, d, b = parse_skill(r, os.path.basename(os.path.dirname(p)))
+                self.prev.setPlainText("%s\n%s\n\n%s" % (n, d, b))
+
+        run_later(self, lambda: gh_raw(repo["full"], repo["branch"], p), done)
+
+    def add_checked(self):
+        if not self.repo:
+            return
+        picks = [self.paths[i] for i in range(self.skill_list.count())
+                 if self.skill_list.item(i).checkState() == Qt.CheckState.Checked and i < len(self.paths)]
+        if not picks:
+            QMessageBox.information(self, "مهارات", "علّم على مهارة وحدة على الأقل.")
+            return
+        repo = self.repo
+        cache = dict(self._preview)
+        self.add_btn.setEnabled(False)
+        self.status.setText("أضيف %d مهارة…" % len(picks))
+
+        def work():
+            have = {s["source"] for s in list_skills()}
+            n = 0
+            for p in picks:
+                src = "https://github.com/%s/blob/%s/%s" % (repo["full"], repo["branch"], p)
+                if src in have:
+                    continue
+                text = cache.get((repo["full"], p)) or gh_raw(repo["full"], repo["branch"], p)
+                name, desc, body = parse_skill(text, os.path.basename(os.path.dirname(p)) or repo["full"].split("/")[-1])
+                if body.strip():
+                    save_skill(name, desc, body, source=src)
+                    n += 1
+            return n
+
+        def done(r, e):
+            self.add_btn.setEnabled(True)
+            self.added += r or 0
+            self.status.setText(("ما قدرت أضيف: %s" % e) if e else ("أضفت %d مهارة. فعّلها من إعدادات المحادثة." % (r or 0)))
+            if not e and self.repo is repo:
+                for i in range(self.skill_list.count()):
+                    it = self.skill_list.item(i)
+                    if it.checkState() == Qt.CheckState.Checked:
+                        it.setCheckState(Qt.CheckState.Unchecked)
+                        if "(مضافة)" not in it.text():
+                            it.setText(it.text() + "   (مضافة)")
+
+        run_later(self, work, done)
+
+
+class SkillsDialog(QDialog):
+    """All saved skills: add from a file, write one, search GitHub, edit, delete."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("المهارات")
+        self.resize(640, 520)
+        lay = QVBoxLayout(self)
+        info = QLabel("المهارة = تعليمات جاهزة لنوع من الشغل (مثلاً: طريقة تقارير معيّنة، خطوات نشر، أسلوب كتابة). "
+                      "تضيفها هنا مرة وحدة، وبعدين تختار اللي تبيها لكل محادثة من «إعدادات المحادثة».")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(lambda _it: self.edit())
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        for text, fn in (("إضافة مهارة من ملف…", self.add_file), ("كتابة مهارة جديدة", self.add_new),
+                         ("بحث في GitHub", self.search_github)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch(1)
+        lay.addLayout(row)
+        row2 = QHBoxLayout()
+        for text, fn in (("تعديل", self.edit), ("حذف", self.remove), ("فتح المجلد", lambda: open_path(SKILLS_DIR))):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row2.addWidget(b)
+        row2.addStretch(1)
+        close = QPushButton("إغلاق")
+        close.clicked.connect(self.accept)
+        row2.addWidget(close)
+        lay.addLayout(row2)
+        self.reload()
+
+    def reload(self):
+        from PySide6.QtWidgets import QListWidgetItem
+
+        self.skills = list_skills()
+        self.list.clear()
+        for s in self.skills:
+            it = QListWidgetItem("%s\n%s" % (s["name"], _cut(s["desc"], 160)))
+            it.setToolTip(s["source"] or s["path"])
+            self.list.addItem(it)
+        if not self.skills:
+            self.list.addItem("(ما فيه مهارات للحين)")
+
+    def _sel(self):
+        r = self.list.currentRow()
+        return self.skills[r] if 0 <= r < len(self.skills) else None
+
+    def add_file(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "اختر ملف مهارة", os.path.expanduser("~"),
+                                                "مهارات (*.md *.txt *.zip *.skill);;كل الملفات (*.*)")
+        n = 0
+        for p in paths:
+            try:
+                name, desc, body = skill_from_file(p)
+                if not body.strip():
+                    raise ValueError("الملف فاضي")
+                dlg = SkillEditDialog(self, name, desc, body, "راجع المهارة قبل الإضافة")
+                if dlg.exec():
+                    save_skill(*dlg.values(), source=p)
+                    n += 1
+            except Exception as e:
+                QMessageBox.warning(self, "مهارة", "ما قدرت أقرأ %s:\n%s" % (os.path.basename(p), e))
+        if n:
+            self.reload()
+
+    def add_new(self):
+        dlg = SkillEditDialog(self, title="مهارة جديدة")
+        if dlg.exec():
+            save_skill(*dlg.values())
+            self.reload()
+
+    def search_github(self):
+        dlg = GitHubSkillsDialog(self)
+        dlg.exec()
+        self.reload()
+
+    def edit(self):
+        s = self._sel()
+        if not s:
+            return
+        dlg = SkillEditDialog(self, s["name"], s["desc"], s["body"], "تعديل مهارة")
+        if dlg.exec():
+            save_skill(*dlg.values(), sid=s["id"])
+            self.reload()
+
+    def remove(self):
+        s = self._sel()
+        if s and QMessageBox.question(self, "حذف", "تحذف المهارة «%s»؟" % s["name"]) == YES:
+            delete_skill(s["id"])
+            self.reload()
 
 
 class DeviceFilesDialog(QDialog):
@@ -4224,7 +4876,7 @@ class DeviceFilesDialog(QDialog):
     def __init__(self, parent, settings, start_dir):
         super().__init__(parent)
         self.setWindowTitle("إعدادات هذه المحادثة")
-        self.resize(660, 620)
+        self.resize(660, 760)
         self.start_dir = start_dir
         lay = QVBoxLayout(self)
         info = QLabel(
@@ -4315,12 +4967,56 @@ class DeviceFilesDialog(QDialog):
         row.addStretch(1)
         lay.addLayout(row)
 
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("المهارات المفعّلة لهذي المحادثة (تقدر تختار أكثر من وحدة):"), 1)
+        b_sk = QPushButton("إضافة وإدارة المهارات…")
+        b_sk.clicked.connect(self.manage_skills)
+        srow.addWidget(b_sk)
+        lay.addLayout(srow)
+        self.skill_list = QListWidget()
+        self.skill_list.setMaximumHeight(130)
+        lay.addWidget(self.skill_list)
+        self._skill_on = set(settings.get("skills") or [])
+        self.fill_skills()
+
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         box.button(QDialogButtonBox.StandardButton.Ok).setText("حفظ")
         box.button(QDialogButtonBox.StandardButton.Cancel).setText("إلغاء")
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
         lay.addWidget(box)
+
+    def fill_skills(self):
+        from PySide6.QtWidgets import QListWidgetItem
+
+        if self.skill_list.count():
+            self._skill_on = set(self.checked_skills())
+        self.skill_list.clear()
+        for s in list_skills():
+            it = QListWidgetItem("%s — %s" % (s["name"], _cut(s["desc"], 110)))
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Checked if s["id"] in self._skill_on else Qt.CheckState.Unchecked)
+            it.setData(Qt.UserRole, s["id"])
+            it.setToolTip(s["desc"])
+            self.skill_list.addItem(it)
+        if not self.skill_list.count():
+            it = QListWidgetItem("ما عندك مهارات للحين. اضغط «إضافة وإدارة المهارات».")
+            it.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.skill_list.addItem(it)
+
+    def checked_skills(self):
+        out = []
+        for i in range(self.skill_list.count()):
+            it = self.skill_list.item(i)
+            if it.data(Qt.UserRole) and it.checkState() == Qt.CheckState.Checked:
+                out.append(it.data(Qt.UserRole))
+        return out
+
+    def manage_skills(self):
+        self._skill_on = set(self.checked_skills())
+        SkillsDialog(self).exec()
+        self.skill_list.clear()
+        self.fill_skills()
 
     def apply_preset(self, _i=None):
         k = self.preset_box.currentData()
@@ -4418,6 +5114,7 @@ class DeviceFilesDialog(QDialog):
             "plan_first": self.plan_box.isChecked(),
             "allowed_dirs": dirs,
             "writable_dirs": writable,
+            "skills": self.checked_skills(),
         }
 
 
@@ -5475,6 +6172,7 @@ def clean_reply(text):
         name = safe_name(m.group(2))
         return ("[رسم بياني: %s]" if m.group(1) == "chart" else "[ملف: %s]") % name
 
+    text = SKILL_OFFER_TAIL_RE.sub("", SKILL_OFFER_RE.sub("", text)) if "[[" in text else text
     return FILE_BLOCK_RE.sub(repl, text)
 
 
@@ -6662,6 +7360,7 @@ class App(QMainWindow):
         self.computer_enabled = s["computer_enabled"]
         self.browser_enabled = s["browser_enabled"]
         self.plan_first = s.get("plan_first", False)
+        self.chat_skills = list(s.get("skills") or [])
         return s
 
     def collect_settings(self):
@@ -6673,6 +7372,7 @@ class App(QMainWindow):
             "computer_enabled": self.computer_enabled, "browser_enabled": self.browser_enabled,
             "model": self.model_box.currentText(), "thinking": self.think_box.currentText(),
             "plan_first": bool(getattr(self, "plan_first", False)),
+            "skills": list(getattr(self, "chat_skills", []) or []),
         }
 
     def chat_settings(self, chat):
@@ -6715,12 +7415,15 @@ class App(QMainWindow):
         dlg = AppSettingsDialog(self, self.key_edit.text(), self.remember_box.isChecked(), self.theme,
                                 (self.cfg.get("update_url") or get_update_url(self.cfg)),
                                 self.cfg.get("chat_width", "wide"),
-                                self.cfg.get("suggest", True) is not False, self.cfg.get("auto_update", True) is not False)
+                                self.cfg.get("suggest", True) is not False, self.cfg.get("auto_update", True) is not False,
+                                self.cfg.get("skill_offers", True) is not False, bool(self.cfg.get("khaled_button")))
         if not dlg.exec():
             return
         v = dlg.values()
         self.cfg["suggest"] = bool(v["suggest"])
         self.cfg["auto_update"] = bool(v["auto_update"])
+        self.cfg["skill_offers"] = bool(v["skill_offers"])
+        self.cfg["khaled_button"] = bool(v["khaled"])
         self.key_edit.setText(v["key"])
         self.remember_box.setChecked(v["remember"])
         if v["remember"] and v["key"]:
@@ -7455,6 +8158,8 @@ class App(QMainWindow):
                 if not steps and m.get("reasoning"):
                     steps = [{"k": "think", "text": m["reasoning"]}]  # chats saved before the Thinking block existed
                 self.render_reply(steps or [], clean_reply(m["content"]), "m%d" % i, False, (), m.get("dur"), m.get("cost"), m.get("sources"))
+                if m.get("skill_offer"):
+                    self._insert_skill_offer(m["skill_offer"], i)
                 if i == len(all_msgs) - 1 and m.get("sugg") and not self.busy:
                     self._insert_suggestions(m["sugg"])
                 self.add_divider()
@@ -7967,8 +8672,89 @@ class App(QMainWindow):
             f.setForeground(QColor(col["accent"]))
             c.insertText(bidi_fix(it), f)
 
+    def maybe_khaled_flash(self, t0):
+        """«زر خالد»: the reply is done and nobody touched the computer for a minute while it was thinking -> flash the screen."""
+        if not self.cfg.get("khaled_button"):
+            return
+        idle = system_idle_seconds()
+        if idle is None:  # cannot read the computer's idle time: fall back to "window in the background and the reply took a minute"
+            away = not self.isActiveWindow() and t0 and time.time() - t0 >= KHALED_IDLE
+        else:
+            away = idle >= KHALED_IDLE
+        if away:
+            try:
+                self._khaled = khaled_flash(KHALED_SECONDS)
+            except Exception as ex:
+                log_event("khaled flash: %s" % ex)
+
+    def _insert_skill_offer(self, offer, idx):
+        """Under a reply: the skill the model suggests saving, with add / view / no links."""
+        col = THEMES[self.theme]
+        c = self._end_cursor()
+        bf = QTextBlockFormat()
+        bf.setTopMargin(8)
+        c.insertBlock(bf, QTextCharFormat())
+        state = offer.get("state")
+        if state == "added":
+            c.insertText("أضفت المهارة «%s»." % bidi_fix(offer.get("name", "")), self.fmt["dim"])
+            return
+        if state == "declined":
+            return
+        c.insertText("اقتراح مهارة: ", self.fmt["dim"])
+        fb = QTextCharFormat(self.fmt["dim"])
+        fb.setFontWeight(QFont.Weight.Bold)
+        fb.setForeground(QColor(col["text"]))
+        c.insertText(bidi_fix(offer.get("name", "")), fb)
+        if offer.get("desc"):
+            b2 = QTextBlockFormat()
+            b2.setTopMargin(2)
+            c.insertBlock(b2, QTextCharFormat())
+            c.insertText(bidi_fix(offer["desc"]), self.fmt["dim"])
+        b3 = QTextBlockFormat()
+        b3.setTopMargin(3)
+        c.insertBlock(b3, QTextCharFormat())
+        for i, (label, act) in enumerate((("أضفها كمهارة", "add"), ("شوف وعدّل", "view"), ("لا، شكراً", "no"))):
+            if i:
+                c.insertText("     ", QTextCharFormat())
+            f = QTextCharFormat()
+            f.setAnchor(True)
+            f.setAnchorHref("skill:%s:%d" % (act, idx))
+            f.setForeground(QColor(col["accent"]))
+            c.insertText(label, f)
+
+    def on_skill_offer(self, act, idx):
+        msgs = self.current["msgs"] if self.current else []
+        if not (0 <= idx < len(msgs)) or not msgs[idx].get("skill_offer"):
+            return
+        o = msgs[idx]["skill_offer"]
+        if act == "no":
+            o["state"] = "declined"
+        else:
+            name, desc, body = o.get("name", ""), o.get("desc", ""), o.get("body", "")
+            if act == "view":
+                dlg = SkillEditDialog(self, name, desc, body, "اقتراح مهارة")
+                if not dlg.exec():
+                    return
+                name, desc, body = dlg.values()
+            try:
+                save_skill(name, desc, body, source="chat:" + str(self.current.get("id", "")))
+            except Exception as ex:
+                QMessageBox.warning(self, "مهارة", "ما قدرت أحفظ المهارة: %s" % ex)
+                return
+            o.update(state="added", name=name)
+            self.statusBar().showMessage("أضفت المهارة «%s». فعّلها لأي محادثة من إعدادات المحادثة." % name, 7000)
+        self.persist()
+        self.render_chat(keep_scroll=True)
+
     def on_anchor(self, url):
         s = url.toString()
+        if s.startswith("skill:"):
+            act, _, i_ = s[6:].partition(":")
+            try:
+                self.on_skill_offer(act, int(i_))
+            except ValueError:
+                pass
+            return
         if s.startswith("sug:"):
             try:
                 i = int(s[4:])
@@ -8702,6 +9488,7 @@ class App(QMainWindow):
         self._tg_busy = False
         ch = self.tg_chat()
         out2, _ = apply_memory_marks(out)
+        out2, _offer = extract_skill_offer(out2)
         ch["msgs"].append({"role": "assistant", "content": out2, "reasoning": ""})
         ch["updated"] = time.time()
         self.persist()
@@ -8834,6 +9621,7 @@ class App(QMainWindow):
             else:
                 final = "(وصلت لحد الخطوات الأقصى قبل ما يخلص المهمة)"
             final, mem_msgs = apply_memory_marks(final)
+            final, _offer = extract_skill_offer(final)
             if task.get("wmove") and files and task.get("watch"):
                 dd_ = os.path.join(task["watch"], DONE_FOLDER)
                 try:
@@ -9606,6 +10394,7 @@ class App(QMainWindow):
         self._act_title = self.current.get("title", "")
         self._srcs = []
         system = SYSTEM_PROMPT + "\n" + memory_prompt() + (tools_prompt(runner) if runner else "")
+        system += skills_prompt(getattr(self, "chat_skills", []), offers=self.cfg.get("skill_offers", True) is not False)
         if roots:
             system += "\n" + folder_notes_prompt(roots)
         proj = self.get_project(self.current.get("project"))
@@ -9614,6 +10403,8 @@ class App(QMainWindow):
         api_msgs = [{"role": "system", "content": system}]
         for m in self.current["msgs"]:
             item = {"role": m["role"], "content": m["content"]}
+            if m["role"] == "assistant" and m.get("skill_offer") and isinstance(m["content"], str):
+                item["content"] = m["content"] + "\n[offered skill «%s»: %s]" % (m["skill_offer"].get("name", ""), m["skill_offer"].get("state") or "not answered")
             if m["role"] == "assistant" and runner is not None and think != "off":
                 item["reasoning_content"] = m.get("reasoning", "")
             api_msgs.append(item)
@@ -10127,7 +10918,10 @@ class App(QMainWindow):
                 content, mem_msgs = apply_memory_marks(content)
                 for mm in mem_msgs:
                     self.statusBar().showMessage(mm, 5000)
+                content, offer_ = extract_skill_offer(content)
                 msg = {"role": "assistant", "content": content, "reasoning": reasoning}
+                if offer_ and self.current.get("id") != "telegram":
+                    msg["skill_offer"] = offer_
                 if getattr(self, "_cut_flag", False) or "⏹ أوقفتّه بطلبك" in content:
                     msg["cut"] = True
                 self._cut_flag = False
@@ -10159,6 +10953,7 @@ class App(QMainWindow):
                 except Exception as ex:
                     log_event("canvas: %s" % ex)
                 self.finish()
+                self.maybe_khaled_flash((L or {}).get("t0"))
                 self.request_suggestions(self.current, len(self.current["msgs"]) - 1)
             elif kind == "err":
                 if L is not None:
