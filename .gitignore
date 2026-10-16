@@ -1,0 +1,15 @@
+config.json
+chats.json
+*.log
+*.log.old
+*.bak*
+*.broken
+run_state.json
+resume.json
+.venv/
+_last_good/
+_last_try/
+_update_backup/
+__pycache__/
+*.pyc
+update_source.txt

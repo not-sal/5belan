@@ -28,6 +28,8 @@ Repo layout: `deepseek_chat.py` (the whole app, ~10.4k lines), `guard.py` (safe 
 
 How clients update: `check_updates()` fetches `update.json` every **3 minutes** (and 4 s after start); if the version is newer, an **orange badge «نزل تحديث X» appears next to «ذاكرة»** in the top bar and, unless `cfg["auto_update"] == False`, `auto_apply()` downloads only changed files (checksum + `compile()` check, backup into `_update_backup/<old version>`), then `try_restart_after_update()` restarts via `restart_app()` **only when nothing is running** (no reply, no background task, empty input box, no attachments). Versions before 2.15.0 only check every 6 h and need a manual click, so a one-time reinstall with the installer is needed to get auto-update.
 
+Building on the owner's Windows PC: the dev folder `C:\Users\Admin\Desktop\deep` is itself a git clone of the repo (`main` tracks `origin/main`, `core.autocrlf=false` so file hashes match GitHub; `.git/info/exclude` whitelists only repo files, so `chats.json`/`config.json`/logs/backups there can never be committed). Push works through Git Credential Manager. NSIS is installed (`C:\Program Files (x86)\NSIS`); run `bash installers/build_release.sh <out> [--publish "notes"]` from Git Bash — it finds makensis, uses `py` when `python3` is the Store stub, and zips with Python when `zip` is missing.
+
 Git access: the sandbox clone is made with the `add_repo` tool (push access) — there is **no token to reuse**; in a new session call `add_repo` for `saleh9688/5belan` with `access: "push"`, clone, work there. Never put API keys, `config.json`, `chats.json`, logs in the repo (`publish.py` writes a `.gitignore` for these).
 
 ## 4. ARCHITECTURE MAP (`deepseek_chat.py`)
