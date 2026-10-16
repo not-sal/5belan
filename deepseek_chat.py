@@ -2530,12 +2530,13 @@ class ToolRunner:
 import sys
 import traceback
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
     QFontDatabase,
     QImage,
+    QPen,
     QKeySequence,
     QIcon,
     QPainter,
@@ -2772,7 +2773,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.9.1"
+APP_VERSION = "2.10.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4854,7 +4855,32 @@ THEMES = {
 }
 
 
+def check_icon_path():
+    """A small white check mark image for checked boxes (drawn once; Qt style sheets can only point at a file)."""
+    try:
+        d = os.path.join(DATA_DIR, "ui")
+        p = os.path.join(d, "check2.png")
+        if not os.path.exists(p):
+            os.makedirs(d, exist_ok=True)
+            img = QImage(18, 18, QImage.Format_ARGB32)
+            img.fill(Qt.transparent)
+            pt = QPainter(img)
+            pt.setRenderHint(QPainter.Antialiasing)
+            pen = QPen(QColor("white"))
+            pen.setWidthF(2.6)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            pt.setPen(pen)
+            pt.drawPolyline([QPointF(4.2, 9.4), QPointF(7.6, 12.8), QPointF(13.8, 5.6)])
+            pt.end()
+            img.save(p, "PNG")
+        return p.replace("\\", "/")
+    except Exception:
+        return ""
+
+
 def make_qss(c):
+    c = dict(c, check=check_icon_path())
     return """
     QWidget { background: %(bg)s; color: %(text)s; }
     QMainWindow, QDialog { background: %(bg)s; }
@@ -4890,6 +4916,7 @@ def make_qss(c):
     QListWidget { background: %(panel)s; color: %(text)s; border: 1px solid %(border)s; border-radius: 10px; padding: 4px; }
     QListWidget::item { padding: 6px; border-radius: 6px; }
     QListWidget::item:selected { background: %(accent)s; color: white; }
+    QToolTip { background: %(panel)s; color: %(text)s; border: 1px solid %(border)s; padding: 4px; }
     QPushButton { background: %(panel)s; color: %(text)s; border: 1px solid %(border)s;
         border-radius: 9px; padding: 6px 12px; }
     QPushButton:hover { border-color: %(accent)s; }
@@ -4907,6 +4934,16 @@ def make_qss(c):
     QComboBox QAbstractItemView { background: %(panel)s; color: %(text)s; selection-background-color: %(accent)s; selection-color: white; }
     QDialog QComboBox { background: %(panel)s; border: 1px solid %(border)s; border-radius: 8px; color: %(text)s; }
     QLabel, QCheckBox { background: transparent; color: %(text)s; }
+    QCheckBox { spacing: 9px; }
+    QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid %(dim)s; border-radius: 5px; background: %(input)s; }
+    QCheckBox::indicator:hover { border-color: %(accent)s; }
+    QCheckBox::indicator:checked { background: %(accent)s; border-color: %(accent)s; image: url(%(check)s); }
+    QCheckBox::indicator:checked:disabled, QCheckBox::indicator:disabled { border-color: %(border)s; background: %(panel)s; }
+    QCheckBox::indicator:checked:hover { border-color: %(text)s; }
+    QRadioButton::indicator { width: 16px; height: 16px; border: 2px solid %(dim)s; border-radius: 9px; background: %(input)s; }
+    QRadioButton::indicator:checked { background: %(accent)s; border-color: %(accent)s; }
+    QListWidget::indicator { width: 16px; height: 16px; border: 2px solid %(dim)s; border-radius: 4px; background: %(input)s; }
+    QListWidget::indicator:checked { background: %(accent)s; border-color: %(accent)s; image: url(%(check)s); }
     QMenu { background: %(panel)s; color: %(text)s; border: 1px solid %(border)s; padding: 4px; }
     QMenu::item { padding: 6px 18px; border-radius: 6px; }
     QMenu::item:selected { background: %(accent)s; color: white; }
@@ -5003,6 +5040,9 @@ class App(QMainWindow):
         self.order = []
         self.view_chats = []
         self.drafts = {}
+        self._queued = None
+        self._interrupt = None
+        self._merge_note = False
         self.plan_first = False
         cfg = load_json(CONFIG_PATH, {})
         self.cfg = cfg if isinstance(cfg, dict) else {}
@@ -5076,6 +5116,7 @@ class App(QMainWindow):
         self.listw = QListWidget()
         self.listw.setObjectName("chats")
         self.listw.setFrameShape(QFrame.NoFrame)
+        self.listw.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.listw.currentRowChanged.connect(self.on_select)
         self.listw.setContextMenuPolicy(Qt.CustomContextMenu)
         self.listw.customContextMenuRequested.connect(self.chat_menu)
@@ -5215,6 +5256,19 @@ class App(QMainWindow):
         cl = QVBoxLayout(composer)
         cl.setContentsMargins(12, 8, 12, 8)
         cl.setSpacing(4)
+        self.queue_box = QFrame()
+        self.queue_box.setObjectName("chipbox")
+        ql = QHBoxLayout(self.queue_box)
+        ql.setContentsMargins(8, 3, 8, 3)
+        self.queue_label = QLabel("")
+        ql.addWidget(self.queue_label, 1)
+        qc = QToolButton()
+        qc.setText("✕ إلغاء")
+        qc.setObjectName("flat")
+        qc.clicked.connect(self.cancel_queued)
+        ql.addWidget(qc)
+        self.queue_box.setVisible(False)
+        cl.addWidget(self.queue_box)
         self.quotes_box = QWidget()
         self.quotes_layout = QHBoxLayout(self.quotes_box)
         self.quotes_layout.setContentsMargins(0, 0, 0, 0)
@@ -5267,7 +5321,7 @@ class App(QMainWindow):
         self.btn = QPushButton("↑")
         self.btn.setObjectName("send")
         self.btn.setFixedSize(40, 40)
-        self.btn.clicked.connect(self.send)
+        self.btn.clicked.connect(self.on_send_btn)
         brow.addWidget(self.btn, 0, Qt.AlignVCenter)
         brow.setAlignment(Qt.AlignVCenter)
         cl.addWidget(brow_w)
@@ -5875,7 +5929,8 @@ class App(QMainWindow):
         if mode == "stop":
             self.btn.setEnabled(True)
             self.btn.setText("■")
-            self.btn.setToolTip("إيقاف")
+            self.btn.setToolTip("إيقاف (أو اكتب رسالة ثانية واضغط Enter أو هذا الزر)")
+            self.statusBar().showMessage("تقدر تكتب رسالة ثانية الحين وتضغط Enter: ترسلها بعد الرد أو تدمجها معه", 7000)
         elif mode == "stopping":
             self.btn.setEnabled(False)
             self.btn.setText("…")
@@ -6257,7 +6312,10 @@ class App(QMainWindow):
             if event.key() in (Qt.Key_Return, Qt.Key_Enter):
                 if event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier | Qt.AltModifier):
                     return False
-                self.send()
+                if self.busy:
+                    self.send_while_busy()
+                else:
+                    self.send()
                 return True
         return super().eventFilter(obj, event)
 
@@ -6807,6 +6865,97 @@ class App(QMainWindow):
         self.refresh_list()
         self.render_chat()
         self.inp.setFocus()
+
+    # ---------- a second message while the model is still working ----------
+    def on_send_btn(self):
+        if self.busy:
+            if self.inp.toPlainText().strip() and self.btn.text() != "…":
+                self.send_while_busy()  # something typed: ask whether to wait or interrupt
+            else:
+                self.stop_event.set()
+                self.set_send_mode("stopping")
+            return
+        self.send()
+
+    def send_while_busy(self):
+        text = self.inp.toPlainText().strip()
+        quotes = [dict(q) for q in self.quotes if q.get("q")]
+        if not text and not self.attachments and not quotes:
+            return
+        if self._queued is not None or self._interrupt is not None:
+            self.statusBar().showMessage("فيه رسالة بالانتظار بالفعل — ألغها أول", 3000)
+            return
+        m = QMenu(self)
+        a_now = m.addAction("⚡  أرسلها الحين — يوقف الرد، يدمجها معه ويكمّل")
+        a_later = m.addAction("⏳  أرسلها بعد ما يخلص الرد")
+        m.addSeparator()
+        m.addAction("إلغاء")
+        pos = self.composer.mapToGlobal(self.composer.rect().topLeft())
+        act = m.exec(pos - QPoint(0, 96))
+        if act not in (a_now, a_later):
+            return
+        pend = {"text": text, "quotes": quotes, "attachments": list(self.attachments)}
+        self.inp.clear()
+        self.quotes = []
+        self.refresh_quotes()
+        self.attachments = []
+        self.refresh_files_label()
+        if act is a_later:
+            self._queued = pend
+            self.show_queue("⏳ بالانتظار (تنرسل بعد الرد): ", pend)
+        else:
+            self._interrupt = pend
+            self.show_queue("⚡ يوقّف الرد ويدمج رسالتك: ", pend)
+            self.stop_event.set()
+            self.set_send_mode("stopping")
+
+    def show_queue(self, prefix, pend):
+        t = (pend["text"] or ("مرفقات" if pend["attachments"] else "اقتباس")).replace("\n", " ")
+        self.queue_label.setText(prefix + (t if len(t) <= 60 else t[:59] + "…"))
+        self.queue_box.setVisible(True)
+
+    def cancel_queued(self):
+        pend = self._queued or self._interrupt
+        if self._interrupt is not None:
+            self.statusBar().showMessage("الإيقاف بدأ بالفعل؛ الرسالة تنرسل بعد ما يوقف", 3000)
+            return
+        self._queued = None
+        self.queue_box.setVisible(False)
+        if pend:  # put it back so nothing typed is lost
+            self.inp.setPlainText(pend["text"])
+            self.quotes = pend["quotes"]
+            self.refresh_quotes()
+            self.attachments = pend["attachments"]
+            self.refresh_files_label()
+
+    def run_pending(self):
+        pend = self._interrupt or self._queued
+        merged = self._interrupt is not None
+        self._interrupt = None
+        self._queued = None
+        self.queue_box.setVisible(False)
+        if not pend or self.busy:
+            return
+        self.inp.setPlainText(pend["text"])
+        self.quotes = pend["quotes"]
+        self.refresh_quotes()
+        self.attachments = pend["attachments"]
+        self.refresh_files_label()
+        self._merge_note = merged
+        self.send()
+
+    def restore_pending(self):
+        """After an error: give the waiting message back to the input box instead of sending it."""
+        pend = self._interrupt or self._queued
+        self._interrupt = None
+        self._queued = None
+        self.queue_box.setVisible(False)
+        if pend:
+            self.inp.setPlainText(pend["text"])
+            self.quotes = pend["quotes"]
+            self.refresh_quotes()
+            self.attachments = pend["attachments"]
+            self.refresh_files_label()
 
     # ---------- background tasks, schedule, folder watch, activity, sources ----------
     def make_llm(self, key, usage_cb=None):
@@ -7545,8 +7694,13 @@ class App(QMainWindow):
         quotes = [dict(q) for q in self.quotes if q.get("q")]
         if not text and not self.attachments and not quotes:
             return
+        api_text = text
+        if self._merge_note:
+            api_text = ("[هذي الرسالة وصلت وأنت لسه تشتغل على ردك السابق، فقاطعتك. ردّك السابق حتى نقطة التوقف موجود فوق. "
+                        "كمّل اللي كنت تسويه مع مراعاة الإضافة التالية، وبدون ما تعيد اللي قلته.]\n\n" + text) if text else text
+            self._merge_note = False
         try:
-            content, names = self.build_user_content(self.compose_text(text, quotes), model)
+            content, names = self.build_user_content(self.compose_text(api_text, quotes), model)
         except RuntimeError as e:
             QMessageBox.warning(self, "5belan", str(e))
             return
@@ -8109,6 +8263,13 @@ class App(QMainWindow):
                         pass
             elif kind == "done":
                 content, reasoning = val
+                if self._interrupt is not None:
+                    content = re.sub(r"\n*⏹ أوقفتّه بطلبك.*$", "", content, flags=re.S).strip()
+                    acts = [x.get("text", "") for x in ((L or {}).get("steps") or []) if x.get("k") == "tool"][-10:]
+                    if acts:
+                        content = (content + "\n\n" if content else "") + "[قاطعني المستخدم؛ آخر ما نفّذته: " + " | ".join(a[:80] for a in acts) + "]"
+                    if not content:
+                        content = "(قاطعني المستخدم قبل ما أكتب شي)"
                 content, mem_msgs = apply_memory_marks(content)
                 for mm in mem_msgs:
                     self.statusBar().showMessage(mm, 5000)
@@ -8157,6 +8318,13 @@ class App(QMainWindow):
                 if self._last_quotes:
                     self.quotes = self._last_quotes
                     self.refresh_quotes()
+                if self._interrupt is not None or self._queued is not None:
+                    self.statusBar().showMessage("صار خطأ؛ رسالتك المؤجلة رجعت لمربع الكتابة", 6000)
+                    pend = self._interrupt or self._queued
+                    self._interrupt = self._queued = None
+                    self.queue_box.setVisible(False)
+                    if pend and not self.inp.toPlainText().strip():
+                        self.inp.setPlainText(pend["text"])
                 self.finish()
         if self.live_dirty and self.live is not None:
             # redrawing rebuilds the whole reply, so on long runs do it less often (this was freezing the window)
@@ -8245,6 +8413,8 @@ class App(QMainWindow):
         self.busy = False
         self.set_send_mode("send")
         self.inp.setFocus()
+        if self._interrupt is not None or self._queued is not None:
+            QTimer.singleShot(250, self.run_pending)
 
 
 def main():
