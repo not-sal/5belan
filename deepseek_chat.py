@@ -2384,7 +2384,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -2636,17 +2636,26 @@ class ChatView(QTextBrowser):
         self.sel_color = QColor(217, 119, 87, 95)
 
     # ----- layout
-    def resizeEvent(self, e):
+    def set_max_width(self, w):
+        self.MAXW = int(w)
+        self._m = None
+        self._apply_margin()
+
+    def _apply_margin(self):
         # always use the widget's own width (not the event size, which can be the viewport's) and never re-enter
-        if not getattr(self, "_in_resize", False):
-            self._in_resize = True
-            try:
-                m = max(14, (self.width() - self.MAXW) // 2)
-                if getattr(self, "_m", None) != m:
-                    self._m = m
-                    self.setViewportMargins(m, 6, m, 6)
-            finally:
-                self._in_resize = False
+        if getattr(self, "_in_resize", False):
+            return
+        self._in_resize = True
+        try:
+            m = max(14, (self.width() - self.MAXW) // 2)
+            if getattr(self, "_m", None) != m:
+                self._m = m
+                self.setViewportMargins(m, 6, m, 6)
+        finally:
+            self._in_resize = False
+
+    def resizeEvent(self, e):
+        self._apply_margin()
         super().resizeEvent(e)
 
     # ----- coordinates
@@ -3451,12 +3460,19 @@ class FilePreviewDialog(QDialog):
         return v
 
 
+CHAT_WIDTHS = {
+    "comfort": ("مريح — هوامش واسعة", 860),
+    "wide": ("واسع — هوامش صغيرة", 1500),
+    "full": ("ممتد — بأقل هوامش", 100000),
+}
+
+
 class AppSettingsDialog(QDialog):
     """Application-wide settings (like the Settings page in the Claude app): account, appearance, updates."""
 
-    def __init__(self, parent, key, remember, theme, update_url):
+    def __init__(self, parent, key, remember, theme, update_url, width="wide"):
         super().__init__(parent)
-        self.setWindowTitle("الإعدادات")
+        self.setWindowTitle("إعدادات التطبيق")
         self.resize(560, 420)
         self.check_requested = False
         self.import_requested = False
@@ -3480,6 +3496,13 @@ class AppSettingsDialog(QDialog):
         self.theme_box.addItem("فاتح", "light")
         self.theme_box.setCurrentIndex(0 if theme == "dark" else 1)
         lay.addWidget(self.theme_box)
+        lay.addWidget(QLabel("عرض المحادثة (الهوامش على الجانبين):"))
+        self.width_box = QComboBox()
+        for k, (label, _mx) in CHAT_WIDTHS.items():
+            self.width_box.addItem(label, k)
+        i_ = self.width_box.findData(width)
+        self.width_box.setCurrentIndex(i_ if i_ >= 0 else 1)
+        lay.addWidget(self.width_box)
         h3 = QLabel("التحديثات")
         h3.setObjectName("h3")
         h3.setObjectName("h2")
@@ -3526,6 +3549,7 @@ class AppSettingsDialog(QDialog):
             "key": self.key_edit.text().strip(),
             "remember": self.remember_box.isChecked(),
             "theme": self.theme_box.currentData() or "dark",
+            "width": self.width_box.currentData() or "wide",
             "update_url": self.url_edit.text().strip(),
         }
 
@@ -3739,7 +3763,7 @@ def make_qss(c):
     QMainWindow, QDialog { background: %(bg)s; }
     QTextBrowser { background: %(bg)s; border: none; }
     QWidget#side, QWidget#filespanel { background: %(side)s; }
-    QToolButton#iconbtn { background: transparent; border: 1px solid transparent; border-radius: 9px; font-size: 17px; padding: 2px; }
+    QToolButton#iconbtn { background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 4px 10px; }
     QToolButton#iconbtn:hover { background: %(hover)s; }
     QToolButton#iconbtn:checked { background: %(bubble)s; border-color: %(accent)s; }
     QFrame#vsep { color: %(border)s; }
@@ -3926,9 +3950,9 @@ class App(QMainWindow):
         bottom = QHBoxLayout()
         self.settings_btn = QToolButton()
         self.settings_btn.setObjectName("iconbtn")
-        self.settings_btn.setText("⚙")
-        self.settings_btn.setToolTip("إعدادات التطبيق (عامة لكل المحادثات): الثيم، الخط، التحديثات")
-        self.settings_btn.setFixedSize(38, 34)
+        self.settings_btn.setText("⚙ إعدادات التطبيق")
+        self.settings_btn.setToolTip("إعدادات التطبيق (عامة لكل المحادثات): المفتاح، الثيم، عرض المحادثة، التحديثات")
+        self.settings_btn.setFixedHeight(34)
         self.settings_btn.setCursor(Qt.PointingHandCursor)
         self.settings_btn.clicked.connect(self.open_app_settings)
         bottom.addWidget(self.settings_btn)
@@ -3979,7 +4003,7 @@ class App(QMainWindow):
             b.setToolTip(tip)
             b.setCheckable(checkable)
             b.setCursor(Qt.PointingHandCursor)
-            b.setFixedSize(38, 34)
+            b.setFixedHeight(34)
             return b
 
         self.balance_btn = QPushButton("💰 ...")
@@ -3991,13 +4015,13 @@ class App(QMainWindow):
         sep.setFrameShape(QFrame.VLine)
         sep.setObjectName("vsep")
         hl.addWidget(sep)
-        self.files_btn = icon_btn("📁", "ملفات هذي المحادثة", True)
+        self.files_btn = icon_btn("📁 الملفات", "ملفات هذي المحادثة", True)
         self.files_btn.toggled.connect(self.toggle_files_panel)
         hl.addWidget(self.files_btn)
-        self.browser_btn = icon_btn("🌐", "المتصفح المدمج (يشتغل بالخلفية حتى لو أخفيته)", True)
+        self.browser_btn = icon_btn("🌐 المتصفح", "المتصفح المدمج (يشتغل بالخلفية حتى لو أخفيته)", True)
         self.browser_btn.toggled.connect(self.toggle_browser)
         hl.addWidget(self.browser_btn)
-        self.chat_settings_btn = icon_btn("🎛", "إعدادات هذي المحادثة فقط: الصلاحيات، الملفات، الأوامر")
+        self.chat_settings_btn = icon_btn("🎛 إعدادات المحادثة", "إعدادات هذي المحادثة فقط: الصلاحيات، الملفات، الأوامر")
         self.chat_settings_btn.clicked.connect(self.open_tools_dialog)
         hl.addWidget(self.chat_settings_btn)
         header.setFixedHeight(52)  # constant height: showing/hiding the reply button must never move the chat text
@@ -4025,7 +4049,8 @@ class App(QMainWindow):
         wl.setContentsMargins(14, 4, 14, 0)
         composer = QFrame()
         composer.setObjectName("composer")
-        composer.setMaximumWidth(860)
+        composer.setMaximumWidth(1500)
+        self.composer = composer
         cl = QVBoxLayout(composer)
         cl.setContentsMargins(12, 8, 12, 8)
         cl.setSpacing(4)
@@ -4109,10 +4134,13 @@ class App(QMainWindow):
         self.files_list.addStretch(1)
         sa.setWidget(inner)
         fpl.addWidget(sa, 1)
-        self.files_panel.setMinimumWidth(240)
-        self.files_panel.setMaximumWidth(440)
         self.files_panel.setVisible(False)
-        splitter.addWidget(self.files_panel)
+        self.right_split = QSplitter(Qt.Vertical)  # browser on top, chat files below, in one column
+        self.right_split.setMinimumWidth(280)
+        self.right_split.setMaximumWidth(700)
+        self.right_split.addWidget(self.files_panel)
+        self.right_split.setVisible(False)
+        splitter.addWidget(self.right_split)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
@@ -4129,6 +4157,7 @@ class App(QMainWindow):
         self.hb = QTimer(self)
         self.hb.timeout.connect(self.heartbeat)
         self.hb.start(5000)
+        self.apply_width()
         QTimer.singleShot(900, self.recover_after_crash)
         QTimer.singleShot(4000, lambda: self.check_updates(silent=True))
         self.upd_timer = QTimer(self)
@@ -4257,6 +4286,11 @@ class App(QMainWindow):
                     out.append({"src": "bot", "kind": kind, "name": name, "body": body, "mi": i})
         return out[::-1][:200]
 
+    def apply_width(self):
+        mx = CHAT_WIDTHS.get(self.cfg.get("chat_width", "wide"), CHAT_WIDTHS["wide"])[1]
+        self.view.set_max_width(mx)
+        self.composer.setMaximumWidth(min(mx, 16777215))
+
     def toggle_files_panel(self, on):
         self._panel_user_off = not on
         self.files_panel.setVisible(bool(on))
@@ -4266,17 +4300,19 @@ class App(QMainWindow):
         total = max(self.splitter.width(), 1000)
         cur = self.splitter.sizes()
         side = cur[0] if cur and cur[0] > 150 else 260
-        fp = 300 if not self.files_panel.isHidden() else 0
-        br = 460 if (self.browser_container is not None and not self.browser_container.isHidden()) else 0
-        sizes = [side, max(320, total - side - fp - br), fp]
-        if self.browser_container is not None:
-            sizes.append(br)
-        self.splitter.setSizes(sizes)
+        fv = not self.files_panel.isHidden()
+        bv = bool(self.browser_container is not None and not self.browser_container.isHidden())
+        self.right_split.setVisible(fv or bv)
+        rw = 480 if bv else (320 if fv else 0)
+        self.splitter.setSizes([side, max(320, total - side - rw), rw])
+        if fv and bv:
+            h = max(self.right_split.height(), 700)
+            self.right_split.setSizes([int(h * 0.6), int(h * 0.4)])
 
     def refresh_files_panel(self):
         entries = self.gather_files()
         sig = tuple((e["src"], e["name"], e["mi"]) for e in entries)
-        self.files_btn.setText("📁 %d" % len(entries) if entries else "📁")
+        self.files_btn.setText("📁 الملفات (%d)" % len(entries) if entries else "📁 الملفات")
         if sig == getattr(self, "_files_sig", None):
             return
         self._files_sig = sig
@@ -4494,7 +4530,8 @@ class App(QMainWindow):
 
     def open_app_settings(self):
         dlg = AppSettingsDialog(self, self.key_edit.text(), self.remember_box.isChecked(), self.theme,
-                                (self.cfg.get("update_url") or get_update_url(self.cfg)))
+                                (self.cfg.get("update_url") or get_update_url(self.cfg)),
+                                self.cfg.get("chat_width", "wide"))
         if not dlg.exec():
             return
         v = dlg.values()
@@ -4505,6 +4542,8 @@ class App(QMainWindow):
         else:
             self.cfg.pop("api_key", None)
         self.cfg["update_url"] = v["update_url"]
+        self.cfg["chat_width"] = v["width"]
+        self.apply_width()
         theme_changed = v["theme"] != self.theme
         self.theme = v["theme"]
         self.save_cfg()
@@ -4785,7 +4824,7 @@ class App(QMainWindow):
             panel.setVisible(bool(show))
             self.web = panel
             self.browser_container = panel
-            self.splitter.addWidget(panel)
+            self.right_split.insertWidget(0, panel)
             panel.setVisible(bool(show))
             self.web_ok = True
             return True
@@ -4983,26 +5022,18 @@ class App(QMainWindow):
         self.statusBar().showMessage("ما فيه رد بعد", 1500)
 
     def update_settings_summary(self):
-        """The small chip under the message box shows, with symbols only, what this chat may do on the computer."""
-        icons, names = [], []
+        """The small chip under the message box shows what this chat may do on the computer."""
+        parts = []
         if self.tools_enabled:
-            if self.write_enabled and self.writable_dirs:
-                icons.append("📂✎")
-                names.append("ملفات: قراءة وتعديل")
-            else:
-                icons.append("📂")
-                names.append("ملفات: قراءة")
+            parts.append("ملفات: قراءة وتعديل" if (self.write_enabled and self.writable_dirs) else "ملفات: قراءة")
         if self.shell_mode in ("ask", "free"):
-            icons.append("⌨")
-            names.append("أوامر" + (" (تستأذن)" if self.shell_mode == "ask" else ""))
+            parts.append("أوامر")
         if self.computer_enabled:
-            icons.append("🖥")
-            names.append("تحكم بالجهاز")
+            parts.append("تحكم")
         if self.browser_enabled and self.web_ok:
-            icons.append("🌐")
-            names.append("متصفح")
-        self.access_btn.setText(" ".join(icons) if icons else "🔒")
-        tip = ["صلاحيات هذي المحادثة فقط — اضغط للتعديل", ""] + (names or ["بدون صلاحيات"])
+            parts.append("متصفح")
+        self.access_btn.setText("🔓 " + "، ".join(parts) if parts else "🔒 بدون صلاحيات")
+        tip = ["صلاحيات هذي المحادثة فقط — اضغط للتعديل"]
         for d in self.allowed_dirs:
             tip.append(("✎ " if d in self.writable_dirs else "👁 ") + d)
         self.access_btn.setToolTip("\n".join(tip))

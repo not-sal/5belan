@@ -1,10 +1,10 @@
 {
-  "version": "2.4.0",
-  "notes": "Icon toolbar, run/copy buttons for shell blocks, auto chat titles, chat separators, quote chips, new thinking view, background tabbed browser, natural selection incl. words, live balance",
+  "version": "2.5.0",
+  "notes": "Chat width option (3 margin sizes), browser above files in one column, text labels on chat buttons",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "6203a82e35e4ca53d9afe9ddb992e7188a5ae4f87ce5700cca3c856964552ab9"
+      "sha256": "5c4b30fe37368a4f8d410a578566bbf47ef78ccfdd523078b0f5358577fb8a30"
     },
     {
       "name": "guard.py",
@@ -22,8 +22,5 @@
       "name": "requirements.txt",
       "sha256": "57aa0e5a6c24527ec89139dc7c6658fb8d06077d200d6632a90e164b24758470"
     }
-  ],
-  "pip": [
-    "PySide6-WebEngine"
   ]
 }
