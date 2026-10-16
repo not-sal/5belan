@@ -2773,7 +2773,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.10.0"
+APP_VERSION = "2.10.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4926,7 +4926,7 @@ def make_qss(c):
     QPushButton#primary:disabled { background: %(border)s; color: %(dim)s; }
     QPushButton#flat, QToolButton#flat { background: transparent; border: none; color: %(dim)s; padding: 4px 8px; }
     QPushButton#flat:hover, QToolButton#flat:hover { color: %(text)s; background: %(hover)s; }
-    QPushButton#send { background: %(accent)s; color: white; border: none; border-radius: 20px; font-size: 20px; font-weight: bold; padding: 0; }
+    QPushButton#send { background: %(accent)s; color: white; border: none; border-radius: 20px; font-size: 14px; font-weight: bold; padding: 0; }
     QPushButton#send:disabled { background: %(border)s; }
     QPushButton#banner { background: %(accent)s; color: white; border: none; border-radius: 12px; padding: 4px 12px; }
     QComboBox { background: transparent; color: %(dim)s; border: none; padding: 4px 8px; }
@@ -5318,9 +5318,9 @@ class App(QMainWindow):
         self.model_box.setLayoutDirection(Qt.LeftToRight)
         self.model_box.setMinimumWidth(150)
         brow.addWidget(self.model_box)
-        self.btn = QPushButton("↑")
+        self.btn = QPushButton("إرسال")
         self.btn.setObjectName("send")
-        self.btn.setFixedSize(40, 40)
+        self.btn.setFixedSize(68, 40)
         self.btn.clicked.connect(self.on_send_btn)
         brow.addWidget(self.btn, 0, Qt.AlignVCenter)
         brow.setAlignment(Qt.AlignVCenter)
@@ -5928,15 +5928,15 @@ class App(QMainWindow):
     def set_send_mode(self, mode):
         if mode == "stop":
             self.btn.setEnabled(True)
-            self.btn.setText("■")
+            self.btn.setText("إيقاف")
             self.btn.setToolTip("إيقاف (أو اكتب رسالة ثانية واضغط Enter أو هذا الزر)")
             self.statusBar().showMessage("تقدر تكتب رسالة ثانية الحين وتضغط Enter: ترسلها بعد الرد أو تدمجها معه", 7000)
         elif mode == "stopping":
             self.btn.setEnabled(False)
-            self.btn.setText("…")
+            self.btn.setText("جارٍ…")
         else:
             self.btn.setEnabled(True)
-            self.btn.setText("↑")
+            self.btn.setText("إرسال")
             self.btn.setToolTip("إرسال (Enter)")
 
     def chat_menu(self, pos):
@@ -6886,8 +6886,8 @@ class App(QMainWindow):
             self.statusBar().showMessage("فيه رسالة بالانتظار بالفعل — ألغها أول", 3000)
             return
         m = QMenu(self)
-        a_now = m.addAction("⚡  أرسلها الحين — يوقف الرد، يدمجها معه ويكمّل")
-        a_later = m.addAction("⏳  أرسلها بعد ما يخلص الرد")
+        a_now = m.addAction("أرسلها الحين — يوقف الرد، يدمجها معه ويكمّل")
+        a_later = m.addAction("أرسلها بعد ما يخلص الرد")
         m.addSeparator()
         m.addAction("إلغاء")
         pos = self.composer.mapToGlobal(self.composer.rect().topLeft())
@@ -6902,10 +6902,10 @@ class App(QMainWindow):
         self.refresh_files_label()
         if act is a_later:
             self._queued = pend
-            self.show_queue("⏳ بالانتظار (تنرسل بعد الرد): ", pend)
+            self.show_queue("بالانتظار (تنرسل بعد الرد): ", pend)
         else:
             self._interrupt = pend
-            self.show_queue("⚡ يوقّف الرد ويدمج رسالتك: ", pend)
+            self.show_queue("يوقّف الرد ويدمج رسالتك: ", pend)
             self.stop_event.set()
             self.set_send_mode("stopping")
 
