@@ -84,6 +84,29 @@ EVENTS_LOG = os.path.join(BASE_DIR, "events.log")
 # deepseek-flash accepts images; deepseek-v4-pro is text only.
 MODELS = ["deepseek-flash", "deepseek-v4-pro"]
 VISION_MODELS = {"deepseek-flash"}
+# DeepSeek prices, USD per 1M tokens at PEAK time: (input cache hit, input cache miss, output). Off-peak is half.
+# Peak: 01:00-04:00 and 06:00-10:00 UTC, Monday-Friday (source: api-docs.deepseek.com pricing page).
+PRICES = {"deepseek-flash": (0.006, 0.30, 1.20), "deepseek-v4-pro": (0.044, 1.32, 3.96)}
+USD_SAR = 3.75
+
+
+def is_peak(ts=None):
+    t = time.gmtime(ts if ts else time.time())
+    return t.tm_wday < 5 and (1 <= t.tm_hour < 4 or 6 <= t.tm_hour < 10)
+
+
+def usage_cost(model, u, ts=None):
+    """Cost in USD of one API call from its usage block."""
+    h, m, o = PRICES.get(model, PRICES["deepseek-flash"])
+    pt = int(u.get("prompt_tokens") or 0)
+    hit = u.get("prompt_cache_hit_tokens")
+    miss = u.get("prompt_cache_miss_tokens")
+    if hit is None and miss is None:
+        hit, miss = 0, pt
+    hit, miss = int(hit or 0), int(miss or 0)
+    out = int(u.get("completion_tokens") or 0)
+    usd = (hit * h + miss * m + out * o) / 1e6 * (1.0 if is_peak(ts) else 0.5)
+    return usd, pt, out, hit
 THINKING_LEVELS = ["off", "low", "high", "max"]
 
 IMAGE_MIME = {
@@ -890,6 +913,8 @@ def strip_for_save(msg):
         out["reasoning"] = str(msg["reasoning"])[:30000]
     if msg.get("dur"):
         out["dur"] = msg["dur"]
+    if msg.get("cost"):
+        out["cost"] = msg["cost"]
     if msg.get("activity"):
         # keep the file small: only the last steps, each shortened (full logs were making chats.json huge)
         out["activity"] = [dict(s, text=str(s.get("text", ""))[:3000]) for s in msg["activity"][-60:]]
@@ -2385,7 +2410,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -3597,6 +3622,17 @@ class DeviceFilesDialog(QDialog):
         self.browser_box.setChecked(bool(settings.get("browser_enabled")))
         for b in (self.enable_box, self.write_box, self.delete_box, self.backup_box, self.computer_box, self.browser_box):
             lay.addWidget(b)
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("قالب جاهز:"))
+        self.preset_box = QComboBox()
+        self.preset_box.addItem("— اختر قالب —", "")
+        self.preset_box.addItem("🔒 بدون صلاحيات", "none")
+        self.preset_box.addItem("👁 قراءة فقط", "read")
+        self.preset_box.addItem("💻 مبرمج (قراءة + تعديل + أوامر بإذنك)", "dev")
+        self.preset_box.addItem("🚀 حرية كاملة (بدون أسئلة)", "free")
+        self.preset_box.activated.connect(self.apply_preset)
+        prow.addWidget(self.preset_box, 1)
+        lay.addLayout(prow)
         form = QHBoxLayout()
         form.addWidget(QLabel("تعديل الملفات:"))
         self.approval_box = QComboBox()
@@ -3654,6 +3690,26 @@ class DeviceFilesDialog(QDialog):
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
         lay.addWidget(box)
+
+    def apply_preset(self, _i=None):
+        k = self.preset_box.currentData()
+        if not k:
+            return
+        P = {
+            #        read   write  delete backup computer browser  approval shell
+            "none": (False, False, False, True, False, False, 0, 0),
+            "read": (True, False, False, True, False, False, 0, 0),
+            "dev": (True, True, False, True, False, False, 0, 1),
+            "free": (True, True, False, True, True, True, 1, 2),
+        }[k]
+        self.enable_box.setChecked(P[0])
+        self.write_box.setChecked(P[1])
+        self.delete_box.setChecked(P[2])
+        self.backup_box.setChecked(P[3])
+        self.computer_box.setChecked(P[4])
+        self.browser_box.setChecked(P[5])
+        self.approval_box.setCurrentIndex(P[6])
+        self.shell_box.setCurrentIndex(P[7])
 
     def add_path(self, path, writable):
         from PySide6.QtWidgets import QListWidgetItem
@@ -3907,6 +3963,8 @@ class App(QMainWindow):
                             _s["text"] = str(_s["text"])[:3000]
         self.current = None  # current chat dict, or None for an unsaved new chat
         self.order = []
+        self.view_chats = []
+        self.drafts = {}
         cfg = load_json(CONFIG_PATH, {})
         self.cfg = cfg if isinstance(cfg, dict) else {}
         cfg = self.cfg
@@ -3943,7 +4001,23 @@ class App(QMainWindow):
         sl.addWidget(brand)
         b_new = QPushButton("＋  محادثة جديدة")
         b_new.clicked.connect(self.new_chat)
+        b_new.setToolTip("Ctrl+N")
         sl.addWidget(b_new)
+        srow = QHBoxLayout()
+        srow.setSpacing(4)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("🔍 بحث في المحادثات")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(lambda _t: self.refresh_list())
+        srow.addWidget(self.search_edit, 1)
+        self.arch_btn = QToolButton()
+        self.arch_btn.setObjectName("iconbtn")
+        self.arch_btn.setText("🗄")
+        self.arch_btn.setCheckable(True)
+        self.arch_btn.setToolTip("إظهار المحادثات المؤرشفة")
+        self.arch_btn.toggled.connect(lambda _c: self.refresh_list())
+        srow.addWidget(self.arch_btn)
+        sl.addLayout(srow)
         self.listw = QListWidget()
         self.listw.setObjectName("chats")
         self.listw.setFrameShape(QFrame.NoFrame)
@@ -4174,6 +4248,10 @@ class App(QMainWindow):
         self.upd_timer = QTimer(self)
         self.upd_timer.timeout.connect(lambda: self.check_updates(silent=True))
         self.upd_timer.start(6 * 3600 * 1000)
+        for keys, fn in (("Ctrl+N", self.new_chat), ("Ctrl+K", lambda: (self.search_edit.setFocus(), self.search_edit.selectAll())),
+                         ("Ctrl+L", lambda: self.inp.setFocus()), ("Ctrl+Shift+C", self.copy_last_reply),
+                         ("Esc", self.esc_pressed)):
+            QShortcut(QKeySequence(keys), self, activated=fn)
         self.inp.setFocus()
 
     # ---------- reply to a part of a message ----------
@@ -4718,11 +4796,18 @@ class App(QMainWindow):
             return
         self.listw.setCurrentRow(self.listw.row(it))
         m = QMenu(self)
+        c_ = self.current
+        m.addAction("📌  إلغاء التثبيت" if c_.get("pinned") else "📌  تثبيت في الأعلى", lambda: self.toggle_flag("pinned"))
+        m.addAction("🗄  إلغاء الأرشفة" if c_.get("archived") else "🗄  أرشفة (إخفاء بدون حذف)", lambda: self.toggle_flag("archived"))
         m.addAction("✏  إعادة تسمية", self.rename_chat)
+        m.addSeparator()
+        m.addAction("📤  تصدير Markdown", lambda: self.export_chat("md"))
+        m.addAction("📄  تصدير PDF", lambda: self.export_chat("pdf"))
+        m.addSeparator()
         m.addAction("🗑  حذف", self.delete_chat)
         m.exec(self.listw.mapToGlobal(pos))
 
-    def add_user_bubble(self, text, names, quotes=None):
+    def add_user_bubble(self, text, names, quotes=None, idx=None):
         """My message: a shaded card with an accent edge and a small "أنت" label, so it stands apart from the reply."""
         col = THEMES[self.theme]
         c = self._end_cursor()
@@ -4755,6 +4840,14 @@ class App(QMainWindow):
         lb.setLayoutDirection(Qt.RightToLeft)
         cc.setBlockFormat(lb)
         cc.insertText("أنت", who)
+        if idx is not None:
+            ef = QTextCharFormat(who)
+            ef.setAnchor(True)
+            ef.setAnchorHref("edit:%d" % idx)
+            ef.setForeground(QColor(col["accent"]))
+            ef.setFontWeight(QFont.Weight.Normal)
+            cc.insertText("      ", who)
+            cc.insertText("✎ تعديل", ef)
         cc.insertBlock(QTextBlockFormat(), QTextCharFormat())
         firstline = True
         for q in quotes or []:
@@ -5122,33 +5215,59 @@ class App(QMainWindow):
                     "settings": c.get("settings"),
                     "renamed": bool(c.get("renamed")),
                     "auto_titled": bool(c.get("auto_titled")),
+                    "pinned": bool(c.get("pinned")),
+                    "archived": bool(c.get("archived")),
                     "msgs": [strip_for_save(m) for m in c["msgs"]],
                 }
             )
         save_json(CHATS_PATH, out)
 
+    def update_cost_tip(self):
+        tot = sum((m.get("cost") or {}).get("usd", 0) for m in (self.current or {}).get("msgs", []))
+        self.title_label.setToolTip(("تكلفة هذي المحادثة: ≈ $%.4f (%.3f ر.س)" % (tot, tot * USD_SAR)) if tot else "")
+
+    @staticmethod
+    def _chat_matches(c, q):
+        if q in c.get("title", "").lower():
+            return True
+        for m in c.get("msgs", []):
+            t = m.get("shown") or ""
+            ct = m.get("content")
+            if isinstance(ct, str):
+                t += "\n" + ct
+            if q in t.lower():
+                return True
+        return False
+
     def refresh_list(self):
-        self.chats.sort(key=lambda c: c.get("updated", 0), reverse=True)
-        self.order = [c["id"] for c in self.chats]
+        self.chats.sort(key=lambda c: (not c.get("pinned"), -c.get("updated", 0)))
+        q = self.search_edit.text().strip().lower()
+        show_arch = self.arch_btn.isChecked()
+        self.view_chats = [c for c in self.chats
+                           if (show_arch or not c.get("archived")) and (not q or self._chat_matches(c, q))]
+        self.order = [c["id"] for c in self.view_chats]
         self.listw.blockSignals(True)
         self.listw.clear()
-        for c in self.chats:
-            self.listw.addItem(c["title"])
+        for c in self.view_chats:
+            self.listw.addItem(("📌 " if c.get("pinned") else "") + ("🗄 " if c.get("archived") else "") + c["title"])
         if self.current and self.current["id"] in self.order:
             self.listw.setCurrentRow(self.order.index(self.current["id"]))
         else:
             self.listw.setCurrentRow(-1)
         self.listw.blockSignals(False)
         self.title_label.setText(self.current["title"] if self.current else "محادثة جديدة")
+        self.update_cost_tip()
 
     def on_select(self, row):
-        if row < 0 or row >= len(self.chats):
+        if row < 0 or row >= len(self.view_chats):
             return
         if self.busy:
             QMessageBox.information(self, "5belan", "انتظر حتى ينتهي الرد الحالي.")
             self.refresh_list()
             return
-        self.current = self.chats[row]
+        self._stash_draft()
+        self.current = self.view_chats[row]
+        self._restore_draft()
         self.apply_settings(self.chat_settings(self.current))
         self.title_label.setText(self.current["title"])
         self.render_chat()
@@ -5172,13 +5291,13 @@ class App(QMainWindow):
             if i < start_i:
                 continue
             if m["role"] == "user":
-                self.add_user_bubble(m.get("shown", ""), m.get("names") or [], m.get("quotes") or [])
+                self.add_user_bubble(m.get("shown", ""), m.get("names") or [], m.get("quotes") or [], i)
             else:
                 self.append_bot_label()
                 steps = m.get("activity")
                 if not steps and m.get("reasoning"):
                     steps = [{"k": "think", "text": m["reasoning"]}]  # chats saved before the Thinking block existed
-                self.render_reply(steps or [], clean_reply(m["content"]), "m%d" % i, False, (), m.get("dur"))
+                self.render_reply(steps or [], clean_reply(m["content"]), "m%d" % i, False, (), m.get("dur"), m.get("cost"))
                 self.add_divider()
                 last_reply = m["content"]
         if self.busy and self.live is not None:
@@ -5189,6 +5308,7 @@ class App(QMainWindow):
         else:
             self.show_files(last_reply)
         self.refresh_files_panel()
+        self.update_cost_tip()
         if keep_scroll:
             sb.setValue(keep)
         else:
@@ -5228,7 +5348,7 @@ class App(QMainWindow):
         m, r = divmod(sec, 60)
         return ("%dد %dث" % (m, r)) if m else ("%dث" % r)
 
-    def render_reply(self, steps, body, act_id, live, warns, dur=None):
+    def render_reply(self, steps, body, act_id, live, warns, dur=None, cost=None):
         """Write one reply at the end of the view: Thinking line, optional details, then the answer.
 
         steps: list of {"k": think|say|tool|note, ...}; details are grouped under a heading per kind of work.
@@ -5267,7 +5387,7 @@ class App(QMainWindow):
             self.insert_rich_body(c, body, act_id)
             if not live:
                 self.reply_ranges.append((r0, self._end_cursor().position()))
-                self._insert_reply_copy(c, act_id, body)
+                self._insert_reply_copy(c, act_id, body, cost)
 
     def _render_details(self, c, steps, act_id="x", live=False):
         """The thinking outline: a soft card with one row per topic. A coloured dot shows the outcome at a glance
@@ -5455,14 +5575,34 @@ class App(QMainWindow):
         c.insertText(code, cf)
         c.insertBlock(QTextBlockFormat(), QTextCharFormat())
 
-    def _insert_reply_copy(self, c, mid, body):
+    @staticmethod
+    def fmt_cost(cost):
+        if not cost:
+            return ""
+        usd = float(cost.get("usd", 0))
+        return "≈ $%.4f (%.3f ر.س) · %s مدخل · %s مخرج" % (usd, usd * USD_SAR, format(int(cost.get("tin", 0)), ","), format(int(cost.get("tout", 0)), ","))
+
+    def _insert_reply_copy(self, c, mid, body, cost=None):
         self.copy_store["reply:" + mid] = body
         c.insertBlock(QTextBlockFormat(), QTextCharFormat())
         a = QTextCharFormat()
         a.setAnchor(True)
         a.setAnchorHref("copyreply:" + mid)
         a.setForeground(QColor(THEMES[self.theme]["accent"]))
-        c.insertText("⧉ نسخ الرد كامل", a)
+        c.insertText("⧉ نسخ", a)
+        try:
+            idx = int(mid[1:])
+            is_last = bool(self.current) and idx == len(self.current["msgs"]) - 1 and idx > 0
+        except Exception:
+            is_last = False
+        if is_last:
+            r = QTextCharFormat(a)
+            r.setAnchorHref("regen:" + mid)
+            c.insertText("    ", self.fmt["dim"])
+            c.insertText("🔄 إعادة توليد", r)
+        t = self.fmt_cost(cost)
+        if t:
+            c.insertText("    " + t, self.fmt["dim"])
 
     def begin_live(self):
         self.live = {"steps": [], "body": "", "cur_think": None, "warns": [], "t0": time.time()}
@@ -5496,6 +5636,15 @@ class App(QMainWindow):
         if s.startswith("run:"):
             self.run_snippet(s[4:])
             return
+        if s.startswith("regen:"):
+            self.regenerate()
+            return
+        if s.startswith("edit:"):
+            try:
+                self.edit_message(int(s[5:]))
+            except ValueError:
+                pass
+            return
         if s.startswith("copyreply:"):
             self._copy(self.copy_store.get("reply:" + s[len("copyreply:"):], ""))
             return
@@ -5527,11 +5676,145 @@ class App(QMainWindow):
     def new_chat(self):
         if self.busy:
             return
+        self._stash_draft()
         self.current = None
+        self._restore_draft()
         self.apply_settings(restrictive_settings(self.def_model, self.def_think))
         self.refresh_list()
         self.render_chat()
         self.inp.setFocus()
+
+    # ---------- drafts, regenerate, edit, pin, archive, export ----------
+    def _stash_draft(self):
+        key = self.current["id"] if self.current else ""
+        t = self.inp.toPlainText()
+        if t.strip():
+            self.drafts[key] = t
+        else:
+            self.drafts.pop(key, None)
+
+    def _restore_draft(self):
+        key = self.current["id"] if self.current else ""
+        self.inp.setPlainText(self.drafts.get(key, ""))
+        c = self.inp.textCursor()
+        c.movePosition(QTextCursor.End)
+        self.inp.setTextCursor(c)
+
+    def regenerate(self):
+        if self.busy or not self.current:
+            return
+        msgs = self.current["msgs"]
+        if len(msgs) < 2 or msgs[-1]["role"] != "assistant" or msgs[-2]["role"] != "user":
+            return
+        key = self.key_edit.text().strip()
+        if not key:
+            QMessageBox.warning(self, "5belan", "اكتب مفتاح API أول.")
+            return
+        msgs.pop()
+        self.current["settings"] = self.collect_settings()
+        self.current["updated"] = time.time()
+        self.persist()
+        self.last_text = msgs[-1].get("shown", "")
+        self.render_chat()
+        self._launch(key, self.model_box.currentText(), self.think_box.currentText())
+
+    def edit_message(self, i):
+        if self.busy or not self.current:
+            return
+        msgs = self.current["msgs"]
+        if i < 0 or i >= len(msgs) or msgs[i]["role"] != "user":
+            return
+        if len(msgs) - i > 2 and QMessageBox.question(
+                self, "تعديل الرسالة", "التعديل يحذف هذي الرسالة وكل اللي بعدها من المحادثة ثم تعيد إرسالها. تكمل؟") != YES:
+            return
+        m = msgs[i]
+        del msgs[i:]
+        self.persist()
+        self.render_chat()
+        self.inp.setPlainText(m.get("shown", ""))
+        c = self.inp.textCursor()
+        c.movePosition(QTextCursor.End)
+        self.inp.setTextCursor(c)
+        self.quotes = [dict(q) for q in (m.get("quotes") or [])]
+        self.refresh_quotes()
+        if m.get("names"):
+            self.statusBar().showMessage("المرفقات القديمة ما رجعت، أرفقها من جديد لو تبيها", 5000)
+        self.inp.setFocus()
+
+    def toggle_flag(self, flag):
+        if not self.current:
+            return
+        self.current[flag] = not self.current.get(flag)
+        self.persist()
+        self.refresh_list()
+
+    def copy_last_reply(self):
+        if not self.current:
+            return
+        for m in reversed(self.current["msgs"]):
+            if m["role"] == "assistant":
+                self._copy(clean_reply(m["content"]))
+                self.statusBar().showMessage("تم نسخ آخر رد", 2000)
+                return
+
+    def esc_pressed(self):
+        if self.busy:
+            self.stop_event.set()
+            self.set_send_mode("stopping")
+
+    def chat_markdown(self):
+        out = ["# " + self.current["title"], ""]
+        for m in self.current["msgs"]:
+            if m["role"] == "user":
+                out.append("## أنت")
+                for q in m.get("quotes") or []:
+                    out.append("> " + q.get("q", "").replace("\n", "\n> "))
+                    if q.get("c"):
+                        out.append("")
+                        out.append(q["c"])
+                if m.get("names"):
+                    out.append("مرفق: " + ", ".join(m["names"]))
+                out.append(m.get("shown", ""))
+            else:
+                out.append("## " + BOT_NAME)
+                out.append(clean_reply(m["content"]))
+            out.append("")
+        return "\n".join(out)
+
+    def export_chat(self, fmt):
+        if not self.current:
+            return
+        base = re.sub(r'[\\/:*?"<>|]+', "_", self.current["title"]).strip()[:50] or "chat"
+        ext = "md" if fmt == "md" else "pdf"
+        path, _ = QFileDialog.getSaveFileName(self, "تصدير المحادثة", os.path.join(self.default_dir(), base + "." + ext),
+                                              "Markdown (*.md)" if fmt == "md" else "PDF (*.pdf)")
+        if not path:
+            return
+        try:
+            md = self.chat_markdown()
+            if fmt == "md":
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(md)
+            else:
+                doc = QTextDocument()
+                doc.setMarkdown(md)
+                html = '<html dir="rtl" lang="ar"><head><meta charset="utf-8"></head><body>%s</body></html>' % doc.toHtml()
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    try:
+                        make_pdf(html, path, {})
+                    except Exception:  # no Edge/Chrome: draw it with Qt instead
+                        from PySide6.QtGui import QPdfWriter, QPageSize
+
+                        wr = QPdfWriter(path)
+                        wr.setPageSize(QPageSize(QPageSize.A4))
+                        doc.setDefaultTextOption(auto_direction_option())
+                        doc.print_(wr)
+                finally:
+                    QApplication.restoreOverrideCursor()
+            self.statusBar().showMessage("انحفظ: " + path, 6000)
+        except Exception as e:
+            QMessageBox.warning(self, "تصدير", "تعذّر التصدير: %s" % e)
 
     def rename_chat(self):
         if self.busy or not self.current:
@@ -5833,11 +6116,17 @@ class App(QMainWindow):
         self.quotes = []
         self.refresh_quotes()
         self.inp.clear()
-        self.add_user_bubble(text, names, quotes)
+        self.add_user_bubble(text, names, quotes, len(self.current["msgs"]) - 1)
         self.refresh_files_panel()
-        self.begin_live()
         self.attachments = []
         self.refresh_files_label()
+        self.drafts.pop(self.current["id"], None)
+        self.drafts.pop("", None)
+        self._launch(key, model, think)
+
+    def _launch(self, key, model, think):
+        """Start the model on the current chat (used by send and by regenerate)."""
+        self.begin_live()
         self.busy = True
         self.stop_event.clear()
         self.set_send_mode("stop")
@@ -5888,7 +6177,13 @@ class App(QMainWindow):
                 if data == "[DONE]":
                     break
                 try:
-                    delta = json.loads(data)["choices"][0]["delta"]
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+                if obj.get("usage"):
+                    self.q.put(("usage", (payload.get("model"), obj["usage"], time.time())))
+                try:
+                    delta = obj["choices"][0]["delta"]
                 except Exception:
                     continue
                 t = delta.get("reasoning_content")
@@ -5929,7 +6224,7 @@ class App(QMainWindow):
                     use_tools = False
                     messages.append({"role": "user", "content": wrap_up})
                 self.trim_context(messages)
-                payload = {"model": model, "messages": messages, "stream": True}
+                payload = {"model": model, "messages": messages, "stream": True, "stream_options": {"include_usage": True}}
                 if think == "off":
                     payload["thinking"] = {"type": "disabled"}
                 else:
@@ -6288,9 +6583,22 @@ class App(QMainWindow):
                         ("\nآخر تغيّر: %+.4f" % d_) if d_ is not None else ""))
                 else:
                     self.balance_btn.setText("💰 " + str(val))
+            elif kind == "usage":
+                if L is not None:
+                    try:
+                        usd, pt, out_, hit = usage_cost(val[0], val[1], val[2])
+                        c_ = L.setdefault("cost", {"usd": 0.0, "tin": 0, "tout": 0, "hit": 0})
+                        c_["usd"] += usd
+                        c_["tin"] += pt
+                        c_["tout"] += out_
+                        c_["hit"] += hit
+                    except Exception:
+                        pass
             elif kind == "done":
                 content, reasoning = val
                 msg = {"role": "assistant", "content": content, "reasoning": reasoning}
+                if L is not None and L.get("cost"):
+                    msg["cost"] = L["cost"]
                 if L is not None and L["steps"]:
                     msg["activity"] = L["steps"]
                 if L is not None and L.get("t0"):
