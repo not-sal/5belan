@@ -905,6 +905,7 @@ DETAIL_TEXT_CAP = 4000     # characters of one step shown in the details
 CONTEXT_TRIM_CHARS = 350000   # above this, old tool results get shortened before each request
 SAME_CALL_LIMIT = 3
 SHELL_TIMEOUT = 180
+SHELL_TIMEOUT_MAX = 1800
 TOOL_MAX_OUTPUT = 120000
 TOOL_MAX_WRITE_CHARS = 400000
 BACKUP_MAX_BYTES = 20 * 1024 * 1024
@@ -1086,6 +1087,7 @@ SHELL_TOOLS = [
                     "command": {"type": "string", "description": "The exact command line to run (PowerShell syntax on Windows)."},
                     "explanation": {"type": "string", "description": "Short plain explanation of what this does and why (shown to the user)."},
                     "cwd": {"type": "string", "description": "Optional working directory (absolute path)."},
+                    "timeout_seconds": {"type": "integer", "description": "Optional time limit in seconds for a long job (default 180, max 1800)."},
                 },
                 "required": ["command", "explanation"],
             },
@@ -1623,7 +1625,7 @@ class ToolRunner:
         if name == "delete_path":
             return "حذف: %s" % a.get("path", "")
         if name == "run_command":
-            return "تشغيل أمر: %s" % (a.get("command", "") or "")
+            return "تشغيل أمر: %s" % _cut(a.get("command", "") or "", 300)
         if name == "open_program":
             return "فتح: %s" % a.get("target", "")
         if name == "open_in_chrome":
@@ -1646,7 +1648,8 @@ class ToolRunner:
             if not isinstance(args, dict):
                 raise ValueError
         except Exception:
-            return "Error: the arguments are not valid JSON"
+            return ("Error: the arguments are not valid JSON (probably cut off because they were too long). Send a shorter command: "
+                    "write big scripts to a file with write_file, then run that file.")
         mapping = {
             "list_folder": self.list_folder,
             "read_file": self.read_file,
@@ -1978,18 +1981,36 @@ class ToolRunner:
                 cwd = None
         if not cwd or not os.path.isdir(cwd):
             cwd = self.roots[0] if self.roots else os.path.expanduser("~")
-        detail = "الأمر:\n%s" % cmd + (("\n\nالشرح:\n%s" % explanation) if explanation else "")
+        detail = "الأمر:\n%s" % _cut(cmd, 6000) + (("\n\nالشرح:\n%s" % explanation) if explanation else "")
         danger = shell_danger(cmd)
         if danger:
             raise ToolError("PROTECTED: refused, %s. Never touch operating-system files, drives, the registry or services, even if the user asks. Tell the user you refused." % danger)
         self._guard_shell("تشغيل أمر على جهازك", detail)
-        if os.name == "nt":
-            argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd]
-        else:
-            argv = ["/bin/bash", "-lc", cmd]
-        return self._exec(argv, cwd)
+        try:
+            tmo = int(a.get("timeout_seconds") or SHELL_TIMEOUT)
+        except Exception:
+            tmo = SHELL_TIMEOUT
+        tmo = max(10, min(SHELL_TIMEOUT_MAX, tmo))
+        # the command goes through a temp script file: no command-line length limit, no quoting problems
+        import tempfile
+        fd, script = tempfile.mkstemp(prefix="5b_cmd_", suffix=(".ps1" if os.name == "nt" else ".sh"))
+        try:
+            with os.fdopen(fd, "w", encoding=("utf-8-sig" if os.name == "nt" else "utf-8"), newline="\n") as f:
+                if os.name == "nt":
+                    f.write("$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n")
+                f.write(cmd + "\n")
+            if os.name == "nt":
+                argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script]
+            else:
+                argv = ["/bin/bash", "-l", script]
+            return self._exec(argv, cwd, tmo)
+        finally:
+            try:
+                os.remove(script)
+            except OSError:
+                pass
 
-    def _exec(self, argv, cwd):
+    def _exec(self, argv, cwd, timeout=None):
         """Run a command WITHOUT pipes (output goes to a temp file) so a server started by the command
         cannot keep us waiting forever; poll so the Stop button works; kill the whole process tree on timeout/stop."""
         import tempfile
@@ -2016,8 +2037,8 @@ class ToolRunner:
             if ev is not None and ev.is_set():
                 why = "stopped by the user"
                 break
-            if time.time() - start > SHELL_TIMEOUT:
-                why = "timed out after %ds" % SHELL_TIMEOUT
+            if time.time() - start > (timeout or SHELL_TIMEOUT):
+                why = "timed out after %ds (pass timeout_seconds up to %d for a long job)" % (timeout or SHELL_TIMEOUT, SHELL_TIMEOUT_MAX)
                 break
         if why:
             self._kill_tree(proc)
@@ -2126,7 +2147,7 @@ class ToolRunner:
 import sys
 import traceback
 
-from PySide6.QtCore import QEvent, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -2134,6 +2155,7 @@ from PySide6.QtGui import (
     QImage,
     QKeySequence,
     QIcon,
+    QPainter,
     QPalette,
     QPixmap,
     QShortcut,
@@ -2250,6 +2272,19 @@ def _first_sentence(text, limit=60):
     return t if len(t) <= limit else t[: limit - 1].rstrip() + "…"
 
 
+def _clean_title(text, limit=58):
+    """A short readable row title from a thought: first sentence, markdown and quotes removed, cut at a word."""
+    t = re.sub(r"[*_`#>]+", "", str(text or ""))
+    t = re.sub(r"\s+", " ", t).strip(" \"'“”«»-—:")
+    if not t:
+        return ""
+    t = re.split(r"(?<=[.!?؟。:])\s", t, maxsplit=1)[0].strip(" .:")
+    if len(t) > limit:
+        cut = t[:limit].rsplit(" ", 1)[0] if " " in t[:limit] else t[:limit]
+        t = cut.rstrip(" ,;:-") + "…"
+    return t
+
+
 def build_activity_tree(steps):
     """Turn the flat activity list into a tree: main topic > sub topic > sub-sub topic, each with its items.
 
@@ -2314,11 +2349,12 @@ def build_activity_tree(steps):
                 ensure()
                 flush()
             else:
-                if st["last_group"] != key or len(stack) < 2:
+                if st["last_group"] is None or not stack:
                     first_think = next((p for p in st["pend"] if p.get("k") == "think"), None)
-                    if st["last_group"] is None or not stack:
-                        push_node(1, _first_sentence(first_think.get("text")) if first_think and first_think.get("text") else title)
-                    push_node(2, title)
+                    ft = (first_think or {}).get("text") or ""
+                    nlat = len(re.findall(r"[A-Za-z]", ft))
+                    nar = len(_AR_ANY.findall(ft))
+                    push_node(1, (_clean_title(ft) if nar >= nlat and ft.strip() else title) or title)
                     st["last_group"] = key
                 flush()
             stack[-1]["items"].append(step)
@@ -2347,7 +2383,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.3.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -2572,14 +2608,31 @@ class PasteEdit(QPlainTextEdit):
 
 
 class ChatView(QTextBrowser):
-    """Chat area whose text column is centred and at most MAXW wide, like the Claude app."""
+    """Chat area whose text column is centred and at most MAXW wide, like the Claude app.
+
+    Mouse selection is done here (not by Qt): the highlight follows the mouse as one visual block per line, which is what
+    people expect in mixed Arabic/English text; Qt's own logical selection breaks into confusing pieces there."""
 
     MAXW = 860
+    selection_changed = Signal()
 
     def __init__(self, *a):
         super().__init__(*a)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._a = None          # selection start / end as document points
+        self._b = None
+        self._press = None
+        self._drag = False
+        self._last_pos = None
+        self._clicks = 0
+        self._click_t = 0.0
+        self._auto = QTimer(self)
+        self._auto.setInterval(30)
+        self._auto.timeout.connect(self._auto_scroll)
+        self.setMouseTracking(True)
+        self.sel_color = QColor(217, 119, 87, 95)
 
+    # ----- layout
     def resizeEvent(self, e):
         # always use the widget's own width (not the event size, which can be the viewport's) and never re-enter
         if not getattr(self, "_in_resize", False):
@@ -2592,6 +2645,528 @@ class ChatView(QTextBrowser):
             finally:
                 self._in_resize = False
         super().resizeEvent(e)
+
+    # ----- coordinates
+    def _to_doc(self, p):
+        return QPointF(p.x() + self.horizontalScrollBar().value(), p.y() + self.verticalScrollBar().value())
+
+    def _line_at(self, pt):
+        """(block, layout, line index) under a document point (nearest line when between lines)."""
+        doc = self.document()
+        lay = doc.documentLayout()
+        pos = lay.hitTest(pt, Qt.FuzzyHit)
+        if pos < 0:
+            return None
+        blk = doc.findBlock(pos)
+        tl = blk.layout()
+        if tl is None or tl.lineCount() == 0:
+            return None
+        origin = tl.position()
+        best, bd = 0, 1e18
+        for i in range(tl.lineCount()):
+            r = tl.lineAt(i).rect()
+            top = origin.y() + r.top()
+            bot = top + r.height()
+            d = 0 if top <= pt.y() <= bot else min(abs(pt.y() - top), abs(pt.y() - bot))
+            if d < bd:
+                best, bd = i, d
+        return blk, tl, best
+
+    @staticmethod
+    def _is_rtl(text):
+        for ch in text:
+            o = ord(ch)
+            if 0x590 <= o <= 0x8FF or 0xFB1D <= o <= 0xFEFF:
+                return True
+            if ch.isalpha():
+                return False
+        return False
+
+    @staticmethod
+    def _line_extent(tl, line):
+        """Visual left/right of the text of one line (document-relative to the layout origin)."""
+        a = line.textStart()
+        n = line.textLength()
+        xs = [line.cursorToX(a + i)[0] for i in range(0, n + 1)]
+        return min(xs), max(xs)
+
+    def _ordered(self):
+        """Selected lines as [(block, layout, line, x0, x1, rtl)], x in document coordinates."""
+        if self._a is None or self._b is None:
+            return []
+        la, lb = self._line_at(self._a), self._line_at(self._b)
+        if not la or not lb:
+            return []
+
+        def key(t):
+            blk, tl, i = t
+            return (blk.position(), i)
+
+        a_pt, b_pt = self._a, self._b
+        if key(la) > key(lb) or (key(la) == key(lb) and False):
+            la, lb = lb, la
+            a_pt, b_pt = b_pt, a_pt
+        out = []
+        blk = la[0]
+        same = key(la) == key(lb)
+        while blk.isValid():
+            tl = blk.layout()
+            if tl is not None and tl.lineCount():
+                rtl = self._is_rtl(blk.text())
+                ox = tl.position().x()
+                first_i = la[2] if blk == la[0] else 0
+                last_i = lb[2] if blk == lb[0] else tl.lineCount() - 1
+                for i in range(first_i, last_i + 1):
+                    line = tl.lineAt(i)
+                    lo, hi = self._line_extent(tl, line)
+                    lo += ox
+                    hi += ox
+                    x0, x1 = lo, hi
+                    is_first = blk == la[0] and i == la[2]
+                    is_last = blk == lb[0] and i == lb[2]
+                    if same:
+                        x0, x1 = min(a_pt.x(), b_pt.x()), max(a_pt.x(), b_pt.x())
+                    elif is_first:
+                        if rtl:
+                            x0, x1 = lo, a_pt.x()
+                        else:
+                            x0, x1 = a_pt.x(), hi
+                    elif is_last:
+                        if rtl:
+                            x0, x1 = b_pt.x(), hi
+                        else:
+                            x0, x1 = lo, b_pt.x()
+                    x0, x1 = max(lo, min(x0, hi)), max(lo, min(x1, hi))
+                    if x1 - x0 > 0.5 or (not same and not is_first and not is_last):
+                        out.append((blk, tl, line, x0, x1))
+            if blk == lb[0]:
+                break
+            blk = blk.next()
+        return out
+
+    # ----- public API
+    def has_visual_selection(self):
+        return self._a is not None and self._b is not None and (abs(self._a.x() - self._b.x()) > 2 or abs(self._a.y() - self._b.y()) > 2)
+
+    def selected_text(self):
+        if self.has_visual_selection():
+            parts = []
+            last_blk = None
+            for blk, tl, line, x0, x1 in self._ordered():
+                txt = blk.text()
+                ox = tl.position().x()
+                a = line.textStart()
+                chars = []
+                for i in range(a, a + line.textLength()):
+                    xa = line.cursorToX(i)[0] + ox
+                    xb = line.cursorToX(i + 1)[0] + ox
+                    c = (xa + xb) / 2
+                    if x0 - 0.5 <= c <= x1 + 0.5 and i < len(txt):
+                        chars.append(txt[i])
+                s = "".join(chars).replace("￼", "")
+                if s.strip() or s:
+                    sep = "\n"
+                    parts.append((sep if parts else "") + s)
+            return strip_bidi("".join(parts)).replace(" ", "\n").replace(" ", "\n")
+        return strip_bidi(self.textCursor().selectedText()).replace(" ", "\n").replace(" ", "\n")
+
+    def has_selection(self):
+        return self.has_visual_selection() or self.textCursor().hasSelection()
+
+    def clear_selection(self):
+        changed = self._a is not None or self.textCursor().hasSelection()
+        self._a = self._b = None
+        c = self.textCursor()
+        c.clearSelection()
+        self.setTextCursor(c)
+        self.viewport().update()
+        if changed:
+            self.selection_changed.emit()
+
+    def copy(self):
+        t = self.selected_text()
+        if t:
+            QApplication.clipboard().setText(t)
+
+    # ----- painting
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if not self.has_visual_selection():
+            return
+        p = QPainter(self.viewport())
+        try:
+            dx, dy = self.horizontalScrollBar().value(), self.verticalScrollBar().value()
+            vh = self.viewport().height()
+            for blk, tl, line, x0, x1 in self._ordered():
+                r = line.rect()
+                top = tl.position().y() + r.top() - dy
+                if top > vh or top + r.height() < 0:
+                    continue
+                p.fillRect(QRectF(x0 - dx, top, max(2.0, x1 - x0), r.height()), self.sel_color)
+        finally:
+            p.end()
+
+    # ----- mouse
+    def mousePressEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return super().mousePressEvent(e)
+        pos = e.position().toPoint()
+        self._press = pos
+        self._drag = False
+        self._on_link = bool(self.anchorAt(pos))
+        now = time.time()
+        if now - self._click_t < 0.45 and (self._press_prev is not None and (pos - self._press_prev).manhattanLength() < 6):
+            self._clicks += 1
+        else:
+            self._clicks = 1
+        self._click_t = now
+        self._press_prev = pos
+        if self._on_link:
+            return super().mousePressEvent(e)
+        if self._clicks >= 2:
+            cur = self.cursorForPosition(pos)
+            cur.select(QTextCursor.BlockUnderCursor if self._clicks >= 3 else QTextCursor.WordUnderCursor)
+            self._a = self._b = None
+            self.setTextCursor(cur)
+            self.viewport().update()
+            self.selection_changed.emit()
+            return
+        had = self.has_selection()
+        self._a = self._to_doc(pos)
+        self._b = None
+        c = self.textCursor()
+        c.clearSelection()
+        self.setTextCursor(c)
+        self.viewport().update()
+        if had:
+            self.selection_changed.emit()
+        self.setFocus()
+
+    _press_prev = None
+    _on_link = False
+
+    def mouseMoveEvent(self, e):
+        pos = e.position().toPoint()
+        if (e.buttons() & Qt.LeftButton) and self._press is not None and not self._on_link:
+            if not self._drag and (pos - self._press).manhattanLength() < 4:
+                return
+            self._drag = True
+            self._last_pos = pos
+            self._b = self._to_doc(pos)
+            self.viewport().update()
+            vh = self.viewport().height()
+            if pos.y() < 8 or pos.y() > vh - 8:
+                if not self._auto.isActive():
+                    self._auto.start()
+            else:
+                self._auto.stop()
+            self.selection_changed.emit()
+            return
+        super().mouseMoveEvent(e)
+
+    def _auto_scroll(self):
+        if self._last_pos is None:
+            self._auto.stop()
+            return
+        vh = self.viewport().height()
+        y = self._last_pos.y()
+        sb = self.verticalScrollBar()
+        if y < 8:
+            sb.setValue(sb.value() - max(4, min(40, (8 - y) // 2 + 4)))
+        elif y > vh - 8:
+            sb.setValue(sb.value() + max(4, min(40, (y - (vh - 8)) // 2 + 4)))
+        else:
+            self._auto.stop()
+            return
+        self._b = self._to_doc(self._last_pos)
+        self.viewport().update()
+        self.selection_changed.emit()
+
+    def mouseReleaseEvent(self, e):
+        self._auto.stop()
+        if self._on_link:
+            self._on_link = False
+            return super().mouseReleaseEvent(e)
+        self._press = None
+        if not self._drag and self._clicks == 1:
+            self._a = self._b = None
+            self.viewport().update()
+            self.selection_changed.emit()
+        self._drag = False
+
+    def keyPressEvent(self, e):
+        if e.matches(QKeySequence.Copy):
+            self.copy()
+            return
+        if e.matches(QKeySequence.SelectAll):
+            self._a = self._b = None
+            super().keyPressEvent(e)
+            self.viewport().update()
+            self.selection_changed.emit()
+            return
+        super().keyPressEvent(e)
+
+    def contextMenuEvent(self, e):
+        m = QMenu(self)
+        a1 = m.addAction("نسخ")
+        a1.setEnabled(self.has_selection())
+        a1.triggered.connect(self.copy)
+        a2 = m.addAction("تحديد الكل")
+        a2.triggered.connect(lambda: (setattr(self, "_a", None), self.selectAll(), self.viewport().update(), self.selection_changed.emit()))
+        m.exec(e.globalPos())
+
+
+class BrowserPanel(QWidget):
+    """The built-in browser: tabs, back/forward/reload, address bar with progress, saved logins (own profile),
+    downloads that ask first, and one 🤖 tab that the agent drives. It keeps working while the panel is hidden."""
+
+    agent_loaded = Signal(bool)
+
+    def __init__(self, parent, data_dir):
+        super().__init__(parent)
+        from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+        from PySide6.QtWidgets import QProgressBar, QTabWidget
+        self._View, self._PageBase = QWebEngineView, QWebEnginePage
+        self._Settings = QWebEngineSettings
+        panel = self
+
+        class Page(QWebEnginePage):
+            def createWindow(self, _type):
+                return panel.new_tab(None).page()
+
+        self._Page = Page
+        pdir = os.path.join(data_dir, "browser")
+        try:
+            os.makedirs(pdir, exist_ok=True)
+        except OSError:
+            pass
+        self.profile = QWebEngineProfile("5belan", self)
+        try:
+            self.profile.setPersistentStoragePath(os.path.join(pdir, "profile"))
+            self.profile.setCachePath(os.path.join(pdir, "cache"))
+            self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+        except Exception:
+            pass
+        self.profile.downloadRequested.connect(self._download)
+        self.agent_view = None
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        nav = QHBoxLayout()
+        nav.setContentsMargins(6, 6, 6, 4)
+        nav.setSpacing(4)
+        self.b_back = self._navbtn("◀", "رجوع", lambda: self._cur() and self._cur().back())
+        self.b_fwd = self._navbtn("▶", "للأمام", lambda: self._cur() and self._cur().forward())
+        self.b_reload = self._navbtn("⟳", "تحديث / إيقاف", self._reload)
+        self.url_edit = QLineEdit()
+        self.url_edit.setLayoutDirection(Qt.LeftToRight)
+        self.url_edit.setPlaceholderText("اكتب رابط أو كلمة بحث…")
+        self.url_edit.returnPressed.connect(self._go)
+        self.b_new = self._navbtn("+", "تبويب جديد", lambda: self.new_tab("https://www.google.com", focus=True))
+        self.b_ext = self._navbtn("↗", "افتح الصفحة في متصفحك العادي", self._external)
+        self.b_hide = self._navbtn("✕", "إخفاء اللوحة (المتصفح يظل يشتغل بالخلفية)", lambda: self.hide_requested.emit())
+        for w in (self.b_back, self.b_fwd, self.b_reload):
+            nav.addWidget(w)
+        nav.addWidget(self.url_edit, 1)
+        for w in (self.b_new, self.b_ext, self.b_hide):
+            nav.addWidget(w)
+        v.addLayout(nav)
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(3)
+        self.progress.setRange(0, 100)
+        self.progress.setStyleSheet("QProgressBar{border:none;background:transparent;} QProgressBar::chunk{background:#d97757;}")
+        self.progress.hide()
+        v.addWidget(self.progress)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.currentChanged.connect(self._tab_changed)
+        v.addWidget(self.tabs, 1)
+        QShortcut(QKeySequence("Ctrl+L"), self, activated=lambda: (self.url_edit.setFocus(), self.url_edit.selectAll()))
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=lambda: self.new_tab("https://www.google.com", focus=True))
+        QShortcut(QKeySequence("Ctrl+W"), self, activated=lambda: self.close_tab(self.tabs.currentIndex()))
+        QShortcut(QKeySequence("F5"), self, activated=lambda: self._cur() and self._cur().reload())
+        self.new_tab("https://www.google.com", focus=True)
+
+    hide_requested = Signal()
+
+    def _navbtn(self, text, tip, fn):
+        b = QPushButton(text)
+        b.setToolTip(tip)
+        b.setFixedWidth(34)
+        b.setObjectName("flat")
+        b.clicked.connect(lambda _=False: fn())
+        return b
+
+    # ----- tabs
+    def _cur(self):
+        w = self.tabs.currentWidget()
+        return w if w is not None else None
+
+    def new_tab(self, url=None, focus=False, agent=False):
+        view = self._View()
+        page = self._Page(self.profile, view)
+        view.setPage(page)
+        try:
+            page.setLifecycleState(self._PageBase.LifecycleState.Active)  # keep running while the panel is hidden
+        except Exception:
+            pass
+        st = view.settings()
+        try:
+            st.setAttribute(self._Settings.WebAttribute.PluginsEnabled, True)
+            st.setAttribute(self._Settings.WebAttribute.FullScreenSupportEnabled, False)
+            st.setAttribute(self._Settings.WebAttribute.ScrollAnimatorEnabled, True)
+        except Exception:
+            pass
+        view._is_agent = agent
+        title = "🤖 " if agent else ""
+        idx = self.tabs.addTab(view, title + "جديد")
+        view.titleChanged.connect(lambda t, vw=view: self._set_title(vw, t))
+        view.urlChanged.connect(lambda u, vw=view: self._url_changed(vw, u))
+        view.loadStarted.connect(lambda vw=view: self._load_state(vw, True))
+        view.loadProgress.connect(lambda p, vw=view: self._progress(vw, p))
+        view.loadFinished.connect(lambda ok, vw=view: self._finished(vw, ok))
+        if url:
+            view.setUrl(QUrl(url))
+        if focus:
+            self.tabs.setCurrentIndex(idx)
+        return view
+
+    def _set_title(self, view, t):
+        i = self.tabs.indexOf(view)
+        if i >= 0:
+            t = (t or "جديد").strip()
+            t = t if len(t) <= 22 else t[:21] + "…"
+            self.tabs.setTabText(i, ("🤖 " if getattr(view, "_is_agent", False) else "") + t)
+            self.tabs.setTabToolTip(i, view.url().toString())
+
+    def close_tab(self, i):
+        if i < 0:
+            return
+        w = self.tabs.widget(i)
+        if w is self.agent_view:
+            self.agent_view = None
+        self.tabs.removeTab(i)
+        if w is not None:
+            w.setParent(None)
+            w.deleteLater()
+        if self.tabs.count() == 0:
+            self.new_tab("https://www.google.com", focus=True)
+
+    def _tab_changed(self, i):
+        w = self.tabs.widget(i)
+        if w is not None:
+            self.url_edit.setText(w.url().toString())
+            self._load_state(w, getattr(w, "_loading", False), only_ui=True)
+
+    # ----- state
+    def _url_changed(self, view, u):
+        if view is self._cur():
+            self.url_edit.setText(u.toString())
+
+    def _load_state(self, view, loading, only_ui=False):
+        if not only_ui:
+            view._loading = loading
+        if view is self._cur():
+            self.b_reload.setText("✕" if loading else "⟳")
+            self.progress.setVisible(bool(loading))
+
+    def _progress(self, view, p):
+        if view is self._cur():
+            self.progress.setValue(p)
+
+    def _finished(self, view, ok):
+        view._loading = False
+        self._load_state(view, False)
+        if view is self.agent_view:
+            self.agent_loaded.emit(bool(ok))
+
+    def _reload(self):
+        w = self._cur()
+        if w is None:
+            return
+        if getattr(w, "_loading", False):
+            w.stop()
+        else:
+            w.reload()
+
+    def _go(self):
+        w = self._cur()
+        if w is not None:
+            w.load(QUrl(to_url(self.url_edit.text())))
+            w.setFocus()
+
+    def _external(self):
+        w = self._cur()
+        if w is not None and w.url().isValid():
+            try:
+                import webbrowser
+                webbrowser.open(w.url().toString())
+            except Exception:
+                pass
+
+    def _download(self, item):
+        try:
+            from PySide6.QtCore import QStandardPaths
+            name = item.downloadFileName() or "file"
+            ans = QMessageBox.question(self, "تنزيل ملف", "تنزيل هذا الملف؟\n\n%s\n\nمن: %s" % (name, item.url().host()))
+            if ans != QMessageBox.StandardButton.Yes:
+                item.cancel()
+                return
+            d = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or os.path.expanduser("~")
+            item.setDownloadDirectory(d)
+            item.accept()
+            item.isFinishedChanged.connect(lambda it=item: QMessageBox.information(self, "تنزيل", "تم التنزيل في:\n%s" % os.path.join(it.downloadDirectory(), it.downloadFileName())) if it.isFinished() else None)
+        except Exception:
+            try:
+                item.cancel()
+            except Exception:
+                pass
+
+    def shutdown(self):
+        """Delete the pages before the profile so Qt exits cleanly."""
+        try:
+            while self.tabs.count():
+                w = self.tabs.widget(0)
+                self.tabs.removeTab(0)
+                try:
+                    w.page().deleteLater()
+                except Exception:
+                    pass
+                w.deleteLater()
+            QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        except Exception:
+            pass
+
+    # ----- agent tab (works even when the panel is hidden)
+    def agent_page(self):
+        if self.agent_view is None:
+            self.agent_view = self.new_tab(None, agent=True)
+        return self.agent_view.page()
+
+    def agent_open(self, url):
+        page = self.agent_page()
+        self.tabs.setCurrentWidget(self.agent_view)
+        self.agent_view.load(QUrl(url))
+        return page
+
+    def agent_back(self):
+        self.agent_page()
+        self.agent_view.back()
+
+
+def to_url(target):
+    target = (target or "").strip()
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", target):
+        return target
+    if "." in target and " " not in target:
+        return "https://" + target
+    return "https://www.google.com/search?q=" + urllib.parse.quote(target)
 
 
 class FilePreviewDialog(QDialog):
@@ -2965,6 +3540,8 @@ def make_qss(c):
     QMainWindow, QDialog { background: %(bg)s; }
     QTextBrowser { background: %(bg)s; border: none; }
     QWidget#side, QWidget#filespanel { background: %(side)s; }
+    QToolButton#quotechip { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 9px; padding: 3px 9px; color: %(text)s; }
+    QToolButton#quotechip:hover { border-color: %(accent)s; }
     QFrame#quotecard { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 10px; }
     QFrame#quotecard QLabel, QFrame#quotecard QToolButton { background: transparent; }
     QFrame#quotecard QLineEdit { background: %(input)s; }
@@ -3180,10 +3757,6 @@ class App(QMainWindow):
         self.reply_btn.clicked.connect(self.add_quote_from_selection)
         self.reply_btn.setVisible(False)
         hl.addWidget(self.reply_btn)
-        self.copylast_btn = QPushButton("⧉ نسخ آخر رد")
-        self.copylast_btn.setObjectName("flat")
-        self.copylast_btn.clicked.connect(self.copy_last)
-        hl.addWidget(self.copylast_btn)
         self.files_btn = QPushButton("📁 الملفات")
         self.files_btn.setCheckable(True)
         self.files_btn.toggled.connect(self.toggle_files_panel)
@@ -3208,6 +3781,7 @@ class App(QMainWindow):
         self.view.setFont(QFont(FONT["family"], TEXT_FONT_SIZE))
         self.view.document().setDefaultTextOption(auto_direction_option())
         self.view.selectionChanged.connect(self.on_selection)
+        self.view.selection_changed.connect(self.on_selection)
         ml.addWidget(self.view, 1)
 
         # files / charts created by the last reply (cards with preview + save)
@@ -3228,7 +3802,7 @@ class App(QMainWindow):
         cl.setContentsMargins(12, 8, 12, 8)
         cl.setSpacing(4)
         self.quotes_box = QWidget()
-        self.quotes_layout = QVBoxLayout(self.quotes_box)
+        self.quotes_layout = QHBoxLayout(self.quotes_box)
         self.quotes_layout.setContentsMargins(0, 0, 0, 0)
         self.quotes_layout.setSpacing(6)
         self.quotes_box.setVisible(False)
@@ -3338,14 +3912,13 @@ class App(QMainWindow):
     # ---------- reply to a part of a message ----------
     def on_selection(self):
         try:
-            t = strip_bidi(self.view.textCursor().selectedText()).strip()
+            t = self.view.selected_text().strip()
         except Exception:
             t = ""
         self.reply_btn.setVisible(bool(t))
 
     def add_quote_from_selection(self):
-        cur = self.view.textCursor()
-        sel = strip_bidi(cur.selectedText()).replace(" ", "\n").replace(" ", "\n").strip()
+        sel = self.view.selected_text().strip()
         if not sel:
             self.statusBar().showMessage("حدّد جزء من الكلام بالماوس أول", 2500)
             return
@@ -3353,43 +3926,69 @@ class App(QMainWindow):
             sel = sel[:1500] + "…"
         if not any(q["q"] == sel for q in self.quotes):
             self.quotes.append({"q": sel, "c": ""})
-        cur.clearSelection()
-        self.view.setTextCursor(cur)
+        self.view.clear_selection()
         self.refresh_quotes()
         self.inp.setFocus()
 
     def refresh_quotes(self):
+        """Each quoted part is a small chip above the input; hover shows it, click opens a mini card with the comment box."""
         while self.quotes_layout.count():
             it = self.quotes_layout.takeAt(0)
             w = it.widget()
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
-        for q in self.quotes:
-            card = QFrame()
-            card.setObjectName("quotecard")
-            h = QHBoxLayout(card)
-            h.setContentsMargins(10, 6, 6, 6)
-            v = QVBoxLayout()
-            v.setSpacing(4)
-            t = q["q"].replace("\n", " ")
-            lab = QLabel("↩  " + bidi_fix(t if len(t) <= 220 else t[:217] + "…"))
-            lab.setWordWrap(True)
-            lab.setObjectName("chip")
-            ed = QLineEdit(q["c"])
-            ed.setPlaceholderText("ردّك على هذا الجزء (اختياري)…")
-            ed.textChanged.connect(lambda txt, qq=q: qq.__setitem__("c", txt))
-            ed.returnPressed.connect(self.send)
-            v.addWidget(lab)
-            v.addWidget(ed)
-            h.addLayout(v, 1)
-            x = QToolButton()
-            x.setText("✕")
-            x.setObjectName("flat")
-            x.clicked.connect(lambda _=False, qq=q: self.remove_quote(qq))
-            h.addWidget(x, 0, Qt.AlignTop)
-            self.quotes_layout.addWidget(card)
+        for i, q in enumerate(self.quotes, 1):
+            t = q["q"].replace("\n", " ").strip()
+            short = t if len(t) <= 22 else t[:21] + "…"
+            chip = QToolButton()
+            chip.setObjectName("quotechip")
+            chip.setCursor(Qt.PointingHandCursor)
+            chip.setText("❝ %d  %s%s" % (i, bidi_fix(short), "  ✎" if q.get("c", "").strip() else ""))
+            tip = t if len(t) <= 500 else t[:497] + "…"
+            if q.get("c", "").strip():
+                tip += "\n\n← " + q["c"].strip()
+            chip.setToolTip(bidi_fix(tip) + "\n\n(اضغط للتفاصيل والتعليق)")
+            chip.clicked.connect(lambda _=False, qq=q, b=chip: self.show_quote_card(qq, b))
+            self.quotes_layout.addWidget(chip)
+        self.quotes_layout.addStretch(1)
         self.quotes_box.setVisible(bool(self.quotes))
+
+    def show_quote_card(self, q, anchor):
+        card = QFrame(self, Qt.Popup)
+        card.setObjectName("quotecard")
+        card.setAttribute(Qt.WA_DeleteOnClose)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(12, 10, 12, 10)
+        v.setSpacing(8)
+        head = QLabel("الجزء اللي تردّ عليه")
+        head.setObjectName("chip")
+        v.addWidget(head)
+        txt = q["q"] if len(q["q"]) <= 700 else q["q"][:697] + "…"
+        body = QLabel(bidi_fix(txt))
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        body.setMaximumWidth(380)
+        v.addWidget(body)
+        ed = QLineEdit(q.get("c", ""))
+        ed.setPlaceholderText("ردّك على هذا الجزء (اختياري)…")
+        ed.textChanged.connect(lambda t_, qq=q: qq.__setitem__("c", t_))
+        v.addWidget(ed)
+        row = QHBoxLayout()
+        done = QPushButton("تم")
+        done.clicked.connect(card.close)
+        rm = QPushButton("🗑 حذف الاقتباس")
+        rm.clicked.connect(lambda: (card.close(), self.remove_quote(q)))
+        row.addWidget(done)
+        row.addStretch(1)
+        row.addWidget(rm)
+        v.addLayout(row)
+        card.destroyed.connect(lambda *_: self.refresh_quotes())
+        card.adjustSize()
+        g = anchor.mapToGlobal(anchor.rect().topLeft())
+        card.move(g.x(), max(0, g.y() - card.height() - 6))
+        card.show()
+        ed.setFocus()
 
     def remove_quote(self, q):
         if q in self.quotes:
@@ -3441,7 +4040,7 @@ class App(QMainWindow):
         cur = self.splitter.sizes()
         side = cur[0] if cur and cur[0] > 150 else 260
         fp = 300 if not self.files_panel.isHidden() else 0
-        br = 380 if (self.browser_container is not None and not self.browser_container.isHidden()) else 0
+        br = 460 if (self.browser_container is not None and not self.browser_container.isHidden()) else 0
         sizes = [side, max(320, total - side - fp - br), fp]
         if self.browser_container is not None:
             sizes.append(br)
@@ -3646,13 +4245,11 @@ class App(QMainWindow):
             self.think_box.setCurrentText(s["thinking"])
             if self.browser_enabled and not self.web_ok:
                 self.browser_enabled = bool(self.ensure_browser(silent=True))
+            vis = bool(self.browser_container is not None and not self.browser_container.isHidden())
             self.browser_btn.blockSignals(True)
-            self.browser_btn.setChecked(self.browser_enabled and self.web_ok)
+            self.browser_btn.setChecked(vis)
             self.browser_btn.blockSignals(False)
-            if self.browser_container is not None:
-                vis = self.browser_enabled and self.web_ok
-                self.browser_container.setVisible(vis)
-                self.relayout()
+            self.relayout()
             self.update_tools_status()
         finally:
             self._applying = False
@@ -3838,32 +4435,54 @@ class App(QMainWindow):
         m.exec(self.listw.mapToGlobal(pos))
 
     def add_user_bubble(self, text, names, quotes=None):
+        """My message: a shaded card with an accent edge and a small "أنت" label, so it stands apart from the reply."""
         col = THEMES[self.theme]
-        bf = QTextBlockFormat()
-        bf.setBackground(QColor(col["bubble"]))
-        bf.setLeftMargin(14)
-        bf.setRightMargin(14)
-        bf.setTopMargin(12)
-        bf.setBottomMargin(2)
         c = self._end_cursor()
-        if self.view.document().isEmpty():
-            c.setBlockFormat(bf)
-        else:
-            c.insertBlock(bf, QTextCharFormat())
-        first = True
+        if not self.view.document().isEmpty():
+            gap = QTextBlockFormat()
+            gap.setTopMargin(8)
+            c.insertBlock(gap, QTextCharFormat())
+        tf = QTextTableFormat()
+        tf.setBorder(0)
+        tf.setCellPadding(10)
+        tf.setCellSpacing(0)
+        tf.setMargin(2)
+        tf.setWidth(QTextLength(QTextLength.PercentageLength, 100))
+        table = c.insertTable(1, 1, tf)
+        cell = table.cellAt(0, 0)
+        cf = cell.format().toTableCellFormat()
+        cf.setBackground(QColor(col["bubble"]))
+        cf.setRightBorder(3)
+        cf.setRightBorderBrush(QColor(col["accent"]))
+        cf.setRightBorderStyle(QTextFrameFormat.BorderStyle_Solid)
+        cell.setFormat(cf)
+        cc = cell.firstCursorPosition()
+        who = QTextCharFormat(self.fmt["dim"])
+        who.setFontWeight(QFont.Weight.Bold)
+        fn = who.font()
+        fn.setPointSizeF(max(8, TEXT_FONT_SIZE - 3))
+        who.setFont(fn)
+        lb = QTextBlockFormat()
+        lb.setAlignment(Qt.AlignRight)
+        lb.setLayoutDirection(Qt.RightToLeft)
+        cc.setBlockFormat(lb)
+        cc.insertText("أنت", who)
+        cc.insertBlock(QTextBlockFormat(), QTextCharFormat())
+        firstline = True
         for q in quotes or []:
-            if not first:
-                c.insertText("\u2028", self.fmt["dim"])
-            first = False
             t = q.get("q", "").replace("\n", " ")
-            c.insertText(bidi_fix("↩ " + (t if len(t) <= 240 else t[:237] + "…")), self.fmt["dim"])
+            if not firstline:
+                cc.insertText("\u2028", self.fmt["dim"])
+            firstline = False
+            cc.insertText(bidi_fix("↩ " + (t if len(t) <= 240 else t[:237] + "…")), self.fmt["dim"])
             if q.get("c", "").strip():
-                c.insertText(bidi_fix("\u2028← " + q["c"].strip()), self.fmt["bot"])
+                cc.insertText(bidi_fix("\u2028← " + q["c"].strip()), self.fmt["bot"])
         if names:
-            c.insertText(("\u2028" if not first else "") + bidi_fix("مرفق: " + ", ".join(names)), self.fmt["file"])
-            first = False
+            cc.insertText(("\u2028" if not firstline else "") + bidi_fix("مرفق: " + ", ".join(names)), self.fmt["file"])
+            firstline = False
         if text:
-            c.insertText(("\u2028" if not first else "") + bidi_fix(text), self.fmt["bot"])
+            cc.insertText(("\u2028" if not firstline else "") + bidi_fix(text), self.fmt["bot"])
+        c = self._end_cursor()
         c.insertBlock(QTextBlockFormat(), QTextCharFormat())
 
     def preview_one(self, kind, name, body):
@@ -3916,78 +4535,59 @@ class App(QMainWindow):
             self.render_chat()
 
     # ---------- built-in browser ----------
-    def ensure_browser(self, silent=False):
+    def ensure_browser(self, silent=False, show=False):
+        """Create the browser panel once. It starts hidden; the agent can browse in it in the background."""
         if self.web_ok and self.web is not None:
             return True
         try:
-            from PySide6.QtWebEngineWidgets import QWebEngineView
+            import PySide6.QtWebEngineWidgets  # noqa: F401
         except Exception as e:
             if silent:
                 return False
             QMessageBox.information(
                 self, "المتصفح المدمج",
-                "المتصفح المدمج يحتاج حزمة إضافية (PySide6-WebEngine). شغّل run.bat مرة ليتم تثبيتها، "
-                "وتأكد من اتصال الإنترنت، ثم افتح البرنامج من جديد.\n\n(%s)" % e,
+                "المتصفح المدمج يحتاج حزمة إضافية (PySide6-WebEngine). شغّل هذا الأمر مرة:\\n"
+                "pip install PySide6-WebEngine\\nثم افتح البرنامج من جديد.\\n\\n(%s)" % e,
             )
             return False
         try:
-            cont = QWidget()
-            v = QVBoxLayout(cont)
-            v.setContentsMargins(0, 0, 0, 0)
-            nav = QHBoxLayout()
-            back = QPushButton("◀")
-            back.setFixedWidth(40)
-            back.clicked.connect(lambda: self.web and self.web.back())
-            self.url_edit = QLineEdit()
-            self.url_edit.setLayoutDirection(Qt.LeftToRight)
-            self.url_edit.setPlaceholderText("اكتب رابط أو كلمة بحث…")
-            self.url_edit.returnPressed.connect(self._nav_go)
-            go = QPushButton("اذهب")
-            go.clicked.connect(self._nav_go)
-            nav.addWidget(back)
-            nav.addWidget(self.url_edit, 1)
-            nav.addWidget(go)
-            v.addLayout(nav)
-            self.web = QWebEngineView()
-            self.web.urlChanged.connect(lambda u: self.url_edit.setText(u.toString()))
-            self.web.loadFinished.connect(self._on_load)
-            v.addWidget(self.web, 1)
-            self.browser_container = cont
-            self.splitter.addWidget(cont)
-            self.web.setUrl(QUrl("https://www.google.com"))
+            panel = BrowserPanel(self, DATA_DIR)
+            panel.hide_requested.connect(lambda: self.browser_btn.setChecked(False))
+            panel.agent_loaded.connect(self._on_load)
+            QApplication.instance().aboutToQuit.connect(panel.shutdown)
+            panel.setVisible(bool(show))
+            self.web = panel
+            self.browser_container = panel
+            self.splitter.addWidget(panel)
+            panel.setVisible(bool(show))
             self.web_ok = True
             return True
         except Exception as e:
             self.web = None
+            self.browser_container = None
             self.web_ok = False
             if not silent:
-                QMessageBox.information(self, "المتصفح المدمج", "تعذّر تشغيل المتصفح المدمج:\n%s" % e)
+                QMessageBox.information(self, "المتصفح المدمج", "تعذّر تشغيل المتصفح المدمج:\\n%s" % e)
             return False
 
     def toggle_browser(self, on):
+        """The button shows/hides the browser panel. Showing it also lets the model use the browser in this chat."""
         on = bool(on)
-        if on and not self.ensure_browser():
+        if on and not self.ensure_browser(show=True):
             self.browser_btn.blockSignals(True)
             self.browser_btn.setChecked(False)
             self.browser_btn.blockSignals(False)
             return
-        self.browser_enabled = on and self.web_ok
+        if on and not self.browser_enabled:
+            self.browser_enabled = True
         if self.browser_container is not None:
-            self.browser_container.setVisible(self.browser_enabled)
+            self.browser_container.setVisible(on)
             self.relayout()
+        self.update_settings_summary()
         self.store_settings()
 
     def _to_url(self, target):
-        target = (target or "").strip()
-        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", target):
-            return target
-        if "." in target and " " not in target:
-            return "https://" + target
-        return "https://www.google.com/search?q=" + urllib.parse.quote(target)
-
-    def _nav_go(self):
-        if self.web is not None:
-            self.web.load(QUrl(self._to_url(self.url_edit.text())))
+        return to_url(target)
 
     def browser_bridge(self, action, **kw):
         """Called from the worker thread; the browser op runs on the main thread."""
@@ -4007,7 +4607,7 @@ class App(QMainWindow):
     def _on_load(self, ok):
         slot = self._open_slot
         self._open_slot = None
-        if slot is None:
+        if slot is None or self.web is None:
             return
 
         def cb(r, s=slot, o=ok):
@@ -4022,7 +4622,7 @@ class App(QMainWindow):
                 self._resolve(s, "loaded (with errors): %s" % d.get("url", ""))
 
         try:
-            self.web.page().runJavaScript("JSON.stringify({title:document.title,url:location.href})", cb)
+            self.web.agent_page().runJavaScript("JSON.stringify({title:document.title,url:location.href})", cb)
         except Exception:
             self._resolve(slot, "opened")
 
@@ -4036,20 +4636,20 @@ class App(QMainWindow):
             return "Error: could not read the page"
         txt = (d.get("text") or "").strip()
         if len(txt) > 6000:
-            txt = txt[:6000] + "\n…[truncated]"
-        return "Title: %s\nURL: %s\n---\n%s" % (d.get("title", ""), d.get("url", ""), txt)
+            txt = txt[:6000] + "\\n…[truncated]"
+        return "Title: %s\\nURL: %s\\n---\\n%s" % (d.get("title", ""), d.get("url", ""), txt)
 
     def _do_browser(self, val):
         action, kw, slot = val
-        if not self.ensure_browser():
-            self._resolve(slot, "Error: the built-in browser is not available")
+        if not self.ensure_browser(silent=True):
+            self._resolve(slot, "Error: the built-in browser is not available (install PySide6-WebEngine)")
             return
         try:
-            page = self.web.page()
+            page = self.web.agent_page()
             if action == "open":
-                url = self._to_url(kw.get("target", ""))
+                url = to_url(kw.get("target", ""))
                 self._open_slot = slot
-                self.web.load(QUrl(url))
+                self.web.agent_open(url)
                 QTimer.singleShot(25000, lambda s=slot, u=url: self._resolve(s, "opened (load timed out): " + u))
             elif action == "read":
                 page.runJavaScript(BROWSER_READ_JS, lambda r, s=slot: self._resolve(s, self._fmt_read(r)))
@@ -4063,7 +4663,7 @@ class App(QMainWindow):
                       .replace("__S__", "true" if kw.get("submit") else "false"))
                 page.runJavaScript(js, lambda r, s=slot: self._resolve(s, str(r)))
             elif action == "back":
-                self.web.back()
+                self.web.agent_back()
                 QTimer.singleShot(1500, lambda s=slot: self._resolve(s, "went back (call browser_read to see the page)"))
             else:
                 self._resolve(slot, "Error: unknown browser action")
@@ -4293,16 +4893,16 @@ class App(QMainWindow):
                 f = QTextCharFormat()
                 f.setAnchor(True)
                 f.setAnchorHref("act:" + act_id)
-                f.setForeground(QColor("#8a8a8a"))
+                f.setForeground(QColor("#9a9a9a"))
                 f.setFontUnderline(False)
-                f.setFontWeight(QFont.Weight.Bold)
+                f.setFontWeight(QFont.Weight.Normal)
                 c.insertText(base + "  " + ("˅" if expanded else "‹"), f)
             if expanded and steps:
                 shown_steps = steps
                 if live and len(steps) > LIVE_DETAIL_STEPS:
                     hidden = len(steps) - LIVE_DETAIL_STEPS
                     shown_steps = [{"k": "note", "text": "... %d earlier steps hidden while it is running; the full list appears when it finishes" % hidden}] + steps[-LIVE_DETAIL_STEPS:]
-                self._render_details(c, shown_steps, act_id)
+                self._render_details(c, shown_steps, act_id, live)
                 c = self._end_cursor()
             c.insertBlock(QTextBlockFormat(), QTextCharFormat())
         for w in warns:
@@ -4312,31 +4912,42 @@ class App(QMainWindow):
             if not live:
                 self._insert_reply_copy(c, act_id, body)
 
-    def _render_details(self, c, steps, act_id="x"):
-        """The thinking outline in a bordered box: one row per main topic (title + chevron). Click a row to open it;
-        sub topics are nested inside, and every opened topic has a fold link at its end."""
+    def _render_details(self, c, steps, act_id="x", live=False):
+        """The thinking outline: a soft card with one row per topic. A coloured dot shows the outcome at a glance
+        (green = all fine, red = something failed, grey = only thoughts); click a row to open it."""
         tree = build_activity_tree(steps)
         opened = self.open_secs
+        col = THEMES[self.theme]
         small = max(8, TEXT_FONT_SIZE - 2)
-        line = QColor(128, 128, 128, 110)
+        line = QColor(128, 128, 128, 70)
+        rail = QColor(col["accent"])
+        rail.setAlpha(150)
+        tint = QColor(128, 128, 128, 22)
+        icons = {"read": "📄", "write": "✏️", "delete": "🗑", "shell": "⌨", "computer": "🖥", "browser": "🌐"}
 
         def sized(base, bold=False, delta=0):
             f = QTextCharFormat(base)
             fn = f.font()
             fn.setPointSizeF(max(8, small + delta))
             f.setFont(fn)
-            if bold:
-                f.setFontWeight(QFont.Weight.Bold)
+            f.setFontWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
             return f
 
-        head_fmts = [sized(self.fmt["head"], False, 1), sized(self.fmt["head"], True, 0), sized(self.fmt["head"], False, 0)]
+        title_fs = [sized(self.fmt["bot"], False, 1), sized(self.fmt["bot"], True, 0), sized(self.fmt["dim"], False, 0)]
         think_f = sized(self.fmt["think"])
         bot_f = sized(self.fmt["bot"])
         err_f = sized(self.fmt["err"])
         dim_f = sized(self.fmt["dim"])
+        ok_c, bad_c, idle_c = QColor("#4caf7d"), QColor("#e5534b"), QColor(128, 128, 128)
 
-        def ops_of(n):
-            return sum(1 for it in n["items"] if it.get("k") == "tool") + sum(ops_of(s) for s in n["subs"])
+        def stats(n):
+            ops = sum(1 for it in n["items"] if it.get("k") == "tool")
+            bad = sum(1 for it in n["items"] if it.get("k") == "tool" and not it.get("ok", True))
+            for s_ in n["subs"]:
+                o2, b2 = stats(s_)
+                ops += o2
+                bad += b2
+            return ops, bad
 
         def blk(depth, top=2):
             b = QTextBlockFormat()
@@ -4351,35 +4962,55 @@ class App(QMainWindow):
             if first:
                 cc.setBlockFormat(blk(depth, 0))
             else:
-                cc.insertBlock(blk(depth, 4), QTextCharFormat())
-            link = QTextCharFormat(head_fmts[min(depth, 2)])
+                cc.insertBlock(blk(depth, 6), QTextCharFormat())
+            ops, bad = stats(node)
+            dot = QTextCharFormat(dim_f)
+            dot.setForeground(bad_c if bad else (ok_c if ops else idle_c))
+            cc.insertText("● ", dot)
+            link = QTextCharFormat(title_fs[min(depth, 2)])
             link.setAnchor(True)
             link.setAnchorHref("sec:" + sec_id)
-            ops = ops_of(node)
-            cc.insertText(bidi_fix(node["title"] or "عام") + ("  (%d)" % ops if ops else "") + "   " + ("˅" if is_open else "‹"), link)
+            cc.insertText(bidi_fix(node["title"] or "عام"), link)
+            meta = QTextCharFormat(dim_f)
+            meta.setAnchor(True)
+            meta.setAnchorHref("sec:" + sec_id)
+            tail = ("  ·  %d عمليات" % ops if ops > 1 else ("  ·  عملية" if ops == 1 else "")) + (("  ·  %d فشل" % bad) if bad else "")
+            cc.insertText(tail + "   " + ("˅" if is_open else "‹"), meta)
             if not is_open:
                 return
-            for s_ in node["items"]:
-                cc.insertBlock(blk(depth + 1, 3), QTextCharFormat())
+            items = node["items"]
+            cap = 1500 if live else DETAIL_TEXT_CAP
+            if len(items) > 25:
+                cc.insertBlock(blk(depth + 1, 4), QTextCharFormat())
+                cc.insertText("... %d earlier items hidden for speed" % (len(items) - 25), dim_f)
+                items = items[-25:]
+            for s_ in items:
+                cc.insertBlock(blk(depth + 1, 4), QTextCharFormat())
                 txt = bidi_fix(str(s_.get("text", "")).strip())
-                if len(txt) > DETAIL_TEXT_CAP:
-                    txt = txt[:DETAIL_TEXT_CAP] + "\n[... shortened for speed]"
+                if len(txt) > cap:
+                    txt = txt[:cap] + "\n[... shortened for speed]"
                 kind = s_.get("k")
                 if kind == "think":
                     cc.insertText(txt, think_f)
                 elif kind == "tool":
+                    key = TOOL_GROUPS.get(s_.get("name"), ("other", ""))[0]
+                    ic = icons.get(key, "•") + " "
+                    txt = _cut(txt, 220)
                     if s_.get("ok", True):
-                        cc.insertText("✓ " + txt, bot_f)
+                        mark = QTextCharFormat(bot_f)
+                        mark.setForeground(ok_c)
+                        cc.insertText("✓ ", mark)
+                        cc.insertText(ic + txt, bot_f)
                     else:
                         err = str(s_.get("err", "")).strip()
                         if err.startswith("Error:"):
                             err = err[6:].strip()
-                        cc.insertText("✗ " + txt + (" — " + err if err else ""), err_f)
+                        cc.insertText("✗ " + ic + txt + (" — " + _cut(err, 160) if err else ""), err_f)
                 else:
                     cc.insertText(txt, dim_f)
             for i, sub in enumerate(node["subs"], 1):
                 fill(cc, sub, "%s.%d" % (path, i), depth + 1, False)
-            cc.insertBlock(blk(depth + 1, 4), QTextCharFormat())
+            cc.insertBlock(blk(depth + 1, 5), QTextCharFormat())
             fold = QTextCharFormat(dim_f)
             fold.setAnchor(True)
             fold.setAnchorHref("sec:" + sec_id)
@@ -4387,15 +5018,24 @@ class App(QMainWindow):
 
         rows = len(tree) + 1
         tf = QTextTableFormat()
-        tf.setBorder(1)
-        tf.setBorderBrush(line)
-        tf.setBorderStyle(QTextFrameFormat.BorderStyle_Solid)
-        tf.setBorderCollapse(True)
-        tf.setCellPadding(8)
+        tf.setBorder(0)
+        tf.setCellPadding(9)
         tf.setCellSpacing(0)
         tf.setMargin(4)
         tf.setWidth(QTextLength(QTextLength.PercentageLength, 100))
         table = c.insertTable(rows, 1, tf)
+        for r in range(rows):
+            cell = table.cellAt(r, 0)
+            cf = cell.format().toTableCellFormat()
+            cf.setBackground(tint)
+            cf.setRightBorder(3)
+            cf.setRightBorderBrush(rail)
+            cf.setRightBorderStyle(QTextFrameFormat.BorderStyle_Solid)
+            if r > 0:
+                cf.setTopBorder(1)
+                cf.setTopBorderBrush(line)
+                cf.setTopBorderStyle(QTextFrameFormat.BorderStyle_Solid)
+            cell.setFormat(cf)
         for mi, m in enumerate(tree, 1):
             fill(table.cellAt(mi - 1, 0).firstCursorPosition(), m, str(mi), 0, True)
         cc = table.cellAt(rows - 1, 0).firstCursorPosition()
@@ -4907,6 +5547,7 @@ class App(QMainWindow):
         rounds = 0
         seen = {}
         net_retries = 0
+        ctx_retried = False
         wrap_up = ""
         try:
             while True:
@@ -4958,6 +5599,11 @@ class App(QMainWindow):
                         retried = True
                         use_tools = False
                         self.q.put(("warn", "هذي المحادثة قديمة وما تدعم ملفات الجهاز، فأرسلت الطلب بدونها. ابدأ محادثة جديدة لو تبيها."))
+                        continue
+                    if e.code == 400 and not ctx_retried and re.search(r"context|length|too long|maximum", detail, re.I):
+                        ctx_retried = True
+                        self.shrink_messages(messages)
+                        self.q.put(("warn", "المحادثة طويلة جداً، قصّرت النتائج القديمة وأعيد المحاولة..."))
                         continue
                     self.q.put(("err", "HTTP %s: %s" % (e.code, detail)))
                     return
@@ -5016,6 +5662,32 @@ class App(QMainWindow):
                     self.report_changes(runner)
         except Exception as e:
             self.q.put(("err", str(e)))
+
+    @staticmethod
+    def shrink_messages(messages):
+        """Emergency: the request was too big, so cut every old tool result and long assistant text hard."""
+        for m in messages[:-4]:
+            c = m.get("content")
+            if m.get("role") == "tool" and isinstance(c, str) and len(c) > 400:
+                m["content"] = c[:400] + "\n[shortened: conversation too long]"
+            elif m.get("role") == "assistant":
+                if isinstance(c, str) and len(c) > 3000:
+                    m["content"] = c[:3000] + "…"
+                rc = m.get("reasoning_content")
+                if isinstance(rc, str) and len(rc) > 1500:
+                    m["reasoning_content"] = rc[:1500]
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    ar = fn.get("arguments") or ""
+                    if len(ar) > 2000:
+                        try:
+                            d = json.loads(ar)
+                            for k, v in list(d.items()):
+                                if isinstance(v, str) and len(v) > 600:
+                                    d[k] = v[:600] + "…[shortened]"
+                            fn["arguments"] = json.dumps(d, ensure_ascii=False)
+                        except Exception:
+                            pass
 
     @staticmethod
     def trim_context(messages):
@@ -5123,7 +5795,7 @@ class App(QMainWindow):
                         box.setIcon(QMessageBox.Icon.Warning)
                         box.setText(title)
                         box.setInformativeText("خبيلان يبي ينفّذ هذي العملية على جهازك مباشرة. توافق؟")
-                        box.setDetailedText(detail or "")
+                        box.setDetailedText(_cut(detail or "", 20000))
                         box.setStandardButtons(YES | NO)
                         box.setDefaultButton(NO)
                         box.exec()
@@ -5320,8 +5992,14 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("5belan.chat.app")
         except Exception:
             pass
+    if hasattr(os, "geteuid") and os.geteuid() == 0 and "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox"  # Chromium refuses to start as root otherwise
     try:
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+    except Exception:
+        pass
+    try:
+        import PySide6.QtWebEngineWidgets  # noqa: F401  (must be imported before the QApplication exists)
     except Exception:
         pass
     migrate_user_data()
