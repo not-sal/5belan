@@ -3239,7 +3239,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.19.0"
+APP_VERSION = "2.19.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -3967,11 +3967,14 @@ class ChatView(QTextBrowser):
             return super().mouseReleaseEvent(e)
         self._press = None
         self._word = None if not self._drag else self._word
+        was_drag = self._drag
         if not self._drag and self._clicks == 1:
             self._a = self._b = None
             self.viewport().update()
             self.selection_changed.emit()
         self._drag = False
+        if was_drag:
+            self.selection_changed.emit()
 
     def keyPressEvent(self, e):
         if e.matches(QKeySequence.Copy):
@@ -7054,17 +7057,14 @@ class App(QMainWindow):
         self.files_bar.setVisible(False)
         ml.addWidget(self.files_bar)
 
-        self.reply_btn = QPushButton("رد على المحدد")
+        self.reply_btn = QPushButton("رد على المحدد", self.view.viewport())  # floats over the selected text
         self.reply_btn.setObjectName("banner")
-        self.reply_btn.setToolTip("حدّد جزء من رد خبيلان بالماوس ثم اضغط للرد عليه")
+        self.reply_btn.setToolTip("الرد على الجزء المحدد من رد خبيلان")
+        self.reply_btn.setFocusPolicy(Qt.NoFocus)
+        self.reply_btn.setCursor(Qt.PointingHandCursor)
         self.reply_btn.clicked.connect(self.add_quote_from_selection)
         self.reply_btn.setVisible(False)
-        rrow = QHBoxLayout()
-        rrow.setContentsMargins(0, 2, 0, 2)
-        rrow.addStretch(1)
-        rrow.addWidget(self.reply_btn)
-        rrow.addStretch(1)
-        ml.addLayout(rrow)
+        self.view.verticalScrollBar().valueChanged.connect(lambda _v: self.place_reply_btn())
 
         # ---------- composer (rounded box like the Claude app) ----------
         wrap = QWidget()
@@ -7106,7 +7106,7 @@ class App(QMainWindow):
         self.inp.setFont(QFont(FONT["family"], TEXT_FONT_SIZE))
         self.inp.setFixedHeight(46)
         self.inp.setLayoutDirection(Qt.RightToLeft)
-        self.inp.document().setDefaultTextOption(auto_direction_option())
+        self.inp.document().setDefaultTextOption(rtl_direction_option())  # typing always starts from the right
         self.inp.installEventFilter(self)
         self.inp.textChanged.connect(self.grow_input)
         self.inp.attach_requested.connect(self.add_attachments)
@@ -7256,7 +7256,51 @@ class App(QMainWindow):
             t = self.view.selected_text().strip()
         except Exception:
             t = ""
-        self.reply_btn.setVisible(bool(t) and self.selection_in_replies())
+        show = bool(t) and self.selection_in_replies() and not self.view._drag
+        self.reply_btn.setVisible(show)
+        if show:
+            self.place_reply_btn()
+
+    def place_reply_btn(self):
+        """Put the «reply to selection» button just above the first selected line (below the last one when there is no room)."""
+        b = self.reply_btn
+        if not b.isVisible():
+            return
+        v = self.view
+        vp = v.viewport()
+        dx, dy = v.horizontalScrollBar().value(), v.verticalScrollBar().value()
+        top = bot = lo = hi = None
+        try:
+            rows = v._ordered() if v.has_visual_selection() else []
+            for blk, tl, line, x0, x1 in rows:
+                y = v._origin(blk, tl).y() + line.rect().top() - dy
+                h = line.rect().height()
+                top = y if top is None else min(top, y)
+                bot = y + h if bot is None else max(bot, y + h)
+                lo = x0 - dx if lo is None else min(lo, x0 - dx)
+                hi = x1 - dx if hi is None else max(hi, x1 - dx)
+            if top is None:  # Qt's own selection (select all): use its cursor rectangle
+                c = v.textCursor()
+                c1, c2 = QTextCursor(c), QTextCursor(c)
+                c1.setPosition(c.selectionStart())
+                c2.setPosition(c.selectionEnd())
+                r1, r2 = v.cursorRect(c1), v.cursorRect(c2)
+                top, bot, lo, hi = r1.top(), r2.bottom(), min(r1.left(), r2.left()), max(r1.left(), r2.left())
+        except Exception:
+            top = None
+        if top is None:
+            b.setVisible(False)
+            return
+        b.adjustSize()
+        bw, bh = b.width(), b.height()
+        y = top - bh - 6
+        if y < 4:
+            y = bot + 6
+        y = max(4, min(y, vp.height() - bh - 4))
+        x = int((lo + hi) / 2 - bw / 2)
+        x = max(4, min(x, vp.width() - bw - 4))
+        b.move(x, int(y))
+        b.raise_()
 
     def add_quote_from_selection(self):
         sel = self.view.selected_text().strip()
@@ -8556,6 +8600,7 @@ class App(QMainWindow):
     def _do_place(self):
         self._place_pending = False
         self._place_boxes()
+        self.place_reply_btn()
 
     def _render_details_box(self, c, steps, act_id="x", live=False):
         """The thinking outline sits in its own scrollable box, so a long outline never pushes the answer far down."""
