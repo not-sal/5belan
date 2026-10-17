@@ -1,10 +1,10 @@
 {
-  "version": "2.17.1",
-  "notes": "New look: updated colors, rounded chat bubbles and code boxes, tools grouped in sidebar menus",
+  "version": "2.18.0",
+  "notes": "2.18.0: تقدر تتنقل بين المحادثات وخبيلان يكمل شغله في كل وحدة (أكثر من محادثة تشتغل مع بعض) + إصلاح التحديد فوق الكلام في رسائلك",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "07dc772b689a7f055c9d24f936746c37e1fc90b1bae372ccf21790730115cbd1"
+      "sha256": "9ae259b7d54fb25e3788e841afb2e3adcd3cd60ed0fa21b2d911c7060754fb43"
     },
     {
       "name": "guard.py",
