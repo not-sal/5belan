@@ -1,10 +1,10 @@
 {
-  "version": "2.17.0",
-  "notes": "2.17.0: المهارات (إضافة من ملف أو بحث في GitHub، تفعيلها لكل محادثة، واقتراح مهارة جديدة لما يتعلّم طريقة شغل) + زر خالد (وميض أخضر وأسود لما يخلص الرد وأنت بعيد عن الجهاز)",
+  "version": "2.17.1",
+  "notes": "New look: updated colors, rounded chat bubbles and code boxes, tools grouped in sidebar menus",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "8f96af3097d9a19614491fc72da1ae583d5f1f586fab6892138e793370dc559b"
+      "sha256": "07dc772b689a7f055c9d24f936746c37e1fc90b1bae372ccf21790730115cbd1"
     },
     {
       "name": "guard.py",

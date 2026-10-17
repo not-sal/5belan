@@ -2931,6 +2931,7 @@ from PySide6.QtGui import (
     QTextCharFormat,
     QTextCursor,
     QTextDocument,
+    QTextFormat,
     QTextFrameFormat,
     QTextImageFormat,
     QTextLength,
@@ -3237,7 +3238,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.17.0"
+APP_VERSION = "2.17.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -3738,7 +3739,80 @@ class ChatView(QTextBrowser):
             QApplication.clipboard().setText(t)
 
     # ----- painting
+    BOX_PROP = int(QTextFormat.UserProperty) + 21  # marks a table (1 = my message) or a block (2 = code) that gets a rounded box
+
+    def set_box_colors(self, bubble, code, border):
+        self.box_colors = {1: (QColor(bubble), QColor(border)), 2: (QColor(code), QColor(border))}
+        self.viewport().update()
+
+    def _paint_boxes(self):
+        cols = getattr(self, "box_colors", None)
+        if not cols:
+            return
+        doc = self.document()
+        lay = doc.documentLayout()
+        dx, dy = self.horizontalScrollBar().value(), self.verticalScrollBar().value()
+        vh = self.viewport().height()
+        x0 = doc.documentMargin()
+        x1 = doc.size().width() - x0
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.Antialiasing)
+
+        def box(r, kind):
+            fill, edge = cols[kind]
+            p.setBrush(fill)
+            p.setPen(QPen(edge, 1))
+            p.drawRoundedRect(r.translated(-dx, -dy), 12, 12)
+
+        try:
+            for fr in doc.rootFrame().childFrames():
+                fm = fr.frameFormat()
+                if not fm.hasProperty(self.BOX_PROP):
+                    continue
+                r = lay.frameBoundingRect(fr)
+                try:  # fit the box to the text inside (the frame itself carries extra empty space)
+                    cell = fr.cellAt(0, 0)
+                    b = cell.firstCursorPosition().block()
+                    last = cell.lastCursorPosition().block()
+                    top = lay.blockBoundingRect(b).top()
+                    bot = top
+                    while b.isValid():
+                        if b.text().strip():
+                            bot = lay.blockBoundingRect(b).bottom()
+                        if b == last:
+                            break
+                        b = b.next()
+                    if bot > top:
+                        r = QRectF(r.left(), top - 12, r.width(), bot - top + 24)
+                except Exception:
+                    pass
+                r = QRectF(x0 + 2, r.top(), x1 - x0 - 4, r.height())
+                if r.bottom() - dy < 0 or r.top() - dy > vh:
+                    continue
+                box(r, int(fm.property(self.BOX_PROP)))
+            blk = doc.findBlock(self.cursorForPosition(QPoint(0, 0)).position())
+            while blk.isValid() and blk.previous().isValid() and blk.previous().blockFormat().hasProperty(self.BOX_PROP):
+                blk = blk.previous()
+            grp = None
+            while blk.isValid():
+                br = lay.blockBoundingRect(blk)
+                if br.top() - dy > vh:
+                    break
+                bf = blk.blockFormat()
+                if bf.hasProperty(self.BOX_PROP):
+                    r = QRectF(x0 + 6, br.top() - 6, x1 - x0 - 12, br.height() + 12)
+                    grp = r if grp is None else grp.united(r)
+                elif grp is not None:
+                    box(grp, 2)
+                    grp = None
+                blk = blk.next()
+            if grp is not None:
+                box(grp, 2)
+        finally:
+            p.end()
+
     def paintEvent(self, e):
+        self._paint_boxes()
         super().paintEvent(e)
         if not self.has_visual_selection():
             return
@@ -4018,7 +4092,7 @@ class BrowserPanel(QWidget):
         self.progress.setTextVisible(False)
         self.progress.setFixedHeight(3)
         self.progress.setRange(0, 100)
-        self.progress.setStyleSheet("QProgressBar{border:none;background:transparent;} QProgressBar::chunk{background:#d97757;}")
+        self.progress.setStyleSheet("QProgressBar{border:none;background:transparent;} QProgressBar::chunk{background:#25936f;}")
         self.progress.hide()
         v.addWidget(self.progress)
         self.tabs = QTabWidget()
@@ -5332,7 +5406,7 @@ class BarChart(QWidget):
         n = max(1, len(self.items))
         bw = (w - 20) / n
         txt = self.palette().text().color()
-        acc = QColor("#d97757")
+        acc = QColor("#25936f")
         p.setPen(txt)
         for i, (lab, v) in enumerate(self.items):
             x = 10 + i * bw
@@ -6178,18 +6252,18 @@ def clean_reply(text):
 
 THEMES = {
     "dark": {
-        "bg": "#262624", "panel": "#30302e", "input": "#30302e", "text": "#faf9f5",
-        "dim": "#9c9a92", "think": "#a8a69e", "user": "#faf9f5", "bot": "#faf9f5",
-        "accent": "#d97757", "head": "#faf9f5", "err": "#ff7b72",
-        "code_bg": "#1f1e1d", "code_text": "#e8e6dc", "border": "#3e3e3a",
-        "side": "#1f1e1d", "bubble": "#3a3936", "hover": "#2b2a28",
+        "bg": "#16181b", "panel": "#1e2125", "input": "#1e2125", "text": "#eceef0",
+        "dim": "#959ca6", "think": "#a3aab3", "user": "#eceef0", "bot": "#eceef0",
+        "accent": "#25936f", "head": "#eceef0", "err": "#ff7b72",
+        "code_bg": "#1b1e22", "code_text": "#dfe3e8", "border": "#2a2f35",
+        "side": "#111316", "bubble": "#252a30", "hover": "#22262b",
     },
     "light": {
-        "bg": "#faf9f5", "panel": "#f0eee6", "input": "#ffffff", "text": "#141413",
-        "dim": "#6b6a64", "think": "#5e5d59", "user": "#141413", "bot": "#141413",
-        "accent": "#c96442", "head": "#141413", "err": "#b00020",
-        "code_bg": "#f0eee6", "code_text": "#141413", "border": "#e3dfd3",
-        "side": "#f0eee6", "bubble": "#ece9df", "hover": "#e8e5da",
+        "bg": "#f6f7f8", "panel": "#eceef0", "input": "#ffffff", "text": "#15181b",
+        "dim": "#5b636d", "think": "#4d555e", "user": "#15181b", "bot": "#15181b",
+        "accent": "#1b7f5f", "head": "#15181b", "err": "#b3261e",
+        "code_bg": "#eef0f2", "code_text": "#15181b", "border": "#dde1e5",
+        "side": "#eceef0", "bubble": "#e6e9ec", "hover": "#e1e5e8",
     },
 }
 
@@ -6218,15 +6292,39 @@ def check_icon_path():
         return ""
 
 
+def chevron_icon_path(color):
+    """A small down chevron in the given color for menu buttons (style sheets can only point at a file)."""
+    try:
+        d = os.path.join(DATA_DIR, "ui")
+        p = os.path.join(d, "chev_%s.png" % color.lstrip("#"))
+        if not os.path.exists(p):
+            os.makedirs(d, exist_ok=True)
+            img = QImage(16, 16, QImage.Format_ARGB32)
+            img.fill(Qt.transparent)
+            pt = QPainter(img)
+            pt.setRenderHint(QPainter.Antialiasing)
+            pen = QPen(QColor(color))
+            pen.setWidthF(1.8)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            pt.setPen(pen)
+            pt.drawPolyline([QPointF(4, 6), QPointF(8, 10), QPointF(12, 6)])
+            pt.end()
+            img.save(p, "PNG")
+        return p.replace("\\", "/")
+    except Exception:
+        return ""
+
+
 def make_qss(c):
-    c = dict(c, check=check_icon_path())
+    c = dict(c, check=check_icon_path(), chev=chevron_icon_path(c["dim"]))
     return """
     QWidget { background: %(bg)s; color: %(text)s; }
     QMainWindow, QDialog { background: %(bg)s; }
     QTextBrowser { background: %(bg)s; border: none; }
     QWidget#side, QWidget#filespanel { background: %(side)s; }
-    QToolButton#iconbtn { background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 4px 10px; }
-    QToolButton#iconbtn:hover { background: %(hover)s; }
+    QToolButton#iconbtn { background: %(panel)s; border: 1px solid %(border)s; border-radius: 15px; padding: 4px 14px; }
+    QToolButton#iconbtn:hover { background: %(hover)s; border-color: %(accent)s; }
     QToolButton#xbtn { background: transparent; border: none; border-radius: 11px; font-size: 16px; color: %(dim)s; padding: 0; }
     QToolButton#xbtn:hover { background: %(hover)s; color: %(text)s; }
     QWidget#dockhead { border-bottom: 1px solid %(border)s; }
@@ -6235,6 +6333,11 @@ def make_qss(c):
     QToolButton#toolbtn:hover { background: %(hover)s; }
     QToolButton#toolbtn:pressed { background: %(bubble)s; }
     QWidget#toolsbar { border-bottom: 1px solid %(border)s; }
+    QFrame#navbox { border: none; border-top: 1px solid %(border)s; background: transparent; }
+    QPushButton#navbtn { background: transparent; border: none; border-radius: 9px; padding: 4px 12px; color: %(text)s; text-align: left; }
+    QPushButton#navbtn:hover { background: %(hover)s; }
+    QPushButton#navbtn:pressed { background: %(bubble)s; }
+    QPushButton#navbtn::menu-indicator { image: url(%(chev)s); width: 16px; height: 16px; subcontrol-origin: padding; subcontrol-position: center right; right: 8px; }
     QToolButton#iconbtn:checked { background: %(bubble)s; border-color: %(accent)s; }
     QFrame#vsep { color: %(border)s; }
     QToolButton#quotechip { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 9px; padding: 3px 9px; color: %(text)s; }
@@ -6244,37 +6347,48 @@ def make_qss(c):
     QFrame#quotecard QLineEdit { background: %(input)s; }
     QScrollArea { background: transparent; border: none; }
     QWidget#side QLabel, QWidget#side QPushButton { background: transparent; }
-    QLabel#brand { font-size: 17px; font-weight: bold; color: %(text)s; padding: 6px 4px; }
+    QWidget#side QPushButton#primary { background: %(accent)s; color: white; border: none; border-radius: 12px; }
+    QWidget#side QToolButton#iconbtn { background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 4px 8px; }
+    QWidget#side QToolButton#iconbtn:hover { background: %(hover)s; }
+    QWidget#side QToolButton#iconbtn:checked { background: %(bubble)s; border-color: %(accent)s; }
+    QLabel#brand { font-size: 20px; font-weight: bold; color: %(accent)s; padding: 8px 6px 10px 6px; }
     QLabel#h2 { font-size: 14px; font-weight: bold; padding-top: 8px; }
     QLabel#chip { color: %(dim)s; }
     QListWidget#chats { background: transparent; border: none; padding: 0; }
-    QListWidget#chats::item { padding: 10px 10px; border: none; border-bottom: 1px solid %(border)s; border-radius: 0; color: %(text)s; }
+    QListWidget#chats::item { padding: 10px 12px; min-height: 28px; border: none; border-radius: 10px; margin: 1px 0; color: %(text)s; }
     QListWidget#chats::item:hover { background: %(hover)s; }
     QListWidget#chats::item:selected { background: %(bubble)s; color: %(text)s; border-right: 3px solid %(accent)s; }
     QPlainTextEdit { background: transparent; color: %(text)s; border: none; padding: 4px; }
-    QFrame#composer { background: %(input)s; border: 1px solid %(border)s; border-radius: 18px; }
+    QFrame#composer { background: %(input)s; border: 1px solid %(border)s; border-radius: 22px; }
     QFrame#composer QWidget { background: transparent; }
     QFrame#chipbox { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 10px; }
     QFrame#chipbox QLabel, QFrame#chipbox QToolButton { background: transparent; }
     QFrame#filecard { background: %(panel)s; border: 1px solid %(border)s; border-radius: 12px; }
     QFrame#filecard QLabel { background: transparent; }
     QLineEdit { background: %(input)s; color: %(text)s; border: 1px solid %(border)s;
-        border-radius: 8px; padding: 6px 8px; }
+        border-radius: 10px; padding: 7px 10px; selection-background-color: %(accent)s; selection-color: white; }
+    QLineEdit:focus { border: 1px solid %(accent)s; }
     QListWidget { background: %(panel)s; color: %(text)s; border: 1px solid %(border)s; border-radius: 10px; padding: 4px; }
     QListWidget::item { padding: 6px; border-radius: 6px; }
     QListWidget::item:selected { background: %(accent)s; color: white; }
     QToolTip { background: %(panel)s; color: %(text)s; border: 1px solid %(border)s; padding: 4px; }
     QPushButton { background: %(panel)s; color: %(text)s; border: 1px solid %(border)s;
-        border-radius: 9px; padding: 6px 12px; }
-    QPushButton:hover { border-color: %(accent)s; }
+        border-radius: 10px; padding: 7px 14px; }
+    QPushButton:hover { border-color: %(accent)s; background: %(hover)s; }
+    QPushButton:pressed { background: %(bubble)s; }
+    QPushButton:focus { border-color: %(accent)s; }
     QPushButton:checked { background: %(accent)s; color: white; border-color: %(accent)s; }
     QPushButton:disabled { color: %(dim)s; }
     QPushButton#primary { background: %(accent)s; color: white; border: none; font-weight: bold; }
+    QPushButton#primary:hover { background: %(accent)s; border: 2px solid %(text)s; padding: 5px 12px; }
     QPushButton#primary:disabled { background: %(border)s; color: %(dim)s; }
     QPushButton#flat, QToolButton#flat { background: transparent; border: none; color: %(dim)s; padding: 4px 8px; }
     QPushButton#flat:hover, QToolButton#flat:hover { color: %(text)s; background: %(hover)s; }
     QPushButton#send { background: %(accent)s; color: white; border: none; border-radius: 20px; font-size: 14px; font-weight: bold; padding: 0; }
     QPushButton#send:disabled { background: %(border)s; }
+    QFrame#composer QPushButton#send { background: %(accent)s; color: white; border-radius: 20px; }
+    QFrame#composer QPushButton#send:hover { background: %(accent)s; border: 2px solid %(text)s; }
+    QFrame#composer QPushButton#send:disabled { background: %(border)s; color: %(dim)s; }
     QToolButton#updbadge { background: #f28c28; color: white; border: none; border-radius: 12px; padding: 2px 12px; font-weight: bold; }
     QToolButton#updbadge:hover { background: #ff9f43; }
     QToolButton#updbadge:disabled { background: #c9873f; color: white; }
@@ -6294,12 +6408,13 @@ def make_qss(c):
     QRadioButton::indicator:checked { background: %(accent)s; border-color: %(accent)s; }
     QListWidget::indicator { width: 16px; height: 16px; border: 2px solid %(dim)s; border-radius: 4px; background: %(input)s; }
     QListWidget::indicator:checked { background: %(accent)s; border-color: %(accent)s; image: url(%(check)s); }
-    QMenu { background: %(panel)s; color: %(text)s; border: 1px solid %(border)s; padding: 4px; }
-    QMenu::item { padding: 6px 18px; border-radius: 6px; }
+    QMenu { background: %(panel)s; color: %(text)s; border: 1px solid %(border)s; border-radius: 10px; padding: 6px; }
+    QMenu::item { padding: 7px 20px; border-radius: 7px; }
+    QMenu::separator { height: 1px; background: %(border)s; margin: 4px 8px; }
     QMenu::item:selected { background: %(accent)s; color: white; }
     QTableWidget { background: %(panel)s; gridline-color: %(border)s; }
-    QScrollBar:vertical { background: transparent; width: 11px; margin: 2px; }
-    QScrollBar::handle:vertical { background: %(border)s; border-radius: 5px; min-height: 28px; }
+    QScrollBar:vertical { background: transparent; width: 12px; margin: 2px; }
+    QScrollBar::handle:vertical { background: %(border)s; border-radius: 4px; min-height: 32px; }
     QScrollBar::handle:vertical:hover { background: %(accent)s; }
     QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
     QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
@@ -6643,6 +6758,8 @@ class App(QMainWindow):
         brand.setObjectName("brand")
         sl.addWidget(brand)
         b_new = QPushButton("＋  محادثة جديدة")
+        b_new.setObjectName("primary")
+        b_new.setFixedHeight(40)
         b_new.clicked.connect(self.new_chat)
         b_new.setToolTip("Ctrl+N")
         sl.addWidget(b_new)
@@ -6682,26 +6799,12 @@ class App(QMainWindow):
         self.listw.setContextMenuPolicy(Qt.CustomContextMenu)
         self.listw.customContextMenuRequested.connect(self.chat_menu)
         sl.addWidget(self.listw, 1)
-        bottom = QHBoxLayout()
-        self.settings_btn = QToolButton()
-        self.settings_btn.setObjectName("iconbtn")
-        self.settings_btn.setText("إعدادات التطبيق")
-        self.settings_btn.setToolTip("إعدادات التطبيق (عامة لكل المحادثات): المفتاح، الثيم، عرض المحادثة، التحديثات")
-        self.settings_btn.setFixedHeight(34)
-        self.settings_btn.setCursor(Qt.PointingHandCursor)
-        self.settings_btn.clicked.connect(self.open_app_settings)
-        bottom.addWidget(self.settings_btn)
-        bottom.addStretch(1)
-        sl.addLayout(bottom)
-        # the tools now live in a bar at the top of the main area (built below, next to the header)
-        self.tools_bar = QWidget()
-        self.tools_bar.setObjectName("toolsbar")
-        tbl = QHBoxLayout(self.tools_bar)
-        tbl.setContentsMargins(12, 4, 12, 4)
-        tbl.setSpacing(2)
-        self.tools_bar.setLayoutDirection(Qt.RightToLeft)
-        tbl.addStretch(1)  # first in a right-to-left row = far right, so the buttons sit at the left edge
-        self.update_btn = QToolButton()  # orange badge next to "ذاكرة": shows when a new version is out
+        navbox = QFrame()
+        navbox.setObjectName("navbox")
+        nbl = QVBoxLayout(navbox)
+        nbl.setContentsMargins(0, 6, 0, 0)
+        nbl.setSpacing(2)
+        self.update_btn = QToolButton()  # orange badge: shows when a new version is out
         self.update_btn.setObjectName("updbadge")
         self.update_btn.setText("نزل تحديث")
         self.update_btn.setCursor(Qt.PointingHandCursor)
@@ -6709,31 +6812,46 @@ class App(QMainWindow):
         self.update_btn.setToolTip("نزل إصدار جديد من خبيلان")
         self.update_btn.clicked.connect(self.start_update)
         self.update_btn.setVisible(False)
-        tbl.addWidget(self.update_btn)
+        nbl.addWidget(self.update_btn)
         groups = (
-            (("ذاكرة", "ملاحظات عنك يقرأها خبيلان بكل محادثة", self.open_memory),
-             ("صرف", "كم صرفت: اليوم، الأسبوع، وأغلى المحادثات", self.open_usage)),
-            (("لوحة", "مساحة جانبية للكود والصفحات والمستندات مع معاينة مباشرة وتعديل بالطلب", self.open_canvas),
-             ("مهام", "مهام تشتغل لوحدها بجدول أو عند ظهور ملف جديد", self.open_tasks),
-             ("مهمة سريعة", "اكتب طلب واحد وشغّله الحين بالخلفية داخل هذي المحادثة وتكمل شغلك (بدون حفظ أو جدول)", self.new_bg_task),
-             ("سجل", "كل اللي سواه خبيلان على جهازك", self.open_activity)),
-            (("تليقرام", "اربط خبيلان ببوت تليقرام: إشعارات ومحادثة من جوالك", self.open_telegram),
-             ("مشكلة", "تقرير جاهز للنسخ لو صار خطأ", self.open_problem)))
-        for gi, grp in enumerate(groups):
-            if gi:
-                sp_ = QFrame()
-                sp_.setFrameShape(QFrame.VLine)
-                sp_.setObjectName("vsep")
-                tbl.addWidget(sp_)
-            for txt, tip, fn in grp:
-                b = QToolButton()
-                b.setObjectName("toolbtn")
-                b.setText(txt)
-                b.setToolTip(tip)
-                b.setCursor(Qt.PointingHandCursor)
-                b.setFixedHeight(28)
-                b.clicked.connect(fn)
-                tbl.addWidget(b)
+            ("الأدوات",
+             (("لوحة", "مساحة جانبية للكود والصفحات والمستندات مع معاينة مباشرة وتعديل بالطلب", self.open_canvas),
+              ("مهام", "مهام تشتغل لوحدها بجدول أو عند ظهور ملف جديد", self.open_tasks),
+              ("مهمة سريعة", "اكتب طلب واحد وشغّله الحين بالخلفية داخل هذي المحادثة وتكمل شغلك (بدون حفظ أو جدول)", self.new_bg_task),
+              ("سجل", "كل اللي سواه خبيلان على جهازك", self.open_activity))),
+            ("حسابي",
+             (("ذاكرة", "ملاحظات عنك يقرأها خبيلان بكل محادثة", self.open_memory),
+              ("صرف", "كم صرفت: اليوم، الأسبوع، وأغلى المحادثات", self.open_usage))),
+            ("الربط والدعم",
+             (("تليقرام", "اربط خبيلان ببوت تليقرام: إشعارات ومحادثة من جوالك", self.open_telegram),
+              ("مشكلة", "تقرير جاهز للنسخ لو صار خطأ", self.open_problem))))
+        self.nav_menus = []
+        for gtitle, items in groups:
+            gb = QPushButton(gtitle)
+            gb.setObjectName("navbtn")
+            gb.setCursor(Qt.PointingHandCursor)
+            gb.setFixedHeight(34)
+            gb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            gm = QMenu(gb)
+            gm.setLayoutDirection(Qt.RightToLeft)
+            for txt, tip, fn in items:
+                act = gm.addAction(txt)
+                act.setToolTip(tip)
+                act.setStatusTip(tip)
+                act.triggered.connect(lambda _c=False, f=fn: f())
+            gm.setToolTipsVisible(True)
+            gb.setMenu(gm)
+            self.nav_menus.append(gm)
+            nbl.addWidget(gb)
+        self.settings_btn = QPushButton("إعدادات التطبيق")
+        self.settings_btn.setObjectName("navbtn")
+        self.settings_btn.setToolTip("إعدادات التطبيق (عامة لكل المحادثات): المفتاح، الثيم، عرض المحادثة، التحديثات")
+        self.settings_btn.setFixedHeight(34)
+        self.settings_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.settings_btn.setCursor(Qt.PointingHandCursor)
+        self.settings_btn.clicked.connect(self.open_app_settings)
+        nbl.addWidget(self.settings_btn)
+        sl.addWidget(navbox)
         side.setMinimumWidth(230)
         side.setMaximumWidth(360)
         splitter.addWidget(side)
@@ -6750,7 +6868,6 @@ class App(QMainWindow):
         ml.setContentsMargins(0, 0, 0, 8)
         ml.setSpacing(0)
 
-        ml.addWidget(self.tools_bar)
         header = QWidget()
         header.setLayoutDirection(Qt.RightToLeft)  # title on the right, the buttons gather at the left edge
         hl = QHBoxLayout(header)
@@ -7654,18 +7771,13 @@ class App(QMainWindow):
             c.insertBlock(gap, QTextCharFormat())
         tf = QTextTableFormat()
         tf.setBorder(0)
-        tf.setCellPadding(10)
+        tf.setCellPadding(14)
         tf.setCellSpacing(0)
-        tf.setMargin(2)
+        tf.setMargin(6)
         tf.setWidth(QTextLength(QTextLength.PercentageLength, 100))
+        tf.setProperty(ChatView.BOX_PROP, 1)  # painted as a rounded box by ChatView
         table = c.insertTable(1, 1, tf)
         cell = table.cellAt(0, 0)
-        cf = cell.format().toTableCellFormat()
-        cf.setBackground(QColor(col["bubble"]))
-        cf.setRightBorder(3)
-        cf.setRightBorderBrush(QColor(col["accent"]))
-        cf.setRightBorderStyle(QTextFrameFormat.BorderStyle_Solid)
-        cell.setFormat(cf)
         cc = cell.firstCursorPosition()
         who = QTextCharFormat(self.fmt["dim"])
         who.setFontWeight(QFont.Weight.Bold)
@@ -7685,7 +7797,9 @@ class App(QMainWindow):
             ef.setFontWeight(QFont.Weight.Normal)
             cc.insertText("      ", who)
             cc.insertText("(معدّلة)", ef)
-        cc.insertBlock(QTextBlockFormat(), QTextCharFormat())
+        airy = QTextBlockFormat()
+        airy.setLineHeight(145, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+        cc.insertBlock(airy, QTextCharFormat())
         firstline = True
         for q in quotes or []:
             t = q.get("q", "").replace("\n", " ")
@@ -7748,6 +7862,7 @@ class App(QMainWindow):
         pal.setColor(QPalette.Highlight, QColor(c["accent"]))
         pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
         self.view.setPalette(pal)
+        self.view.set_box_colors(c["bubble"], c["code_bg"], c["border"])
         self._build_formats()
         if self.current:
             self.render_chat()
@@ -8183,7 +8298,7 @@ class App(QMainWindow):
     def append_bot_label(self):
         """The assistant's name, with its small picture in front when 5belan.png exists."""
         gap = QTextBlockFormat()
-        gap.setTopMargin(14)
+        gap.setTopMargin(20)
         self._end_cursor().insertBlock(gap, QTextCharFormat())
         if os.path.exists(ICON_PATH):
             img = QImage(ICON_PATH)
@@ -8202,7 +8317,7 @@ class App(QMainWindow):
         """Vertical space between messages (no hard line, like the Claude app)."""
         c = self._end_cursor()
         bf = QTextBlockFormat()
-        bf.setTopMargin(10)
+        bf.setTopMargin(16)
         c.insertBlock(bf, QTextCharFormat())
 
     @staticmethod
@@ -8464,16 +8579,16 @@ class App(QMainWindow):
         rows = len(tree) + 1
         tf = QTextTableFormat()
         tf.setBorder(0)
-        tf.setCellPadding(9)
+        tf.setCellPadding(11)
         tf.setCellSpacing(0)
-        tf.setMargin(4)
+        tf.setMargin(6)
         tf.setWidth(QTextLength(QTextLength.PercentageLength, 100))
         table = c.insertTable(rows, 1, tf)
         for r in range(rows):
             cell = table.cellAt(r, 0)
             cf = cell.format().toTableCellFormat()
             cf.setBackground(tint)
-            cf.setRightBorder(3)
+            cf.setRightBorder(2)
             cf.setRightBorderBrush(rail)
             cf.setRightBorderStyle(QTextFrameFormat.BorderStyle_Solid)
             if r > 0:
@@ -8490,6 +8605,13 @@ class App(QMainWindow):
         fold.setAnchorHref("act:" + act_id)
         cc.insertText("˄ طيّ التفكير كله", fold)
 
+    @staticmethod
+    def _airy(c):
+        """Looser line spacing for the text written next (new lines in it keep this block format)."""
+        bf = QTextBlockFormat()
+        bf.setLineHeight(150, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+        c.mergeBlockFormat(bf)
+
     def insert_rich_body(self, c, body, mid):
         """Insert a reply body, turning ``` fenced blocks into copyable command/code boxes."""
         pos = 0
@@ -8497,22 +8619,24 @@ class App(QMainWindow):
         for m in CODE_FENCE_RE.finditer(body):
             pre = body[pos:m.start()]
             if pre:
+                self._airy(c)
                 c.insertText(bidi_fix(pre), self.fmt["bot"])
             self._insert_code_block(c, m.group(2), (m.group(1) or "").strip(), "%sc%d" % (mid, idx))
             idx += 1
             pos = m.end()
         tail = body[pos:]
         if tail:
+            self._airy(c)
             c.insertText(bidi_fix(tail), self.fmt["bot"])
 
     def _insert_code_block(self, c, code, lang, cid):
         self.copy_store[cid] = code
         col = THEMES[self.theme]
         bf = QTextBlockFormat()
-        bf.setBackground(QColor(col["code_bg"]))
-        bf.setLeftMargin(10)
-        bf.setRightMargin(10)
-        bf.setTopMargin(4)
+        bf.setProperty(ChatView.BOX_PROP, 2)  # painted as a rounded box by ChatView
+        bf.setLeftMargin(22)
+        bf.setRightMargin(22)
+        bf.setTopMargin(14)
         bf.setBottomMargin(2)
         bf.setAlignment(Qt.AlignLeft)
         c.insertBlock(bf, QTextCharFormat())
@@ -8551,7 +8675,7 @@ class App(QMainWindow):
         cf.setFontFamilies(["Consolas", "DejaVu Sans Mono", "Courier New", "monospace"])
         bf2 = QTextBlockFormat(bf)
         bf2.setTopMargin(2)
-        bf2.setBottomMargin(6)
+        bf2.setBottomMargin(12)
         c.insertBlock(bf2, QTextCharFormat())
         c.insertText(code, cf)
         c.insertBlock(QTextBlockFormat(), QTextCharFormat())
@@ -11117,8 +11241,11 @@ def main():
     if os.path.exists(ICON_PATH):
         app.setWindowIcon(QIcon(ICON_PATH))
     app.setLayoutDirection(Qt.RightToLeft)
+    app.setStyle("Fusion")  # same look on Windows, Linux and macOS (native styles ignore parts of the style sheet)
     cfg = load_json(CONFIG_PATH, {})
     custom_font = cfg.get("font_family") if isinstance(cfg, dict) else None
+    if not IS_WIN:
+        FONT["family"] = "Helvetica Neue" if IS_MAC else "Noto Sans"  # Segoe UI exists only on Windows
     FONT["family"] = custom_font or pick_font_family() or FONT["family"]
     app.setFont(QFont(FONT["family"], UI_FONT_SIZE))
 
