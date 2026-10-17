@@ -3238,7 +3238,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.17.1"
+APP_VERSION = "2.18.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -3539,7 +3539,7 @@ class ChatView(QTextBrowser):
         tl = blk.layout()
         if tl is None or tl.lineCount() == 0:
             return None
-        origin = tl.position()
+        origin = self._origin(blk, tl)
         best, bd = 0, 1e18
         for i in range(tl.lineCount()):
             r = tl.lineAt(i).rect()
@@ -3559,6 +3559,12 @@ class ChatView(QTextBrowser):
             if ch.isalpha():
                 return False
         return False
+
+    def _origin(self, blk, tl):
+        """Where a block's text starts in the document. QTextLayout.position() is relative to the table cell the block sits in
+        (my message bubbles are tables), so use the document layout's absolute rectangle instead."""
+        br = self.document().documentLayout().blockBoundingRect(blk)
+        return br.topLeft() - tl.boundingRect().topLeft()
 
     @staticmethod
     def _line_extent(tl, line):
@@ -3591,7 +3597,7 @@ class ChatView(QTextBrowser):
             tl = blk.layout()
             if tl is not None and tl.lineCount():
                 rtl = self._is_rtl(blk.text())
-                ox = tl.position().x()
+                ox = self._origin(blk, tl).x()
                 first_i = la[2] if blk == la[0] else 0
                 last_i = lb[2] if blk == lb[0] else tl.lineCount() - 1
                 for i in range(first_i, last_i + 1):
@@ -3640,7 +3646,7 @@ class ChatView(QTextBrowser):
         txt = blk.text()
         if n <= 0:
             return None
-        ox = tl.position().x()
+        ox = self._origin(blk, tl).x()
         a = line.textStart()
         pos = line.xToCursor(pt.x() - ox, QTextLine.CursorOnCharacter)
         pos = max(a, min(pos, a + n - 1))
@@ -3659,7 +3665,7 @@ class ChatView(QTextBrowser):
         xs = line.cursorToX(s_)[0] + ox
         xe = line.cursorToX(e_)[0] + ox
         lo, hi = min(xs, xe), max(xs, xe)
-        y = tl.position().y() + line.rect().center().y()
+        y = self._origin(blk, tl).y() + line.rect().center().y()
         prtl = self._is_rtl(txt)
         return {"key": (blk.position(), i), "lo": lo, "hi": hi, "y": y,
                 "lead": hi if prtl else lo, "trail": lo if prtl else hi, "rtl": prtl}
@@ -3677,12 +3683,12 @@ class ChatView(QTextBrowser):
         if tl.lineCount() == 0:
             return
         rtl = self._is_rtl(blk.text())
-        ox = tl.position().x()
+        ox = self._origin(blk, tl).x()
         first, last = tl.lineAt(0), tl.lineAt(tl.lineCount() - 1)
         flo, fhi = self._line_extent(tl, first)
         llo, lhi = self._line_extent(tl, last)
-        y1 = tl.position().y() + first.rect().center().y()
-        y2 = tl.position().y() + last.rect().center().y()
+        y1 = self._origin(blk, tl).y() + first.rect().center().y()
+        y2 = self._origin(blk, tl).y() + last.rect().center().y()
         self._a = QPointF((fhi if rtl else flo) + ox, y1)
         self._b = QPointF((llo if rtl else lhi) + ox, y2)
         self._force = True
@@ -3693,7 +3699,7 @@ class ChatView(QTextBrowser):
             last_blk = None
             for blk, tl, line, x0, x1 in self._ordered():
                 txt = blk.text()
-                ox = tl.position().x()
+                ox = self._origin(blk, tl).x()
                 a = line.textStart()
                 chars = []
                 for i in range(a, a + line.textLength()):
@@ -3822,7 +3828,7 @@ class ChatView(QTextBrowser):
             vh = self.viewport().height()
             for blk, tl, line, x0, x1 in self._ordered():
                 r = line.rect()
-                top = tl.position().y() + r.top() - dy
+                top = self._origin(blk, tl).y() + r.top() - dy
                 if top > vh or top + r.height() < 0:
                     continue
                 p.fillRect(QRectF(x0 - dx, top, max(2.0, x1 - x0), r.height()), self.sel_color)
@@ -6664,9 +6670,101 @@ class DockFrame(QFrame):
         self.setMinimumWidth(300)
 
 
+class Run:
+    """One reply being produced for one chat. Several chats can have a Run at the same time."""
+
+    def __init__(self, chat):
+        self.chat = chat
+        self.stop_event = threading.Event()
+        self.live = None  # the reply that is being streamed right now
+        self.live_dirty = False
+        self.srcs = []
+        self.cut = False
+        self.finish_reason = ""
+        self.act_title = chat.get("title", "")
+        self.last_text = ""
+        self.last_quotes = []
+        self.queued = None
+        self.interrupt = None
+        self.tg_wait = None
+        self.last_ckpt = 0.0
+
+
 class App(QMainWindow):
+    _idle_stop = threading.Event()
+
+    # The window always shows ONE chat; these are the state of the reply running for that chat (None / False when it has none).
+    # Other chats can be running at the same time: they live in self.runs, keyed by chat id.
+    @property
+    def cur_run(self):
+        c = getattr(self, "current", None)
+        return self.runs.get(c["id"]) if c else None
+
+    @property
+    def busy(self):
+        return self.cur_run is not None
+
+    @busy.setter
+    def busy(self, v):
+        pass
+
+    @property
+    def live(self):
+        r = self.cur_run
+        return r.live if r else None
+
+    @live.setter
+    def live(self, v):
+        r = self.cur_run
+        if r:
+            r.live = v
+
+    @property
+    def live_dirty(self):
+        r = self.cur_run
+        return r.live_dirty if r else False
+
+    @live_dirty.setter
+    def live_dirty(self, v):
+        r = self.cur_run
+        if r:
+            r.live_dirty = v
+
+    @property
+    def stop_event(self):
+        r = self.cur_run
+        return r.stop_event if r else self._idle_stop
+
+    @stop_event.setter
+    def stop_event(self, v):
+        pass
+
+    @property
+    def _queued(self):
+        r = self.cur_run
+        return r.queued if r else None
+
+    @_queued.setter
+    def _queued(self, v):
+        r = self.cur_run
+        if r:
+            r.queued = v
+
+    @property
+    def _interrupt(self):
+        r = self.cur_run
+        return r.interrupt if r else None
+
+    @_interrupt.setter
+    def _interrupt(self, v):
+        r = self.cur_run
+        if r:
+            r.interrupt = v
+
     def __init__(self):
         super().__init__()
+        self.runs = {}  # chat id -> Run, for every chat that is answering right now
+        self._browser_owner = None  # the chat that may use the built-in browser (it is one shared window)
         self.setWindowTitle("5belan")
         if os.path.exists(ICON_PATH):
             self.setWindowIcon(QIcon(ICON_PATH))
@@ -7564,8 +7662,8 @@ class App(QMainWindow):
 
     def import_chats(self):
         """Merge the chats of another chats.json (an older install or a backup) into this one."""
-        if self.busy:
-            QMessageBox.information(self, "استيراد", "انتظر حتى ينتهي الرد الحالي.")
+        if self.runs:
+            QMessageBox.information(self, "استيراد", "انتظر حتى تنتهي الردود الشغالة.")
             return
         path, _ = QFileDialog.getOpenFileName(self, "اختر ملف chats.json", self.default_dir(), "chats (*.json);;كل الملفات (*.*)")
         if not path:
@@ -7657,8 +7755,8 @@ class App(QMainWindow):
         m = self.pending_update
         if not m:
             return
-        if self.busy:
-            QMessageBox.information(self, "التحديث", "انتظر حتى ينتهي الرد الحالي ثم حدّث.")
+        if self.runs:
+            QMessageBox.information(self, "التحديث", "انتظر حتى تنتهي الردود الشغالة ثم حدّث.")
             return
         notes = str(m.get("notes", "")).strip()
         msg = "يوجد إصدار جديد %s (أنت على %s).\n%s\n\nيتم تنزيل الملفات الجديدة فقط ثم يُعاد تشغيل البرنامج. محادثاتك وإعداداتك ما تتأثر.\nتحدّث الحين؟" % (
@@ -7726,12 +7824,27 @@ class App(QMainWindow):
             self.add_attachments(paths)
             e.acceptProposedAction()
 
-    def set_send_mode(self, mode):
+    def sync_run_ui(self):
+        """Show the state of the chat on screen: its Stop button and its waiting message."""
+        R = self.cur_run
+        if R is None:
+            self.set_send_mode("send", quiet=True)
+            self.queue_box.setVisible(False)
+            return
+        self.set_send_mode("stopping" if R.stop_event.is_set() else "stop", quiet=True)
+        pend = R.interrupt or R.queued
+        if pend:
+            self.show_queue("يوقّف الرد ويدمج رسالتك: " if R.interrupt else "بالانتظار (تنرسل بعد الرد): ", pend)
+        else:
+            self.queue_box.setVisible(False)
+
+    def set_send_mode(self, mode, quiet=False):
         if mode == "stop":
             self.btn.setEnabled(True)
             self.btn.setText("إيقاف")
             self.btn.setToolTip("إيقاف (أو اكتب رسالة ثانية واضغط Enter أو هذا الزر)")
-            self.statusBar().showMessage("تقدر تكتب رسالة ثانية الحين وتضغط Enter: ترسلها بعد الرد أو تدمجها معه", 7000)
+            if not quiet:
+                self.statusBar().showMessage("تقدر تكتب رسالة ثانية الحين وتضغط Enter: ترسلها بعد الرد أو تدمجها معه، أو تروح لمحادثة ثانية وتكمل معها", 7000)
         elif mode == "stopping":
             self.btn.setEnabled(False)
             self.btn.setText("جارٍ…")
@@ -7742,7 +7855,7 @@ class App(QMainWindow):
 
     def chat_menu(self, pos):
         it = self.listw.itemAt(pos)
-        if it is None or self.busy:
+        if it is None:
             return
         self.listw.setCurrentRow(self.listw.row(it))
         m = QMenu(self)
@@ -8149,13 +8262,14 @@ class App(QMainWindow):
         self.apply_settings(merged)
         self.store_settings()
 
-    def ask_confirm(self, title, detail):
+    def ask_confirm(self, title, detail, run=None):
         """Called from the worker thread; the dialog is shown by the main thread."""
         slot = {"ok": False, "event": threading.Event()}
-        self.q.put(("confirm", (title, detail, slot)))
+        self.q.put(("confirm", (title, detail, slot), run))
+        stop = run.stop_event if run is not None else self.stop_event
         end = time.time() + 900
         while time.time() < end and not slot["event"].wait(0.3):
-            if self.stop_event.is_set():
+            if stop.is_set():
                 return False
         return bool(slot["ok"])
 
@@ -8219,7 +8333,7 @@ class App(QMainWindow):
         self.listw.clear()
         for c in self.view_chats:
             pj = self.get_project(c.get("project"))
-            self.listw.addItem(("[جديد] " if c.get("unread") else "") + ("[مثبّتة] " if c.get("pinned") else "") + ("[أرشيف] " if c.get("archived") else "") + c["title"]
+            self.listw.addItem(("[يشتغل] " if c["id"] in self.runs else "") + ("[جديد] " if c.get("unread") else "") + ("[مثبّتة] " if c.get("pinned") else "") + ("[أرشيف] " if c.get("archived") else "") + c["title"]
                                + (("   ‹%s›" % pj["name"]) if pj and sel == "*" else ""))
         if self.current and self.current["id"] in self.order:
             self.listw.setCurrentRow(self.order.index(self.current["id"]))
@@ -8231,10 +8345,6 @@ class App(QMainWindow):
 
     def on_select(self, row):
         if row < 0 or row >= len(self.view_chats):
-            return
-        if self.busy:
-            QMessageBox.information(self, "5belan", "انتظر حتى ينتهي الرد الحالي.")
-            self.refresh_list()
             return
         self._stash_draft()
         self.current = self.view_chats[row]
@@ -8254,6 +8364,7 @@ class App(QMainWindow):
         self.reply_ranges = []
         self.copy_store.clear()
         self.show_files("")
+        self.sync_run_ui()
         if not self.current:
             self.refresh_files_panel()
             return
@@ -8284,6 +8395,7 @@ class App(QMainWindow):
             self.reply_start = self._end_cursor().position()
             L = self.live
             self.render_reply(L["steps"], L["body"], "live", True, L["warns"])
+            self.live_dirty = False
         else:
             self.show_files(last_reply)
         self.refresh_files_panel()
@@ -8947,8 +9059,6 @@ class App(QMainWindow):
             self.render_chat(keep_scroll=True)
 
     def new_chat(self):
-        if self.busy:
-            return
         self._stash_draft()
         self.current = None
         self._restore_draft()
@@ -9019,11 +9129,8 @@ class App(QMainWindow):
             self.attachments = pend["attachments"]
             self.refresh_files_label()
 
-    def run_pending(self):
-        pend = self._interrupt or self._queued
-        merged = self._interrupt is not None
-        self._interrupt = None
-        self._queued = None
+    def run_pending(self, pend, merged):
+        """Send the message that was waiting for the reply of the chat on screen to finish."""
         self.queue_box.setVisible(False)
         if not pend or self.busy:
             return
@@ -9034,19 +9141,6 @@ class App(QMainWindow):
         self.refresh_files_label()
         self._merge_note = merged
         self.send()
-
-    def restore_pending(self):
-        """After an error: give the waiting message back to the input box instead of sending it."""
-        pend = self._interrupt or self._queued
-        self._interrupt = None
-        self._queued = None
-        self.queue_box.setVisible(False)
-        if pend:
-            self.inp.setPlainText(pend["text"])
-            self.quotes = pend["quotes"]
-            self.refresh_quotes()
-            self.attachments = pend["attachments"]
-            self.refresh_files_label()
 
     # ---------- background tasks, schedule, folder watch, activity, sources ----------
     def make_llm(self, key, usage_cb=None):
@@ -9111,7 +9205,7 @@ class App(QMainWindow):
         self.activateWindow()
 
     def work_running(self):
-        return bool(self.busy or self._bg_running)
+        return bool(self.runs or self._bg_running)
 
     def on_session_end(self, mgr):
         try:
@@ -9497,7 +9591,7 @@ class App(QMainWindow):
             send("المختارة: " + ("محادثة تليقرام الخاصة" if ch_.get("id") == "telegram" else (ch_.get("title") or "بدون عنوان")))
             return
         if cmd == "/status":
-            send("التطبيق شغال. %s. مهام تشتغل: %d. %s" % ("مشغول برد" if self.busy else "فاضي", len(self._bg_running),
+            send("التطبيق شغال. %s. مهام تشتغل: %d. %s" % (("مشغول بـ %d رد" % len(self.runs)) if self.runs else "فاضي", len(self._bg_running),
                                                          self.peak_label.text() if self.peak_label.isVisible() else "ماهو وقت الذروة"))
             return
         if cmd == "/tasks":
@@ -9582,8 +9676,8 @@ class App(QMainWindow):
         if not self.key_edit.text().strip():
             send("مفتاح DeepSeek غير مكتوب بالتطبيق.")
             return
-        if self.busy:
-            send("التطبيق مشغول برد حالياً، انتظر يخلص وارسل من جديد.")
+        if chat["id"] in self.runs:
+            send("هذي المحادثة تشتغل على رد الحين، انتظر يخلص وارسل من جديد.")
             return
         prev_txt, prev_att, prev_q = self.inp.toPlainText(), self.attachments, self.quotes
         self.attachments, self.quotes = [], []
@@ -9592,7 +9686,7 @@ class App(QMainWindow):
         self.title_label.setText(chat.get("title", ""))
         self.refresh_list()
         self.render_chat()
-        self._tg_wait = {"chat": chat, "n": len(chat["msgs"])}
+        n_before = len(chat["msgs"])
         self.inp.setPlainText(text)
         try:
             self.send()
@@ -9602,10 +9696,11 @@ class App(QMainWindow):
             self.refresh_files_label()
             if prev_txt and not self.inp.toPlainText().strip():
                 self.inp.setPlainText(prev_txt)
-        if not self.busy and getattr(self, "_tg_wait", None):
-            self._tg_wait = None
+        R_ = self.runs.get(chat["id"])
+        if R_ is None:
             send("ما قدرت أرسل للمحادثة (تأكد من المفتاح والإعدادات).")
         else:
+            R_.tg_wait = {"chat": chat, "n": n_before}
             send("وصلت للمحادثة «%s»، أنتظر الرد…" % _cut(chat.get("title") or "", 40))
 
     def on_tg_reply(self, out):
@@ -9793,7 +9888,7 @@ class App(QMainWindow):
             self.chats.append(chat)
             self.persist()
             self.refresh_list()
-        elif target is self.current and self.busy:
+        elif target["id"] in self.runs:
             self._bg_pending.append((target, chat))  # do not interleave with a reply that is being streamed
             self.statusBar().showMessage("خلصت المهمة، تنزل بالمحادثة بعد ما يخلص الرد", 6000)
             return
@@ -10486,23 +10581,35 @@ class App(QMainWindow):
 
     def _launch(self, key, model, think):
         """Start the model on the current chat (used by send and by regenerate)."""
+        cid = self.current["id"]
+        if cid in self.runs:
+            return
+        run = Run(self.current)
+        run.last_text = self.last_text
+        run.last_quotes = list(self._last_quotes)
+        self.runs[cid] = run
         self.begin_live()
-        self.busy = True
-        self.stop_event.clear()
         self.set_send_mode("stop")
+        self.refresh_list()
 
         roots = [d for d in self.allowed_dirs if os.path.isdir(d)] if self.tools_enabled else []
         wroots = [d for d in self.writable_dirs if os.path.isdir(d)] if (roots and self.write_enabled) else []
         shell_mode = self.shell_mode if self.shell_mode in ("ask", "free") else "off"
         allow_computer = bool(self.computer_enabled)
         use_browser = bool(self.browser_enabled and self.web_ok)
+        if use_browser:
+            if self._browser_owner and self._browser_owner != cid and self._browser_owner in self.runs:
+                use_browser = False  # the one built-in browser is busy with another chat
+                run.live["warns"].append("المتصفح المدمج مشغول مع محادثة ثانية، فهذا الرد يشتغل بدونه.")
+            else:
+                self._browser_owner = cid
         runner = None
         if True:  # the code interpreter is always available, so there is always a runner
             runner = ToolRunner(
                 roots,
                 writable=wroots,
                 allow_delete=bool(self.delete_enabled),
-                confirm=self.ask_confirm,
+                confirm=lambda t_, d_, r_=run: self.ask_confirm(t_, d_, r_),
                 backup=bool(self.backup_enabled),
                 confirm_files=bool(self.confirm_edits),
                 shell_mode=shell_mode,
@@ -10510,13 +10617,11 @@ class App(QMainWindow):
                 browser=self.browser_bridge if use_browser else None,
                 plan_first=bool(self.plan_first),
             )
-            runner.stop_event = self.stop_event
+            runner.stop_event = run.stop_event
             runner.undo_dir = os.path.join(self.chat_dir(), "undo")
             runner.work_dir = os.path.join(self.chat_dir(), "work")
         if runner is not None:
-            runner.llm = self.make_llm(key, lambda u: self.q.put(("usage", (MODELS[0], u, time.time()))))
-        self._act_title = self.current.get("title", "")
-        self._srcs = []
+            runner.llm = self.make_llm(key, lambda u: self.q.put(("usage", (MODELS[0], u, time.time()), run)))
         system = SYSTEM_PROMPT + "\n" + memory_prompt() + (tools_prompt(runner) if runner else "")
         system += skills_prompt(getattr(self, "chat_skills", []), offers=self.cfg.get("skill_offers", True) is not False)
         if roots:
@@ -10532,9 +10637,10 @@ class App(QMainWindow):
             if m["role"] == "assistant" and runner is not None and think != "off":
                 item["reasoning_content"] = m.get("reasoning", "")
             api_msgs.append(item)
-        threading.Thread(target=self.worker, args=(key, model, think, api_msgs, runner), daemon=True).start()
+        threading.Thread(target=self.worker, args=(key, model, think, api_msgs, runner, run), daemon=True).start()
 
-    def stream_once(self, key, payload):
+    def stream_once(self, key, payload, run):
+        put = lambda k, v=None: self.q.put((k, v, run))
         req = urllib.request.Request(
             API_URL,
             data=json.dumps(payload).encode("utf-8"),
@@ -10543,7 +10649,7 @@ class App(QMainWindow):
         content, reasoning, calls = [], [], {}
         with urllib.request.urlopen(req, timeout=600) as resp:
             for raw in resp:
-                if self.stop_event.is_set():
+                if run.stop_event.is_set():
                     break
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
@@ -10556,21 +10662,21 @@ class App(QMainWindow):
                 except Exception:
                     continue
                 if obj.get("usage"):
-                    self.q.put(("usage", (payload.get("model"), obj["usage"], time.time())))
+                    put("usage", (payload.get("model"), obj["usage"], time.time()))
                 try:
                     if obj["choices"][0].get("finish_reason"):
-                        self._finish = obj["choices"][0]["finish_reason"]
+                        run.finish_reason = obj["choices"][0]["finish_reason"]
                     delta = obj["choices"][0]["delta"]
                 except Exception:
                     continue
                 t = delta.get("reasoning_content")
                 if t:
                     reasoning.append(t)
-                    self.q.put(("think", t))
+                    put("think", t)
                 piece = delta.get("content")
                 if piece:
                     content.append(piece)
-                    self.q.put(("tok", piece))
+                    put("tok", piece)
                 for tc in delta.get("tool_calls") or []:
                     slot = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
                     if tc.get("id"):
@@ -10582,7 +10688,8 @@ class App(QMainWindow):
                         slot["args"] += fn["arguments"]
         return "".join(content), "".join(reasoning), [calls[i] for i in sorted(calls)]
 
-    def worker(self, key, model, think, messages, runner):
+    def worker(self, key, model, think, messages, runner, run):
+        put = lambda k, v=None: self.q.put((k, v, run))
         use_tools = bool(runner and runner.tools())
         retried = False
         rounds = 0
@@ -10592,10 +10699,10 @@ class App(QMainWindow):
         wrap_up = ""
         try:
             while True:
-                self.q.put(("round", rounds))
-                if self.stop_event.is_set():
-                    self.report_changes(runner)
-                    self.q.put(("done", ("⏹ أوقفتّه بطلبك. اكتب «كمّل» لو تبيه يكمل من وين وقف.", "")))
+                put("round", rounds)
+                if run.stop_event.is_set():
+                    self.report_changes(runner, run)
+                    put("done", ("⏹ أوقفتّه بطلبك. اكتب «كمّل» لو تبيه يكمل من وين وقف.", ""))
                     return
                 if wrap_up:
                     use_tools = False
@@ -10610,14 +10717,14 @@ class App(QMainWindow):
                 if use_tools:
                     payload["tools"] = runner.tools()
                 try:
-                    self._finish = ""
-                    content, reasoning, calls = self.stream_once(key, payload)
+                    run.finish_reason = ""
+                    content, reasoning, calls = self.stream_once(key, payload, run)
                     net_retries = 0
                 except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
                     if not isinstance(e, urllib.error.HTTPError):
                         net_retries += 1
-                        if net_retries <= 3 and not self.stop_event.is_set():
-                            self.q.put(("warn", "انقطع الاتصال، أعيد المحاولة (%d/3)..." % net_retries))
+                        if net_retries <= 3 and not run.stop_event.is_set():
+                            put("warn", "انقطع الاتصال، أعيد المحاولة (%d/3)..." % net_retries)
                             time.sleep(2 * net_retries)
                             continue
                         raise
@@ -10628,9 +10735,9 @@ class App(QMainWindow):
                     if e.code == 400 and use_tools and not retried and "reasoning_content" in detail:
                         retried = True
                         use_tools = False
-                        self.q.put(("warn", "هذي المحادثة قديمة وما تدعم ملفات الجهاز، فأرسلت الطلب بدونها. ابدأ محادثة جديدة لو تبيها."))
+                        put("warn", "هذي المحادثة قديمة وما تدعم ملفات الجهاز، فأرسلت الطلب بدونها. ابدأ محادثة جديدة لو تبيها.")
                         continue
-                    self.q.put(("err", "HTTP %s: %s" % (e.code, detail)))
+                    put("err", "HTTP %s: %s" % (e.code, detail))
                     return
                 except urllib.error.HTTPError as e:
                     try:
@@ -10640,24 +10747,24 @@ class App(QMainWindow):
                     if e.code == 400 and use_tools and not retried and "reasoning_content" in detail:
                         retried = True
                         use_tools = False
-                        self.q.put(("warn", "هذي المحادثة قديمة وما تدعم ملفات الجهاز، فأرسلت الطلب بدونها. ابدأ محادثة جديدة لو تبيها."))
+                        put("warn", "هذي المحادثة قديمة وما تدعم ملفات الجهاز، فأرسلت الطلب بدونها. ابدأ محادثة جديدة لو تبيها.")
                         continue
                     if e.code == 400 and not ctx_retried and re.search(r"context|length|too long|maximum", detail, re.I):
                         ctx_retried = True
                         self.shrink_messages(messages)
-                        self.q.put(("warn", "المحادثة طويلة جداً، قصّرت النتائج القديمة وأعيد المحاولة..."))
+                        put("warn", "المحادثة طويلة جداً، قصّرت النتائج القديمة وأعيد المحاولة...")
                         continue
-                    self.q.put(("err", "HTTP %s: %s" % (e.code, detail)))
+                    put("err", "HTTP %s: %s" % (e.code, detail))
                     return
-                if self.stop_event.is_set():
-                    self.report_changes(runner)
-                    self.q.put(("done", ((content + "\n\n" if content.strip() else "") + "⏹ أوقفتّه بطلبك. اكتب «كمّل» لو تبيه يكمل من وين وقف.", reasoning)))
+                if run.stop_event.is_set():
+                    self.report_changes(runner, run)
+                    put("done", ((content + "\n\n" if content.strip() else "") + "⏹ أوقفتّه بطلبك. اكتب «كمّل» لو تبيه يكمل من وين وقف.", reasoning))
                     return
                 if not calls or not use_tools:
-                    self.report_changes(runner)
-                    if getattr(self, "_finish", "") == "length":
-                        self._cut_flag = True
-                    self.q.put(("done", (content, reasoning)))
+                    self.report_changes(runner, run)
+                    if run.finish_reason == "length":
+                        run.cut = True
+                    put("done", (content, reasoning))
                     return
                 rounds += 1
                 if rounds > TOOL_MAX_ROUNDS and not wrap_up:
@@ -10666,7 +10773,7 @@ class App(QMainWindow):
                                "summarise what you finished, what is left, and tell the user to write «كمّل» to continue.")
                     messages.append({"role": "assistant", "content": content or "..."})
                     continue
-                self.q.put(("demote", None))  # what the model said before using tools goes into the details
+                put("demote", None)  # what the model said before using tools goes into the details
                 asst = {
                     "role": "assistant",
                     "content": content,
@@ -10679,7 +10786,7 @@ class App(QMainWindow):
                     asst["reasoning_content"] = reasoning
                 messages.append(asst)
                 for c in calls:
-                    if self.stop_event.is_set():
+                    if run.stop_event.is_set():
                         messages.append({"role": "tool", "tool_call_id": c["id"], "content": "Error: stopped by the user"})
                         continue
                     sig = c["name"] + "|" + (c["args"] or "")
@@ -10691,29 +10798,27 @@ class App(QMainWindow):
                         result = runner.run(c["name"], c["args"])
                     failed = result.startswith("Error")
                     try:
-                        log_activity(getattr(self, "_act_title", ""), c["name"], runner.describe(c["name"], c["args"]), not failed)
+                        log_activity(run.act_title, c["name"], runner.describe(c["name"], c["args"]), not failed)
                         if c["name"] == "browser_open" and not failed:
                             mm = re.match(r"opened[^:]*:\s*(.*?)\s+—\s+(https?://\S+)", result)
-                            if mm and all(x["url"] != mm.group(2) for x in self._srcs):
-                                self._srcs.append({"title": mm.group(1)[:120], "url": mm.group(2)})
+                            if mm and all(x["url"] != mm.group(2) for x in run.srcs):
+                                run.srcs.append({"title": mm.group(1)[:120], "url": mm.group(2)})
                     except Exception:
                         pass
-                    self.q.put(
-                        (
-                            "tool",
-                            {
-                                "k": "tool",
-                                "name": c["name"],
-                                "text": runner.describe(c["name"], c["args"]),
-                                "ok": not failed,
-                                "err": result[:300] if failed else "",
-                            },
-                        )
+                    put(
+                        "tool",
+                        {
+                            "k": "tool",
+                            "name": c["name"],
+                            "text": runner.describe(c["name"], c["args"]),
+                            "ok": not failed,
+                            "err": result[:300] if failed else "",
+                        },
                     )
                     messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
-                    self.report_changes(runner)
+                    self.report_changes(runner, run)
         except Exception as e:
-            self.q.put(("err", str(e)))
+            put("err", str(e))
 
     @staticmethod
     def shrink_messages(messages):
@@ -10753,12 +10858,12 @@ class App(QMainWindow):
                 if len(c) > 1500:
                     m["content"] = c[:1500] + "\n[older result shortened to save tokens]"
 
-    def report_changes(self, runner):
+    def report_changes(self, runner, run=None):
         """Announce (once) the files the model changed on disk during this reply."""
         if runner is not None:
             n_ = getattr(runner, "_jsent", 0)
             if len(runner.journal) > n_:
-                self.q.put(("journal", runner.journal[n_:]))
+                self.q.put(("journal", runner.journal[n_:], run))
                 runner._jsent = len(runner.journal)
         if not runner or not runner.changes:
             return
@@ -10771,7 +10876,7 @@ class App(QMainWindow):
             return
         shown.update(new)
         names = "، ".join(os.path.basename(p.rstrip("\\/")) for p in new)
-        self.q.put(("note", "تم التعديل على جهازك: " + (names if len(names) <= 200 else "%d عنصر" % len(new))))
+        self.q.put(("note", "تم التعديل على جهازك: " + (names if len(names) <= 200 else "%d عنصر" % len(new)), run))
 
     def auto_title(self, chat, ask, reply):
         """After the first question and first answer, ask the model for a short summary and use it as the chat title."""
@@ -10847,41 +10952,46 @@ class App(QMainWindow):
                 pending.append(self.q.get_nowait())
         except queue.Empty:
             pass
-        for kind, val in pending:
-            L = self.live
+        for item in pending:
+            kind, val = item[0], item[1]
+            R = item[2] if len(item) > 2 else None  # the run (chat) this event belongs to
+            L = R.live if R is not None else None
+            cur = R is not None and R is self.cur_run  # that chat is the one on screen
             if kind == "round":
                 if L is not None:
                     L["cur_think"] = None
             elif kind == "tool":
                 if L is not None:
                     L["steps"].append(val)
-                    self.live_dirty = True
-                    self.checkpoint(force=True)
+                    R.live_dirty = True
+                    self.checkpoint(R, force=True)
                     write_state(last_event="tool: %s" % str(val.get("text", ""))[:120])
             elif kind == "note":
                 if L is not None:
                     L["steps"].append({"k": "note", "text": val})
-                    self.live_dirty = True
+                    R.live_dirty = True
             elif kind == "warn":
                 if L is not None:
                     L["warns"].append(val)
-                    self.live_dirty = True
+                    R.live_dirty = True
             elif kind == "demote":
                 if L is not None:
                     L["cur_think"] = None
                     if L["body"].strip():
                         L["steps"].append({"k": "say", "text": L["body"].strip()})
                     L["body"] = ""
-                    self.live_dirty = True
+                    R.live_dirty = True
             elif kind == "browser":
                 self._do_browser(val)
             elif kind == "confirm":
                 title, detail, slot = val
                 if self._confirm_open:
-                    slot["ok"] = False
+                    self.q.put(item)  # one question at a time: this one waits its turn
                 else:
                     self._confirm_open = True
                     try:
+                        if R is not None and len(self.runs) > 1:
+                            title = "[%s] %s" % (_cut(R.chat.get("title") or "", 30), title)
                         box = QMessageBox(self)
                         box.setWindowTitle("موافقة قبل التنفيذ")
                         box.setIcon(QMessageBox.Icon.Warning)
@@ -10902,17 +11012,17 @@ class App(QMainWindow):
                         st = {"k": "think", "text": ""}
                         L["steps"].append(st)
                         L["cur_think"] = st
-                        self.live_dirty = True
+                        R.live_dirty = True
                     st["text"] += val
-                    if "live" in self.open_acts:
-                        self.live_dirty = True
+                    if cur and "live" in self.open_acts:
+                        R.live_dirty = True
             elif kind == "tok":
                 if L is not None:
                     first = not L["body"]
                     L["body"] += val
                     if first and not L["steps"]:
-                        self.live_dirty = True  # the "thinking" line goes away once the answer starts
-                    if not self.live_dirty:
+                        R.live_dirty = True  # the "thinking" line goes away once the answer starts
+                    if cur and not R.live_dirty:
                         self.append(val, "bot")
             elif kind == "update_check":
                 self._upd_busy = False
@@ -11013,12 +11123,14 @@ class App(QMainWindow):
                                 % (t_.get("url"), diff_))
                 self.start_bg(t2)
             elif kind == "journal":
-                if self.current is not None:
-                    j_ = self.current.setdefault("journal", [])
+                jc_ = R.chat if R is not None else self.current
+                if jc_ is not None:
+                    j_ = jc_.setdefault("journal", [])
                     j_.extend(val)
                     if len(j_) > 300:
                         del j_[:len(j_) - 300]
-                    self.undo_btn.setVisible(True)
+                    if jc_ is self.current:
+                        self.undo_btn.setVisible(True)
             elif kind == "usage":
                 if L is not None:
                     try:
@@ -11032,7 +11144,9 @@ class App(QMainWindow):
                         pass
             elif kind == "done":
                 content, reasoning = val
-                if self._interrupt is not None:
+                ch_ = R.chat
+                cur = R is self.cur_run
+                if R.interrupt is not None:
                     content = re.sub(r"\n*⏹ أوقفتّه بطلبك.*$", "", content, flags=re.S).strip()
                     acts = [x.get("text", "") for x in ((L or {}).get("steps") or []) if x.get("k") == "tool"][-10:]
                     if acts:
@@ -11044,69 +11158,77 @@ class App(QMainWindow):
                     self.statusBar().showMessage(mm, 5000)
                 content, offer_ = extract_skill_offer(content)
                 msg = {"role": "assistant", "content": content, "reasoning": reasoning}
-                if offer_ and self.current.get("id") != "telegram":
+                if offer_ and ch_.get("id") != "telegram":
                     msg["skill_offer"] = offer_
-                if getattr(self, "_cut_flag", False) or "⏹ أوقفتّه بطلبك" in content:
+                if R.cut or "⏹ أوقفتّه بطلبك" in content:
                     msg["cut"] = True
-                self._cut_flag = False
+                R.cut = False
                 if L is not None and L.get("cost"):
                     msg["cost"] = dict(L["cost"], t=time.time())
-                if getattr(self, "_srcs", None):
-                    msg["sources"] = list(self._srcs[:10])
-                    self._srcs = []
+                if R.srcs:
+                    msg["sources"] = list(R.srcs[:10])
+                    R.srcs = []
                 if L is not None and L["steps"]:
                     msg["activity"] = L["steps"]
                 if L is not None and L.get("t0"):
                     msg["dur"] = int(time.time() - L["t0"])
-                self.current["msgs"].append(msg)
-                ch_ = self.current
+                ch_["msgs"].append(msg)
                 if (len(ch_["msgs"]) == 2 and not ch_.get("renamed") and not ch_.get("auto_titled")
                         and content and not str(content).startswith("⏹")):
                     self.auto_title(ch_, ch_["msgs"][0].get("shown") or str(ch_["msgs"][0].get("content", "")), str(content))
-                if "live" in self.open_acts:
+                if cur and "live" in self.open_acts:
                     self.open_acts.discard("live")
-                    self.open_acts.add("m%d" % (len(self.current["msgs"]) - 1))
-                self.live = None
-                self.live_dirty = False
-                self.current["updated"] = time.time()
+                    self.open_acts.add("m%d" % (len(ch_["msgs"]) - 1))
+                R.live = None
+                R.live_dirty = False
+                ch_["updated"] = time.time()
                 self.persist()
                 self.refresh_list()
-                self.render_chat()
-                try:
-                    self.canvas_from_reply(content)
-                except Exception as ex:
-                    log_event("canvas: %s" % ex)
-                self.finish()
+                if cur:
+                    self.render_chat()
+                    try:
+                        self.canvas_from_reply(content)
+                    except Exception as ex:
+                        log_event("canvas: %s" % ex)
+                self.finish(R)
                 self.maybe_khaled_flash((L or {}).get("t0"))
-                self.request_suggestions(self.current, len(self.current["msgs"]) - 1)
+                self.request_suggestions(ch_, len(ch_["msgs"]) - 1)
             elif kind == "err":
-                if L is not None:
+                ch_ = R.chat
+                cur = R is self.cur_run
+                if cur and L is not None:
                     self.redraw_live()
-                self.live = None
-                self.live_dirty = False
-                self.append("\n[خطأ] " + val + "\n\n", "err")
-                msgs = self.current["msgs"]
+                R.live = None
+                R.live_dirty = False
+                if cur:
+                    self.append("\n[خطأ] " + val + "\n\n", "err")
+                else:
+                    self.statusBar().showMessage("صار خطأ في محادثة «%s»: %s" % (_cut(ch_.get("title") or "", 30), str(val)[:140]), 15000)
+                msgs = ch_["msgs"]
                 if msgs and msgs[-1]["role"] == "user":
                     msgs.pop()
                 if not msgs:
-                    self.chats = [c for c in self.chats if c["id"] != self.current["id"]]
-                    self.current = None
+                    self.chats = [c for c in self.chats if c["id"] != ch_["id"]]
+                    if self.current is ch_:
+                        self.current = None
                     self.refresh_list()
                 else:
                     self.persist()
-                if self.last_text:
-                    self.inp.setPlainText(self.last_text)
-                if self._last_quotes:
-                    self.quotes = self._last_quotes
-                    self.refresh_quotes()
-                if self._interrupt is not None or self._queued is not None:
-                    self.statusBar().showMessage("صار خطأ؛ رسالتك المؤجلة رجعت لمربع الكتابة", 6000)
-                    pend = self._interrupt or self._queued
-                    self._interrupt = self._queued = None
-                    self.queue_box.setVisible(False)
-                    if pend and not self.inp.toPlainText().strip():
-                        self.inp.setPlainText(pend["text"])
-                self.finish()
+                pend = R.interrupt or R.queued
+                R.interrupt = R.queued = None
+                if cur:
+                    if R.last_text:
+                        self.inp.setPlainText(R.last_text)
+                    if R.last_quotes:
+                        self.quotes = R.last_quotes
+                        self.refresh_quotes()
+                    if pend:
+                        self.statusBar().showMessage("صار خطأ؛ رسالتك المؤجلة رجعت لمربع الكتابة", 6000)
+                        if not self.inp.toPlainText().strip():
+                            self.inp.setPlainText(pend["text"])
+                elif R.last_text and msgs:
+                    self.drafts[ch_["id"]] = R.last_text
+                self.finish(R, failed=True)
         if self.live_dirty and self.live is not None:
             # redrawing rebuilds the whole reply, so on long runs do it less often (this was freezing the window)
             gap = min(1.2, 0.12 + 0.004 * len(self.live["steps"]) + (0.3 if "live" in self.open_acts else 0))
@@ -11114,31 +11236,34 @@ class App(QMainWindow):
                 self._last_redraw = time.time()
                 self.redraw_live()
 
-    def checkpoint(self, force=False):
+    def checkpoint(self, R, force=False):
         """Save the work in progress (small file) so it can be resumed after a crash."""
-        L = self.live
-        if not self.busy or L is None or not self.current:
+        if R is None or R.live is None:
             return
+        L = R.live
         now = time.time()
-        if not force and now - getattr(self, "_last_ckpt", 0) < 4:
+        if not force and now - R.last_ckpt < 4:
             return
-        self._last_ckpt = now
+        R.last_ckpt = now
         steps = [dict(x, text=str(x.get("text", ""))[:1500], err=str(x.get("err", ""))[:300]) for x in L["steps"][-80:]]
         save_json(RESUME_PATH, {
-            "chat_id": self.current["id"], "ts": now, "user_text": self.last_text,
+            "chat_id": R.chat["id"], "ts": now, "user_text": R.last_text,
             "steps": steps, "body": str(L["body"])[-8000:], "total_steps": len(L["steps"]),
         })
 
     def heartbeat(self):
         m = mem_mb()
         peak = max(_STATE.get("peak_mb", 0) or 0, m)
-        write_state(mem_mb=m, peak_mb=peak, busy=bool(self.busy))
-        if self.busy:
-            self.checkpoint()
+        write_state(mem_mb=m, peak_mb=peak, busy=bool(self.runs))
+        for R in list(self.runs.values()):
+            self.checkpoint(R)
 
-    def clear_resume(self):
+    def clear_resume(self, cid=None):
+        """Remove the crash-recovery file (only when it belongs to chat cid, if given)."""
         try:
             if os.path.exists(RESUME_PATH):
+                if cid is not None and (load_json(RESUME_PATH, {}) or {}).get("chat_id") != cid:
+                    return
                 os.remove(RESUME_PATH)
         except Exception:
             pass
@@ -11185,28 +11310,52 @@ class App(QMainWindow):
             self.inp.setPlainText("كمّل من وين وقفت. شف اللي تم أعلاه وكمّل الباقي بدون ما تعيد اللي خلص.")
             self.send()
 
-    def finish(self):
-        self.clear_resume()
-        write_state(last_event="reply finished", busy=False)
+    def finish(self, R, failed=False):
+        """A reply (of any chat) ended: free its run, then tidy the screen if that chat is the one shown."""
+        cid = R.chat["id"]
+        self.runs.pop(cid, None)
+        if self._browser_owner == cid:
+            self._browser_owner = None
+        self.clear_resume(cid)
+        write_state(last_event="reply finished", busy=bool(self.runs))
         self._bal_changed = False
         for ms in (700, 4000, 12000, 30000, 70000):  # the provider can take a little while to update the balance
             QTimer.singleShot(ms, lambda: (not self._bal_changed) and self.refresh_balance(force=True))
-        self.busy = False
-        self.set_send_mode("send")
-        self.inp.setFocus()
-        w_ = getattr(self, "_tg_wait", None)
+        pend = R.interrupt or R.queued
+        merged = R.interrupt is not None
+        is_cur = self.current is R.chat
+        if is_cur:
+            self.sync_run_ui()
+            self.inp.setFocus()
+        elif not failed:
+            R.chat["unread"] = True
+            self.persist()
+            self.refresh_list()
+            self.statusBar().showMessage("خلص الرد في محادثة «%s»" % _cut(R.chat.get("title") or "", 40), 12000)
+            try:
+                QApplication.alert(self, 5000)
+            except Exception:
+                pass
+        w_ = R.tg_wait
         if w_:
-            self._tg_wait = None
             ms_ = w_["chat"].get("msgs", [])
             if len(ms_) > w_["n"] and ms_[-1].get("role") == "assistant":
                 self.tg_notify_force("خبيلان:\n" + clean_reply(str(ms_[-1].get("content", ""))))
             else:
                 self.tg_notify_force("صار خطأ ولا قدر يرد على هذي الرسالة.")
-        while self._bg_pending:
-            t_, c_ = self._bg_pending.pop(0)
-            self.merge_bg(t_, c_)
-        if self._interrupt is not None or self._queued is not None:
-            QTimer.singleShot(250, self.run_pending)
+        keep = []
+        for t_, c_ in self._bg_pending:
+            if t_["id"] in self.runs:
+                keep.append((t_, c_))
+            else:
+                self.merge_bg(t_, c_)
+        self._bg_pending = keep
+        if pend and not failed:
+            if is_cur:
+                QTimer.singleShot(250, lambda c=R.chat: self.run_pending(pend, merged) if self.current is c else None)
+            else:
+                self.drafts[cid] = pend["text"]  # it was meant for that chat: wait for you there
+                self.statusBar().showMessage("رسالتك المؤجلة رجعت لمسودة محادثتها", 6000)
 
 
 def main():
