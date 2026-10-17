@@ -937,6 +937,7 @@ def strip_for_save(msg):
 TOOL_READ_CHUNK = 40000
 TOOL_MAX_ROUNDS = 400
 RENDER_LAST_MSGS = 40      # messages drawn in the window (older ones stay saved)
+CHIP_PAD = "\u00a0\u00a0\u00a0"
 DETAIL_BOX_MAX = 300      # tallest the thinking box gets before it scrolls inside
 LIVE_DETAIL_STEPS = 30     # steps drawn while a reply is running
 DETAIL_TEXT_CAP = 4000     # characters of one step shown in the details
@@ -3238,7 +3239,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.18.0"
+APP_VERSION = "2.19.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -3560,6 +3561,22 @@ class ChatView(QTextBrowser):
                 return False
         return False
 
+    def drop_native_selection(self):
+        """Clear Qt's own selection WITHOUT letting it scroll: setTextCursor() calls ensureCursorVisible(), which threw the
+        view to wherever Qt's hidden text cursor is (usually the top or the very end) every time you started selecting."""
+        c = self.textCursor()
+        if not c.hasSelection():
+            return
+        sb = self.verticalScrollBar()
+        v = sb.value()
+        c.clearSelection()
+        self.setTextCursor(c)
+        sb.setValue(v)
+
+    def selecting(self):
+        """The user is dragging a selection or has one: the chat must not scroll or be rebuilt under them."""
+        return bool(self._drag or self.has_visual_selection() or self.textCursor().hasSelection())
+
     def _origin(self, blk, tl):
         """Where a block's text starts in the document. QTextLayout.position() is relative to the table cell the block sits in
         (my message bubbles are tables), so use the document layout's absolute rectangle instead."""
@@ -3856,18 +3873,14 @@ class ChatView(QTextBrowser):
         self._force = False
         if self._clicks >= 3:
             self._select_block(pos)
-            c0 = self.textCursor()
-            c0.clearSelection()
-            self.setTextCursor(c0)
+            self.drop_native_selection()
             self.viewport().update()
             self.selection_changed.emit()
             return
         had = self.has_selection()
         self._a = self._to_doc(pos)
         self._b = None
-        c = self.textCursor()
-        c.clearSelection()
-        self.setTextCursor(c)
+        self.drop_native_selection()
         self.viewport().update()
         if had:
             self.selection_changed.emit()
@@ -3889,9 +3902,7 @@ class ChatView(QTextBrowser):
         self._press = pos
         self._drag = False
         self._on_link = False
-        c0 = self.textCursor()
-        c0.clearSelection()
-        self.setTextCursor(c0)
+        self.drop_native_selection()
         if w:
             self._word = w
             self._set_word_sel(w)
@@ -4041,7 +4052,7 @@ class BrowserPanel(QWidget):
     """The built-in browser: tabs, back/forward/reload, address bar with progress, saved logins (own profile),
     downloads that ask first, and one 🤖 tab that the agent drives. It keeps working while the panel is hidden."""
 
-    agent_loaded = Signal(bool)
+    agent_loaded = Signal(str, bool)  # (chat key, loaded ok)
 
     def __init__(self, parent, data_dir):
         super().__init__(parent)
@@ -4070,7 +4081,7 @@ class BrowserPanel(QWidget):
         except Exception:
             pass
         self.profile.downloadRequested.connect(self._download)
-        self.agent_view = None
+        self.agent_views = {}  # chat id -> the tab that chat's agent drives (several chats can browse at once)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -4163,15 +4174,17 @@ class BrowserPanel(QWidget):
         if i >= 0:
             t = (t or "جديد").strip()
             t = t if len(t) <= 22 else t[:21] + "…"
-            self.tabs.setTabText(i, ("" if getattr(view, "_is_agent", False) else "") + t)
-            self.tabs.setTabToolTip(i, view.url().toString())
+            lab = getattr(view, "_chat_label", "") if getattr(view, "_is_agent", False) else ""
+            self.tabs.setTabText(i, ("[%s] " % lab if lab else "") + t)
+            self.tabs.setTabToolTip(i, (("محادثة: %s\n" % lab) if lab else "") + view.url().toString())
 
     def close_tab(self, i):
         if i < 0:
             return
         w = self.tabs.widget(i)
-        if w is self.agent_view:
-            self.agent_view = None
+        for k_, vw_ in list(self.agent_views.items()):
+            if vw_ is w:
+                del self.agent_views[k_]
         self.tabs.removeTab(i)
         if w is not None:
             w.setParent(None)
@@ -4204,8 +4217,9 @@ class BrowserPanel(QWidget):
     def _finished(self, view, ok):
         view._loading = False
         self._load_state(view, False)
-        if view is self.agent_view:
-            self.agent_loaded.emit(bool(ok))
+        key = getattr(view, "_agent_key", None)
+        if key is not None and self.agent_views.get(key) is view:
+            self.agent_loaded.emit(key, bool(ok))
 
     def _reload(self):
         w = self._cur()
@@ -4265,20 +4279,27 @@ class BrowserPanel(QWidget):
             pass
 
     # ----- agent tab (works even when the panel is hidden)
-    def agent_page(self):
-        if self.agent_view is None:
-            self.agent_view = self.new_tab(None, agent=True)
-        return self.agent_view.page()
+    def agent_tab(self, key="", label=""):
+        v = self.agent_views.get(key)
+        if v is None:
+            v = self.new_tab(None, agent=True)
+            v._agent_key = key
+            v._chat_label = label
+            self.agent_views[key] = v
+            self._set_title(v, "")
+        return v
 
-    def agent_open(self, url):
-        page = self.agent_page()
-        self.tabs.setCurrentWidget(self.agent_view)
-        self.agent_view.load(QUrl(url))
-        return page
+    def agent_page(self, key="", label=""):
+        return self.agent_tab(key, label).page()
 
-    def agent_back(self):
-        self.agent_page()
-        self.agent_view.back()
+    def agent_open(self, url, key="", label=""):
+        v = self.agent_tab(key, label)
+        self.tabs.setCurrentWidget(v)
+        v.load(QUrl(url))
+        return v.page()
+
+    def agent_back(self, key=""):
+        self.agent_tab(key).back()
 
 
 def html_to_text(html_txt):
@@ -6764,7 +6785,6 @@ class App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.runs = {}  # chat id -> Run, for every chat that is answering right now
-        self._browser_owner = None  # the chat that may use the built-in browser (it is one shared window)
         self.setWindowTitle("5belan")
         if os.path.exists(ICON_PATH):
             self.setWindowIcon(QIcon(ICON_PATH))
@@ -6785,7 +6805,8 @@ class App(QMainWindow):
         self.web = None
         self.web_ok = False
         self.browser_container = None
-        self._open_slot = None
+        self._open_slots = {}  # chat id -> the browser_open call waiting for its page to load
+        self._text_pages = {}
         self.live = None  # the reply that is being streamed right now
         self.open_acts = set()  # which Thinking blocks are expanded
         self._boxes = {}
@@ -8037,10 +8058,10 @@ class App(QMainWindow):
     def _to_url(self, target):
         return to_url(target)
 
-    def browser_bridge(self, action, **kw):
-        """Called from the worker thread; the browser op runs on the main thread."""
+    def browser_bridge(self, action, _run=None, **kw):
+        """Called from the worker thread; the browser op runs on the main thread (in that chat's own tab)."""
         slot = {"result": None, "event": threading.Event(), "done": False}
-        self.q.put(("browser", (action, kw, slot)))
+        self.q.put(("browser", (action, kw, slot), _run))
         if not slot["event"].wait(60):
             return "Error: the browser timed out"
         return slot["result"] if slot["result"] is not None else "Error: no result from the browser"
@@ -8052,9 +8073,8 @@ class App(QMainWindow):
         slot["done"] = True
         slot["event"].set()
 
-    def _on_load(self, ok):
-        slot = self._open_slot
-        self._open_slot = None
+    def _on_load(self, key, ok):
+        slot = self._open_slots.pop(key, None)
         if slot is None or self.web is None:
             return
 
@@ -8070,11 +8090,11 @@ class App(QMainWindow):
                 self._resolve(s, "loaded (with errors): %s" % d.get("url", ""))
 
         try:
-            self.web.agent_page().runJavaScript("JSON.stringify({title:document.title,url:location.href})", cb)
+            self.web.agent_page(key).runJavaScript("JSON.stringify({title:document.title,url:location.href})", cb)
         except Exception:
             self._resolve(slot, "opened")
 
-    def _text_browser(self, action, kw, slot):
+    def _text_browser(self, action, kw, slot, key=""):
         """No browser engine on this system: open/read still work in text mode (download the page and read its text)."""
         if action == "open":
             url = to_url(kw.get("target", ""))
@@ -8088,14 +8108,14 @@ class App(QMainWindow):
                         final = r.geturl()
                     html_txt = raw.decode(ctype, errors="replace")
                     title, text = html_to_text(html_txt)
-                    self._text_page = {"title": title, "url": final, "text": text}
+                    self._text_pages[key] = {"title": title, "url": final, "text": text}
                     self._resolve(slot, "opened (text mode): %s — %s" % (title, final))
                 except Exception as e:
                     self._resolve(slot, "Error: could not open the page: %s" % e)
 
             threading.Thread(target=work, daemon=True).start()
         elif action == "read":
-            p = getattr(self, "_text_page", None)
+            p = self._text_pages.get(key)
             self._resolve(slot, self._fmt_read(json.dumps(p)) if p else "Error: no page is open yet; call browser_open first")
         else:
             self._resolve(slot, "Error: this system has no browser engine, so only opening and reading pages works (install PySide6-WebEngine for clicking and typing)")
@@ -8113,17 +8133,19 @@ class App(QMainWindow):
             txt = txt[:6000] + "\\n…[truncated]"
         return "Title: %s\\nURL: %s\\n---\\n%s" % (d.get("title", ""), d.get("url", ""), txt)
 
-    def _do_browser(self, val):
+    def _do_browser(self, val, R=None):
         action, kw, slot = val
+        key = R.chat["id"] if R is not None else ""
+        label = (R.chat.get("title") or "")[:10] if R is not None else ""
         if not self.ensure_browser(silent=True):
-            self._text_browser(action, kw, slot)
+            self._text_browser(action, kw, slot, key)
             return
         try:
-            page = self.web.agent_page()
+            page = self.web.agent_page(key, label)
             if action == "open":
                 url = to_url(kw.get("target", ""))
-                self._open_slot = slot
-                self.web.agent_open(url)
+                self._open_slots[key] = slot
+                self.web.agent_open(url, key, label)
                 QTimer.singleShot(25000, lambda s=slot, u=url: self._resolve(s, "opened (load timed out): " + u))
             elif action == "read":
                 page.runJavaScript(BROWSER_READ_JS, lambda r, s=slot: self._resolve(s, self._fmt_read(r)))
@@ -8137,7 +8159,7 @@ class App(QMainWindow):
                       .replace("__S__", "true" if kw.get("submit") else "false"))
                 page.runJavaScript(js, lambda r, s=slot: self._resolve(s, str(r)))
             elif action == "back":
-                self.web.agent_back()
+                self.web.agent_back(key)
                 QTimer.singleShot(1500, lambda s=slot: self._resolve(s, "went back (call browser_read to see the page)"))
             else:
                 self._resolve(slot, "Error: unknown browser action")
@@ -8552,7 +8574,8 @@ class App(QMainWindow):
         self._render_details(cb, steps, act_id, live)
         box.document().setTextWidth(wd)
         h = int(box.document().size().height()) + 6
-        h = max(60, min(DETAIL_BOX_MAX, h))
+        cap = max(DETAIL_BOX_MAX, int(vp.height() * 0.8))  # grows with the thinking; scrolls inside only past most of the screen
+        h = max(60, min(cap, h))
         box.setProperty("boxh", h)
         # a transparent placeholder of the same height reserves the space in the chat
         tf = QTextTableFormat()
@@ -8611,6 +8634,20 @@ class App(QMainWindow):
         err_f = sized(self.fmt["err"])
         dim_f = sized(self.fmt["dim"])
         ok_c, bad_c, idle_c = QColor("#4caf7d"), QColor("#e5534b"), QColor(128, 128, 128)
+
+        chip_bg = QColor(128, 128, 128, 46)
+        chip_bg_strong = QColor(col["accent"])
+        chip_bg_strong.setAlpha(60)
+
+        def chip_f(href, strong):
+            """A small pill-like button (shaded background, padded text) for folding."""
+            f = QTextCharFormat(sized(self.fmt["bot"] if strong else self.fmt["dim"], True, 0))
+            f.setAnchor(True)
+            f.setAnchorHref(href)
+            f.setBackground(chip_bg_strong if strong else chip_bg)
+            f.setForeground(QColor(col["text"]) if strong else QColor(col["dim"]))
+            f.setFontUnderline(False)
+            return f
 
         def stats(n):
             ops = sum(1 for it in n["items"] if it.get("k") == "tool")
@@ -8682,13 +8719,12 @@ class App(QMainWindow):
                     cc.insertText(txt, dim_f)
             for i, sub in enumerate(node["subs"], 1):
                 fill(cc, sub, "%s.%d" % (path, i), depth + 1, False)
-            cc.insertBlock(blk(depth + 1, 5), QTextCharFormat())
-            fold = QTextCharFormat(dim_f)
-            fold.setAnchor(True)
-            fold.setAnchorHref("sec:" + sec_id)
-            cc.insertText("˄ طيّ", fold)
+            fb = blk(depth + 1, 8)
+            fb.setAlignment(Qt.AlignLeft)
+            cc.insertBlock(fb, QTextCharFormat())
+            cc.insertText(CHIP_PAD + "طي" + CHIP_PAD, chip_f("sec:" + sec_id, False))
 
-        rows = len(tree) + 1
+        rows = max(1, len(tree))
         tf = QTextTableFormat()
         tf.setBorder(0)
         tf.setCellPadding(11)
@@ -8710,12 +8746,11 @@ class App(QMainWindow):
             cell.setFormat(cf)
         for mi, m in enumerate(tree, 1):
             fill(table.cellAt(mi - 1, 0).firstCursorPosition(), m, str(mi), 0, True)
-        cc = table.cellAt(rows - 1, 0).firstCursorPosition()
-        cc.setBlockFormat(blk(0, 0))
-        fold = QTextCharFormat(dim_f)
-        fold.setAnchor(True)
-        fold.setAnchorHref("act:" + act_id)
-        cc.insertText("˄ طيّ التفكير كله", fold)
+        cc = table.cellAt(rows - 1, 0).lastCursorPosition()
+        fb = blk(0, 10)
+        fb.setAlignment(Qt.AlignLeft)
+        cc.insertBlock(fb, QTextCharFormat())
+        cc.insertText(CHIP_PAD + "طي التفكير كله" + CHIP_PAD, chip_f("act:" + act_id, True))
 
     @staticmethod
     def _airy(c):
@@ -8842,7 +8877,7 @@ class App(QMainWindow):
             return
         sb = self.view.verticalScrollBar()
         keep = sb.value()
-        at_bottom = keep >= sb.maximum() - 24
+        at_bottom = keep >= sb.maximum() - 24 and not self.view.selecting()
         self._drop_box("live")
         c = QTextCursor(self.view.document())
         c.setPosition(self.reply_start)
@@ -10328,11 +10363,11 @@ class App(QMainWindow):
 
     def append(self, text, kind="bot"):
         sb = self.view.verticalScrollBar()
-        at_bottom = sb.value() >= sb.maximum() - 24
+        at_bottom = sb.value() >= sb.maximum() - 24 and not self.view.selecting()
+        keep = sb.value()
         c = self._end_cursor()
         c.insertText(text, self.fmt[kind])
-        if at_bottom:
-            sb.setValue(sb.maximum())
+        sb.setValue(sb.maximum() if at_bottom else keep)
 
     def append_image(self, path):
         img = QImage(path)
@@ -10597,12 +10632,6 @@ class App(QMainWindow):
         shell_mode = self.shell_mode if self.shell_mode in ("ask", "free") else "off"
         allow_computer = bool(self.computer_enabled)
         use_browser = bool(self.browser_enabled and self.web_ok)
-        if use_browser:
-            if self._browser_owner and self._browser_owner != cid and self._browser_owner in self.runs:
-                use_browser = False  # the one built-in browser is busy with another chat
-                run.live["warns"].append("المتصفح المدمج مشغول مع محادثة ثانية، فهذا الرد يشتغل بدونه.")
-            else:
-                self._browser_owner = cid
         runner = None
         if True:  # the code interpreter is always available, so there is always a runner
             runner = ToolRunner(
@@ -10614,7 +10643,7 @@ class App(QMainWindow):
                 confirm_files=bool(self.confirm_edits),
                 shell_mode=shell_mode,
                 allow_computer=allow_computer,
-                browser=self.browser_bridge if use_browser else None,
+                browser=(lambda a_, _r=run, **k_: self.browser_bridge(a_, _r, **k_)) if use_browser else None,
                 plan_first=bool(self.plan_first),
             )
             runner.stop_event = run.stop_event
@@ -10982,7 +11011,7 @@ class App(QMainWindow):
                     L["body"] = ""
                     R.live_dirty = True
             elif kind == "browser":
-                self._do_browser(val)
+                self._do_browser(val, R)
             elif kind == "confirm":
                 title, detail, slot = val
                 if self._confirm_open:
@@ -11229,12 +11258,30 @@ class App(QMainWindow):
                 elif R.last_text and msgs:
                     self.drafts[ch_["id"]] = R.last_text
                 self.finish(R, failed=True)
-        if self.live_dirty and self.live is not None:
+        if self.live_dirty and self.live is not None and self.hold_live_redraw():
+            if time.time() - getattr(self, "_hold_msg_t", 0) > 4:
+                self._hold_msg_t = time.time()
+                self.statusBar().showMessage("الشاشة واقفة وأنت تحدد نص، وتتحدّث لما تلغي التحديد", 3500)
+        elif self.live_dirty and self.live is not None:
             # redrawing rebuilds the whole reply, so on long runs do it less often (this was freezing the window)
             gap = min(1.2, 0.12 + 0.004 * len(self.live["steps"]) + (0.3 if "live" in self.open_acts else 0))
             if time.time() - getattr(self, "_last_redraw", 0) >= gap:
                 self._last_redraw = time.time()
                 self.redraw_live()
+
+    def hold_live_redraw(self):
+        """Do not rebuild the streaming reply while the mouse is down or something is selected (in the chat or in a thinking box)."""
+        if QApplication.mouseButtons() & Qt.LeftButton:
+            return True
+        if self.view.selecting():
+            return True
+        for _cur, w in list(self._boxes.values()):
+            try:
+                if w.textCursor().hasSelection():
+                    return True
+            except Exception:
+                pass
+        return False
 
     def checkpoint(self, R, force=False):
         """Save the work in progress (small file) so it can be resumed after a crash."""
@@ -11270,6 +11317,8 @@ class App(QMainWindow):
 
     def recover_after_crash(self):
         """If the last run died in the middle of a reply, bring back what it had done and offer to continue."""
+        if self.runs:  # a reply started before this check: its checkpoint file is live work, not a crash
+            return
         rs = load_json(RESUME_PATH, None)
         crashed = PREV_CRASH
         if not isinstance(rs, dict) or not rs.get("steps") and not rs.get("body"):
@@ -11314,8 +11363,6 @@ class App(QMainWindow):
         """A reply (of any chat) ended: free its run, then tidy the screen if that chat is the one shown."""
         cid = R.chat["id"]
         self.runs.pop(cid, None)
-        if self._browser_owner == cid:
-            self._browser_owner = None
         self.clear_resume(cid)
         write_state(last_event="reply finished", busy=bool(self.runs))
         self._bal_changed = False
