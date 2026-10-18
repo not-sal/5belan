@@ -3244,7 +3244,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.22.2"
+APP_VERSION = "2.23.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5751,19 +5751,27 @@ class RoomDialog(QDialog):
         lr = QHBoxLayout()
         lr.addWidget(QLabel("جولات"))
         self.rounds = QSpinBox()
-        self.rounds.setRange(1, 30)
+        self.rounds.setRange(1, 1000)
         self.rounds.setValue(3)
         self.rounds.setToolTip("كم جولة (رد من كل عضو) قبل ما يوقفون وينتظرون ردك")
-        lr.addWidget(self.rounds)
-        lr.addWidget(QLabel("سقف الصرف $"))
+        lr.addWidget(self.rounds, 1)
+        self.rounds_free = QCheckBox("بلا حد")
+        lr.addWidget(self.rounds_free)
+        ll.addLayout(lr)
+        br_ = QHBoxLayout()
+        br_.addWidget(QLabel("سقف الصرف $"))
         self.budget = QDoubleSpinBox()
         self.budget.setDecimals(3)
-        self.budget.setRange(0.001, 50.0)
+        self.budget.setRange(0.001, 1000.0)
         self.budget.setSingleStep(0.01)
         self.budget.setValue(0.05)
         self.budget.setToolTip("لما يوصل مجموع صرف الغرفة هذا الرقم توقف تلقائيًا")
-        lr.addWidget(self.budget)
-        ll.addLayout(lr)
+        br_.addWidget(self.budget, 1)
+        self.budget_free = QCheckBox("بلا حد")
+        br_.addWidget(self.budget_free)
+        ll.addLayout(br_)
+        self.rounds_free.toggled.connect(lambda on: self.rounds.setEnabled(not on and not self._running()))
+        self.budget_free.toggled.connect(lambda on: self.budget.setEnabled(not on and not self._running()))
         self.stopword = QCheckBox("يوقفون لما يتفقون (أو لما المدير يختم)")
         self.stopword.setChecked(True)
         ll.addWidget(self.stopword)
@@ -5802,7 +5810,7 @@ class RoomDialog(QDialog):
             brow.addWidget(b)
         lay.addLayout(brow)
         self._locked_widgets = (self.b_go, self.b_dist, self.b_sum, self.topic, self.mlist, self.m_name, self.m_role, self.m_level, self.m_group,
-                                self.m_model, self.m_think, self.m_mute, self.rounds, self.budget, self.stopword, self.combo, self.flist)
+                                self.m_model, self.m_think, self.m_mute, self.rounds, self.rounds_free, self.budget, self.budget_free, self.stopword, self.combo, self.flist)
         self.sig_msg.connect(self._on_msg)
         self.sig_status.connect(self.status.setText)
         self.sig_done.connect(self._on_done)
@@ -5841,6 +5849,8 @@ class RoomDialog(QDialog):
         r["topic"] = self.topic.toPlainText().strip()
         r["rounds"] = self.rounds.value()
         r["budget"] = self.budget.value()
+        r["rounds_free"] = self.rounds_free.isChecked()
+        r["budget_free"] = self.budget_free.isChecked()
         r["stop"] = self.stopword.isChecked()
 
     def _save(self):
@@ -5888,6 +5898,10 @@ class RoomDialog(QDialog):
         self.topic.setPlainText(r.get("topic", ""))
         self.rounds.setValue(int(r.get("rounds", 3)))
         self.budget.setValue(float(r.get("budget", 0.05)))
+        self.rounds_free.setChecked(bool(r.get("rounds_free")))
+        self.budget_free.setChecked(bool(r.get("budget_free")))
+        self.rounds.setEnabled(not self.rounds_free.isChecked())
+        self.budget.setEnabled(not self.budget_free.isChecked())
         self.stopword.setChecked(r.get("stop", True))
         self._fill_members()
         self._fill_files()
@@ -6150,13 +6164,19 @@ class RoomDialog(QDialog):
 
     def _status_idle(self):
         r = self.room
-        self.status.setText(("صرف الغرفة %.4f$ من %.3f$ · رسائل %d" % (r.get("spent", 0.0), r.get("budget", 0.05), len(r["msgs"]))) if r else "")
+        self.status.setText(("صرف الغرفة %.4f$ من %s · رسائل %d" % (r.get("spent", 0.0), self._cap_text(r), len(r["msgs"]))) if r else "")
+
+    @staticmethod
+    def _cap_text(r):
+        return "بلا حد" if r.get("budget_free") else "%.3f$" % r.get("budget", 0.05)
 
     def _lock(self, on):
         for w in self._locked_widgets:
             w.setEnabled(not on)
         self.b_stop.setEnabled(on)
         if not on:
+            self.rounds.setEnabled(not self.rounds_free.isChecked())
+            self.budget.setEnabled(not self.budget_free.isChecked())
             self._member_selected(self.mlist.currentRow())
 
     # ----- running
@@ -6194,9 +6214,12 @@ class RoomDialog(QDialog):
         if not key:
             QMessageBox.information(self, "غرفة نقاش", "حط مفتاح DeepSeek أول من إعدادات التطبيق.")
             return
-        if r.get("spent", 0.0) >= r["budget"]:
-            QMessageBox.information(self, "غرفة نقاش", "الغرفة وصلت سقف الصرف. ارفع السقف عشان تكمل.")
+        if not r.get("budget_free") and r.get("spent", 0.0) >= r["budget"]:
+            QMessageBox.information(self, "غرفة نقاش", "الغرفة وصلت سقف الصرف. ارفع السقف أو اختر «بلا حد» عشان تكمل.")
             return
+        if r.get("rounds_free") and r.get("budget_free"):
+            if QMessageBox.question(self, "بلا حدود", "لا حد للجولات ولا للصرف: النقاش ما يوقف إلا بزر «إيقاف»، أو لما يتفقون، أو لو صاروا يكررون، أو لو صار خطأ.\nتكمل؟") != YES:
+                return
         r["running"] = True
         self._save()
         self._stop.clear()
@@ -6217,13 +6240,15 @@ class RoomDialog(QDialog):
                 order = sorted(order, key=lambda m: m["name"] != asked["to"])  # stable: the addressed member goes first
             boss = room_boss(r)
             n = len(order)
-            for rd in range(1, r["rounds"] + 1):
+            import itertools
+            rounds_iter = itertools.count(1) if r.get("rounds_free") else range(1, r["rounds"] + 1)
+            for rd in rounds_iter:
                 for m in order:
                     if self._stop.is_set():
                         raise StopIteration("أوقفتها")
-                    if r.get("spent", 0.0) >= r["budget"]:
+                    if not r.get("budget_free") and r.get("spent", 0.0) >= r["budget"]:
                         raise StopIteration("وصلت سقف الصرف")
-                    self.sig_status.emit("جولة %d من %d · يتكلم: %s · صرف %.4f$ من %.3f$" % (rd, r["rounds"], m["name"], r.get("spent", 0.0), r["budget"]))
+                    self.sig_status.emit("جولة %d من %s · يتكلم: %s · صرف %.4f$ من %s" % (rd, "بلا حد" if r.get("rounds_free") else r["rounds"], m["name"], r.get("spent", 0.0), self._cap_text(r)))
                     model = m.get("model") or MODELS[0]
                     msg, u = api_chat(key, model, room_turn_messages(r, m), think=m.get("think", "off"), timeout=180, max_tokens=500)
                     r["spent"] = r.get("spent", 0.0) + usage_cost(model, u)[0]
@@ -6255,7 +6280,7 @@ class RoomDialog(QDialog):
         if self.room is not None:
             self.room["running"] = False
         self._save()
-        self.status.setText("وقفت: %s · صرف %.4f$ من %.3f$" % (reason, self.room.get("spent", 0.0), self.room["budget"]))
+        self.status.setText("وقفت: %s · صرف %.4f$ من %s" % (reason, self.room.get("spent", 0.0), self._cap_text(self.room)))
         try:
             if self.app.tray is not None and not self.isActiveWindow():
                 self.app.tray.showMessage("غرفة النقاش", reason, QSystemTrayIcon.Information, 6000)
