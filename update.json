@@ -1,10 +1,10 @@
 {
-  "version": "2.23.0",
-  "notes": "Room: unlimited option for rounds and for spending cap, each on its own",
+  "version": "2.24.0",
+  "notes": "Room talk shown in the big chat, slash commands to ask a member, a group head or the manager, balanced ending (mode, minimum rounds, final confirmation round)",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "a69f2e6f58571cb04f3eb9d84ab6ff25c46b6f06793d96e29ec198e7c2c219fc"
+      "sha256": "ecc9547190a018ab6f96d1e4fd7ce5447d5a7e60c22856fcb3660c9a23e599eb"
     },
     {
       "name": "guard.py",
