@@ -3296,7 +3296,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.29.0"
+APP_VERSION = "2.29.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4131,10 +4131,17 @@ class RunOutputDialog(QDialog):
         row.addWidget(close)
         lay.addLayout(row)
 
-    def done(self, text):
+    def finish_run(self, text):
+        """(Not named done: QDialog.done(int) is what close/Esc/the X button call, and overriding it broke closing the window.)"""
+        self.finished_run = True
         self.head.setText("انتهى")
         self.stop_btn.setEnabled(False)
         self.out.setPlainText(text)
+
+    def reject(self):
+        if not getattr(self, "finished_run", False):
+            self.stop_event.set()  # closing the window while the command still runs stops it
+        super().reject()
 
 
 class BrowserPanel(QWidget):
@@ -9918,7 +9925,7 @@ class App(QMainWindow):
         def poll_run():
             if "out" in holder:
                 tm.stop()
-                dlg.done(holder["out"])
+                dlg.finish_run(holder["out"])
                 if py:
                     self._files_sig = None
                     self.refresh_files_panel()
