@@ -3244,7 +3244,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.27.0"
+APP_VERSION = "2.28.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -3769,8 +3769,17 @@ class ChatView(QTextBrowser):
     # ----- painting
     BOX_PROP = int(QTextFormat.UserProperty) + 21  # marks a table (1 = my message) or a block (2 = code) that gets a rounded box
 
+    SPEAKER_HUES = (205, 25, 285, 140, 340, 50, 175, 245)  # box kinds 10.. : one colour per room member
+
     def set_box_colors(self, bubble, code, border):
         self.box_colors = {1: (QColor(bubble), QColor(border)), 2: (QColor(code), QColor(border))}
+        dark = QColor(bubble).lightness() < 128
+        self.speaker_names = []
+        for i, hue in enumerate(self.SPEAKER_HUES):
+            fill = QColor.fromHsl(hue, 110, 38) if dark else QColor.fromHsl(hue, 150, 230)
+            edge = QColor.fromHsl(hue, 90, 66) if dark else QColor.fromHsl(hue, 110, 165)
+            self.box_colors[10 + i] = (fill, edge)
+            self.speaker_names.append(QColor.fromHsl(hue, 190, 170) if dark else QColor.fromHsl(hue, 200, 68))
         self.viewport().update()
 
     def _paint_boxes(self):
@@ -4453,7 +4462,7 @@ CHAT_WIDTHS = {
 class AppSettingsDialog(QDialog):
     """Application-wide settings (like the Settings page in the Claude app): account, appearance, updates."""
 
-    def __init__(self, parent, key, remember, theme, update_url, width="wide", suggest=True, auto_update=True, skill_offers=True, khaled=False):
+    def __init__(self, parent, key, remember, theme, update_url, width="wide", suggest=True, auto_update=False, skill_offers=True, khaled=False):
         super().__init__(parent)
         self.setWindowTitle("إعدادات التطبيق")
         self.resize(600, 560)
@@ -4489,7 +4498,7 @@ class AppSettingsDialog(QDialog):
         self.suggest_box = QCheckBox("اقتراح أسئلة متابعة تحت كل رد (يصرف شوي بسيط)")
         self.suggest_box.setChecked(bool(suggest))
         lay.addWidget(self.suggest_box)
-        self.auto_box = QCheckBox("حدّث البرنامج تلقائياً لما ينزل إصدار جديد")
+        self.auto_box = QCheckBox("حدّث البرنامج تلقائياً لما ينزل إصدار جديد (إذا طفيتها يطلع لك إشعار وبس، وأنت تقرر)")
         self.auto_box.setChecked(bool(auto_update))
         lay.addWidget(self.auto_box)
         hs = QLabel("المهارات")
@@ -5360,6 +5369,7 @@ class MemoryDialog(QDialog):
 
 ROOMS_PATH = os.path.join(DATA_DIR, "rooms.json")
 ROOM_AGREE = "[[اتفقنا]]"
+ROOM_NEUTRAL = ("تنبيه", "خلاصة", "النظام")  # speakers that are not members: shown as plain cards, no member colour
 _ROOMS_LOCK = threading.Lock()
 _ROOMS_BAK_T = [0.0]
 ROOM_CTX_PARTIAL = 30000   # characters kept from "last 6 topics"
@@ -5587,7 +5597,7 @@ def room_member_prompt(room, m):
 
 
 def room_turn_messages(room, m):
-    vis = [x for x in room["msgs"] if room_sees(room, m, x)][-ROOM_KEEP:]
+    vis = [x for x in room["msgs"] if not x.get("sys") and room_sees(room, m, x)][-ROOM_KEEP:]
     talk = "\n".join("[%s]: %s" % (x["who"], x["text"]) for x in vis) or "(nobody spoke yet)"
     user = "Topic: %s\n\nDiscussion so far:\n%s\n\nIt is your turn, %s." % (room.get("topic", ""), talk, m["name"])
     asked = next((x for x in reversed(vis) if x["who"] == "الحكم"), None)
@@ -5603,6 +5613,40 @@ def room_turn_messages(room, m):
         blocks = [b for b in (room_image_block(f) for f in room_member_images(room, m)) if b]
     content = [{"type": "text", "text": user}] + blocks if blocks else user
     return [{"role": "system", "content": room_member_prompt(room, m)}, {"role": "user", "content": content}]
+
+
+ROOM_RETRIES = 3          # tries per member turn before that turn is given up
+ROOM_FAIL_LIMIT = 3       # turns in a row that failed (after their retries) before the run stops
+ROOM_REPEAT_LIMIT = 2     # near-identical replies in a row before the run stops
+
+
+def room_member_reply(key, room, m, stop, max_tokens=500):
+    """One member's turn with the retries a long run needs: a network or rate-limit hiccup, or an empty answer (thinking used up the
+    token budget), must not end the talk. Returns (text, cost in USD); text is '' when the member stayed silent. Raises only when
+    every try failed with an error."""
+    model = m.get("model") or MODELS[0]
+    think = m.get("think", "off")
+    budget = max_tokens + (3000 if think != "off" else 0)  # reasoning tokens count against max_tokens
+    cost, err = 0.0, None
+    for attempt in range(ROOM_RETRIES):
+        if stop.is_set():
+            break
+        try:
+            msg, u = api_chat(key, model, room_turn_messages(room, m), think=think, timeout=180, max_tokens=budget)
+        except Exception as e:
+            err = e
+            if stop.wait(2 * (attempt + 1) ** 2):  # 2 s, 8 s, 18 s; leaves at once when you press stop
+                break
+            continue
+        err = None
+        cost += usage_cost(model, u)[0]
+        text = str(msg.get("content") or "").strip()
+        if text:
+            return text, cost
+        budget += 1500
+    if err is not None:
+        raise err
+    return "", cost
 
 
 def room_parse_plan(text, room):
@@ -6509,7 +6553,7 @@ class RoomDialog(QDialog):
 
     def _refresh_export(self):
         r = self.room
-        self.b_exp.setVisible(bool(r and any(m["who"] not in ("الحكم", "تنبيه") for m in r["msgs"])))
+        self.b_exp.setVisible(bool(r and any(m["who"] not in ("الحكم", "تنبيه", "النظام") for m in r["msgs"])))
 
     def _status_idle(self):
         r = self.room
@@ -6590,10 +6634,12 @@ class RoomDialog(QDialog):
         try:
             self.sig_status.emit("يرد: %s…" % m["name"])
             self.sig_turn.emit(m["name"])
-            model = m.get("model") or MODELS[0]
-            msg, u = api_chat(key, model, room_turn_messages(r, m), think=m.get("think", "off"), timeout=180, max_tokens=700)
-            r["spent"] = r.get("spent", 0.0) + usage_cost(model, u)[0]
-            text = str(msg.get("content") or "").replace(ROOM_AGREE, "").strip() or "(…)"
+            text, cost = room_member_reply(key, r, m, self._stop, max_tokens=700)
+            r["spent"] = r.get("spent", 0.0) + cost
+            text = text.replace(ROOM_AGREE, "").strip()
+            if not text:
+                self.sig_done.emit("%s ما رد (ردّ فاضي). جرّب تسأله مرة ثانية" % m["name"])
+                return
             r["msgs"].append({"who": m["name"], "text": text, "vis": room_vis(m)})
             rooms_save(self.rooms)
             self.sig_msg.emit(m["name"], text)
@@ -6650,8 +6696,10 @@ class RoomDialog(QDialog):
             heads = [m for m in order if room_level(m) == "head"]
             import itertools
             rounds_iter = itertools.count(1) if r.get("rounds_free") else range(1, r["rounds"] + 1)
+            fails = repeats = 0
             for rd in rounds_iter:
                 said = {}
+                spoke = 0
                 for m in order:
                     if self._stop.is_set():
                         raise StopIteration("أوقفتها")
@@ -6659,19 +6707,36 @@ class RoomDialog(QDialog):
                         raise StopIteration("وصلت سقف الصرف")
                     self.sig_status.emit("جولة %d من %s · يتكلم: %s · صرف %.4f$ من %s" % (rd, "بلا حد" if r.get("rounds_free") else r["rounds"], m["name"], r.get("spent", 0.0), self._cap_text(r)))
                     self.sig_turn.emit(m["name"])
-                    model = m.get("model") or MODELS[0]
-                    msg, u = api_chat(key, model, room_turn_messages(r, m), think=m.get("think", "off"), timeout=180, max_tokens=500)
-                    r["spent"] = r.get("spent", 0.0) + usage_cost(model, u)[0]
-                    text = str(msg.get("content") or "").strip()
+                    try:
+                        text, cost = room_member_reply(key, r, m, self._stop)
+                    except Exception as e:  # this turn failed after its retries: skip it, stop only if it keeps happening
+                        fails += 1
+                        if fails >= ROOM_FAIL_LIMIT:
+                            raise StopIteration("تعذّر الاتصال بالنموذج %d مرات ورا بعض: %s" % (fails, str(e)[:100]))
+                        self.sig_status.emit("%s ما قدر يرد (%s) · أتخطاه وأكمل" % (m["name"], str(e)[:60]))
+                        continue
+                    fails = 0
+                    r["spent"] = r.get("spent", 0.0) + cost
+                    if self._stop.is_set() and not text:
+                        raise StopIteration("أوقفتها")
                     agree = ROOM_AGREE in text
-                    text = text.replace(ROOM_AGREE, "").strip() or "(…)"
+                    text = text.replace(ROOM_AGREE, "").strip()
+                    if not text:
+                        continue  # stayed silent even after the retries: no empty message in the chat, the round goes on
+                    spoke += 1
                     prev = [x["text"] for x in r["msgs"] if x["who"] == m["name"]][-1:]
                     r["msgs"].append({"who": m["name"], "text": text, "agree": agree, "vis": room_vis(m)})
                     said[m["name"]] = agree
                     rooms_save(self.rooms)  # every message is on disk at once: a crash loses nothing
                     self.sig_msg.emit(m["name"], text)
-                    if prev and difflib.SequenceMatcher(None, prev[0], text).ratio() > 0.85:
-                        raise StopIteration("صاروا يكررون نفس الكلام")
+                    if prev and len(text) > 20 and difflib.SequenceMatcher(None, prev[0], text).ratio() > 0.85:
+                        repeats += 1
+                        if repeats >= ROOM_REPEAT_LIMIT:
+                            raise StopIteration("صاروا يكررون نفس الكلام")
+                    else:
+                        repeats = 0
+                if not spoke:
+                    raise StopIteration("ما أحد رد في هذي الجولة")
                 # ---- end of a full round: may the talk end now? (balanced: minimum rounds, then a last confirmation round)
                 r["rounds_done"] = r.get("rounds_done", 0) + 1
                 if mode == "manual" or r["rounds_done"] < r.get("min_rounds", 2):
@@ -6696,6 +6761,13 @@ class RoomDialog(QDialog):
             reason = str(e)
         except Exception as e:
             reason = "صار خطأ: " + str(e)[:120]
+        try:  # the reason also lands in the big chat, so a stopped talk is never a silent one
+            note = {"who": "النظام", "text": "وقف النقاش: " + reason, "vis": ["*"], "sys": True}
+            r["msgs"].append(note)
+            rooms_save(self.rooms)
+            self.sig_msg.emit("النظام", note["text"])
+        except Exception:
+            pass
         self.sig_done.emit(reason)
 
     def _on_done(self, reason):
@@ -6712,6 +6784,10 @@ class RoomDialog(QDialog):
                 self.app.tray.showMessage("غرفة النقاش", reason, QSystemTrayIcon.Information, 6000)
         except Exception:
             pass
+        bg = getattr(self.app, "room_bg", None)
+        if bg is not None and bg.inner is self:  # the panel was closed while the talk ran: nothing keeps it alive any more
+            self.app.room_bg = None
+            bg.deleteLater()
 
     def summarize(self):
         r = self.room
@@ -6730,7 +6806,7 @@ class RoomDialog(QDialog):
         try:
             who = room_boss(r) or r["members"][0]
             self.sig_turn.emit(who["name"])
-            talk = "\n".join("[%s]: %s" % (x["who"], x["text"]) for x in r["msgs"][-40:])
+            talk = "\n".join("[%s]: %s" % (x["who"], x["text"]) for x in [y for y in r["msgs"] if not y.get("sys")][-40:])
             msgs = [{"role": "system", "content": "Summarize the discussion below in the language of the topic, under 150 words: the decisions reached, the open points, and what the referee should do next. Plain text, no preamble."},
                     {"role": "user", "content": "Topic: %s\n\n%s" % (r.get("topic", ""), talk)}]
             model = who.get("model") or MODELS[0]
@@ -6753,7 +6829,8 @@ class RoomDialog(QDialog):
             return
         out = ["# " + (r.get("topic") or "غرفة نقاش"), "", "الأعضاء: " + "، ".join(self._member_label(m) for m in r["members"]), ""]
         for m in r["msgs"]:
-            out += ["### " + m["who"], m["text"], ""]
+            if not m.get("sys"):
+                out += ["### " + m["who"], m["text"], ""]
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(out))
@@ -6765,7 +6842,7 @@ class RoomDialog(QDialog):
         r = self.room
         if r is None or not r["msgs"]:
             return
-        talk = "\n\n".join("%s: %s" % (m["who"], m["text"]) for m in r["msgs"])
+        talk = "\n\n".join("%s: %s" % (m["who"], m["text"]) for m in r["msgs"] if not m.get("sys"))
         if r.get("files"):
             talk += "\n\n(ملفات الغرفة: %s)" % "، ".join(f["name"] for f in r["files"])
         c = {"id": uuid.uuid4().hex, "title": "غرفة: " + _cut(r.get("topic") or "نقاش", 30), "updated": time.time(), "project": "",
@@ -6778,10 +6855,10 @@ class RoomDialog(QDialog):
         self.status.setText("انحفظ النقاش كمحادثة")
 
     def done(self, r):
-        self._stop.set()
+        # closing the panel must not end a running talk: the dock is parked (App.close_dock) and the run goes on in the big chat
         try:
             self._save()
-            if self.room is not None:
+            if self.room is not None and not self._running():
                 self.app.room_thinking.pop(self.room["id"], None)
         except Exception:
             pass
@@ -7805,6 +7882,8 @@ def make_qss(c):
     QPushButton#navbtn::menu-indicator { image: url(%(chev)s); width: 16px; height: 16px; subcontrol-origin: padding; subcontrol-position: center right; right: 8px; }
     QToolButton#iconbtn:checked { background: %(bubble)s; border-color: %(accent)s; }
     QFrame#vsep { color: %(border)s; }
+    QFrame#roombar { background: %(bubble)s; border: none; border-bottom: 1px solid %(border)s; }
+    QFrame#roombar QLabel { background: transparent; }
     QToolButton#quotechip { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 9px; padding: 3px 9px; color: %(text)s; }
     QToolButton#quotechip:hover { border-color: %(accent)s; }
     QFrame#quotecard { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 10px; }
@@ -8228,6 +8307,7 @@ class App(QMainWindow):
         super().__init__()
         self.runs = {}  # chat id -> Run, for every chat that is answering right now
         self.room_thinking = {}  # room id -> name of the member who is thinking right now
+        self.room_bg = None  # the room panel parked (hidden) while its talk keeps running after the panel was closed
         self.setWindowTitle("5belan")
         if os.path.exists(ICON_PATH):
             self.setWindowIcon(QIcon(ICON_PATH))
@@ -8285,6 +8365,13 @@ class App(QMainWindow):
         cfg = load_json(CONFIG_PATH, {})
         self.cfg = cfg if isinstance(cfg, dict) else {}
         cfg = self.cfg
+        if not cfg.get("upd_notify_only"):  # 2.28.0: a new version only tells you (orange button); you decide, auto-update is opt-in
+            cfg["auto_update"] = False
+            cfg["upd_notify_only"] = True
+            try:
+                save_json(CONFIG_PATH, cfg)
+            except Exception:
+                pass
         self.legacy_settings = {k: cfg[k] for k in CHAT_SETTING_KEYS if k in cfg}
         self._applying = False
         th = cfg.get("theme", "dark")
@@ -8481,6 +8568,19 @@ class App(QMainWindow):
         hl.addWidget(self.undo_btn)
         header.setFixedHeight(52)  # constant height: showing/hiding the reply button must never move the chat text
         ml.addWidget(header)
+
+        self.room_bar = QFrame()  # room chats only: who is thinking right now (or that nobody is), and a stop button while the talk runs
+        self.room_bar.setObjectName("roombar")
+        rbl = QHBoxLayout(self.room_bar)
+        rbl.setContentsMargins(14, 4, 10, 4)
+        self.room_bar_lbl = QLabel()
+        rbl.addWidget(self.room_bar_lbl, 1)
+        self.room_bar_stop = QPushButton("إيقاف النقاش")
+        self.room_bar_stop.setObjectName("flat")
+        self.room_bar_stop.clicked.connect(self.room_stop_from_chat)
+        rbl.addWidget(self.room_bar_stop)
+        self.room_bar.setVisible(False)
+        ml.addWidget(self.room_bar)
 
         self.view = ChatView()
         self.view.verticalScrollBar().valueChanged.connect(lambda _v: self._schedule_place())
@@ -9141,7 +9241,7 @@ class App(QMainWindow):
         dlg = AppSettingsDialog(self, self.key_edit.text(), self.remember_box.isChecked(), self.theme,
                                 (self.cfg.get("update_url") or get_update_url(self.cfg)),
                                 self.cfg.get("chat_width", "wide"),
-                                self.cfg.get("suggest", True) is not False, self.cfg.get("auto_update", True) is not False,
+                                self.cfg.get("suggest", True) is not False, self.cfg.get("auto_update") is True,
                                 self.cfg.get("skill_offers", True) is not False, bool(self.cfg.get("khaled_button")))
         if not dlg.exec():
             return
@@ -9221,6 +9321,20 @@ class App(QMainWindow):
                 self.q.put(("update_check_err", (str(e), silent)))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def tell_update(self, m):
+        """Auto-update is off: say once per version that one is waiting; the orange button is what installs it."""
+        v = str(m.get("version"))
+        if getattr(self, "_upd_told", "") == v:
+            return
+        self._upd_told = v
+        msg = "فيه إصدار جديد %s. إذا تبي تحدّث اضغط الزر البرتقالي فوق، وإذا لا تجاهله." % v
+        self.statusBar().showMessage(msg, 20000)
+        try:
+            if self.tray is not None and not self.isActiveWindow():
+                self.tray.showMessage("خبيلان", msg, QSystemTrayIcon.Information, 8000)
+        except Exception:
+            pass
 
     def auto_apply(self):
         """A new version was published: download it right away; the restart waits until nothing is running."""
@@ -9440,6 +9554,45 @@ class App(QMainWindow):
             cc.insertText(("\u2028" if not firstline else "") + bidi_fix(text), self.fmt["bot"])
         c = self._end_cursor()
         c.insertBlock(QTextBlockFormat(), QTextCharFormat())
+
+    def add_speaker_bubble(self, speaker, idx, body, mid, cost=None, note=""):
+        """A room member's message as its own tinted card with the name on top, like a group chat: each message has clear edges
+        and each person keeps one colour (idx None = a neutral card for the referee's system notes)."""
+        c = self._end_cursor()
+        if not self.view.document().isEmpty():
+            gap = QTextBlockFormat()
+            gap.setTopMargin(6)
+            c.insertBlock(gap, QTextCharFormat())
+        tf = QTextTableFormat()
+        tf.setBorder(0)
+        tf.setCellPadding(14)
+        tf.setCellSpacing(0)
+        tf.setMargin(6)
+        tf.setWidth(QTextLength(QTextLength.PercentageLength, 100))
+        n = len(ChatView.SPEAKER_HUES)
+        tf.setProperty(ChatView.BOX_PROP, 1 if idx is None else 10 + idx % n)
+        table = c.insertTable(1, 1, tf)
+        cc = table.cellAt(0, 0).firstCursorPosition()
+        nf = QTextCharFormat(self.fmt["bot_name"])
+        names = getattr(self.view, "speaker_names", None)
+        if idx is not None and names:
+            nf.setForeground(names[idx % n])
+        lb = QTextBlockFormat()
+        lb.setAlignment(Qt.AlignLeading)
+        lb.setLayoutDirection(Qt.RightToLeft)
+        cc.setBlockFormat(lb)
+        cc.insertText(speaker, nf)
+        airy = QTextBlockFormat()
+        airy.setLineHeight(145, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+        cc.insertBlock(airy, QTextCharFormat())
+        if note:
+            cc.insertText(note, self.fmt["dim"])
+        if body:
+            r0 = cc.position()
+            self.insert_rich_body(cc, body, mid)
+            self.reply_ranges.append((r0, cc.position()))
+            self._insert_reply_copy(cc, mid, body, cost)
+        self._end_cursor().insertBlock(QTextBlockFormat(), QTextCharFormat())
 
     def preview_one(self, kind, name, body):
         FilePreviewDialog(self, kind, name, body, self.assets, self.save_one).exec()
@@ -9857,6 +10010,7 @@ class App(QMainWindow):
         self.listw.blockSignals(False)
         self.title_label.setText(self.current["title"] if self.current else "محادثة جديدة")
         self.update_cost_tip()
+        self.update_room_bar()
 
     def _chat_row_text(self, c, sel):
         pj = self.get_project(c.get("project"))
@@ -9871,6 +10025,7 @@ class App(QMainWindow):
         if not self.runs and not self.room_thinking:
             return
         self._dots += 1
+        self.update_room_bar()
         sel = getattr(self, "_list_sel", "*")
         for i, c in enumerate(self.view_chats):
             if (c["id"] in self.runs or (c.get("room") and c["room"] in self.room_thinking)) and i < self.listw.count():
@@ -9900,6 +10055,7 @@ class App(QMainWindow):
         self.copy_store.clear()
         self.show_files("")
         self.sync_run_ui()
+        self.update_room_bar()
         if not self.current:
             self.refresh_files_panel()
             return
@@ -9908,11 +10064,20 @@ class App(QMainWindow):
         start_i = max(0, len(all_msgs) - RENDER_LAST_MSGS)
         if start_i:
             self.append("(%d رسالة أقدم مخفية عشان البرنامج يظل سريع؛ هي محفوظة وما انحذفت)\n" % start_i, "file")
+        spk_idx = {}  # room member -> colour slot, in order of first appearance (stable while the talk grows)
+        if self.current.get("room"):
+            for mm in all_msgs:
+                sp_ = mm.get("speaker")
+                if sp_ and sp_ not in ROOM_NEUTRAL and sp_ not in spk_idx:
+                    spk_idx[sp_] = len(spk_idx)
         for i, m in enumerate(all_msgs):
             if i < start_i:
                 continue
             if m["role"] == "user":
                 self.add_user_bubble(m.get("shown", ""), m.get("names") or [], m.get("quotes") or [], None if self.current.get("room") else i)
+            elif m.get("speaker"):
+                self.add_speaker_bubble(m["speaker"], spk_idx.get(m["speaker"]), clean_reply(m["content"]), "m%d" % i, m.get("cost"))
+                last_reply = m["content"]
             else:
                 self.append_bot_label(m.get("speaker"))
                 steps = m.get("activity")
@@ -9927,8 +10092,7 @@ class App(QMainWindow):
                 last_reply = m["content"]
         rt = self.room_thinking.get(self.current.get("room")) if self.current.get("room") else None
         if rt:
-            self.append_bot_label(rt)
-            self.append("يفكر الآن…\n", "dim")
+            self.add_speaker_bubble(rt, spk_idx.get(rt, len(spk_idx)), "", "think", note="يفكر الآن…")
         if self.busy and self.live is not None:
             self.append_bot_label()
             self.reply_start = self._end_cursor().position()
@@ -10914,7 +11078,10 @@ class App(QMainWindow):
             return
         frame.hide()
         frame.setParent(None)
-        frame.deleteLater()
+        if key == "room" and isinstance(frame.inner, RoomDialog) and frame.inner._running():
+            self.room_bg = frame  # a running talk keeps its panel alive (hidden); it is released when the run ends
+        else:
+            frame.deleteLater()
         self.relayout()
 
     def open_tasks(self):
@@ -11590,6 +11757,17 @@ class App(QMainWindow):
         self.open_dock("memory", "الذاكرة", lambda: MemoryDialog(self), ok, 420)
 
     def open_room(self, rid=None):
+        bg = getattr(self, "room_bg", None)
+        if bg is not None and "room" not in self.docks:  # the talk kept running while the panel was closed: show that same panel again
+            self.room_bg = None
+            self.docks["room"] = bg
+            self.dock.addWidget(bg)
+            bg.show()
+            bg.inner.show()
+            self.relayout()
+            if rid and (bg.inner.room is None or bg.inner.room["id"] != rid):
+                bg.inner.select_room(rid)
+            return
         self.open_dock("room", "غرفة نقاش", lambda: RoomDialog(self, rid), width=520)
 
     # ---------- room chats: the talk is shown in the big chat ----------
@@ -11602,6 +11780,39 @@ class App(QMainWindow):
              "settings": self.collect_settings(), "project": ""}
         self.chats.append(c)
         return c
+
+    def room_dialog_running_for(self, rid):
+        """The room panel (shown or parked) when it is busy with a talk of this room, else None."""
+        fr = self.docks.get("room") or self.room_bg
+        dlg = fr.inner if fr is not None and isinstance(fr.inner, RoomDialog) else None
+        if dlg is not None and dlg.room is not None and dlg.room["id"] == rid and dlg._running():
+            return dlg
+        return None
+
+    def update_room_bar(self):
+        c = self.current
+        if not c or not c.get("room"):
+            self.room_bar.setVisible(False)
+            return
+        rid = c["room"]
+        who = self.room_thinking.get(rid)
+        running = self.room_dialog_running_for(rid) is not None
+        if who:
+            txt = "%s يفكر الآن%s" % (who, "." * (1 + getattr(self, "_dots", 0) % 3))
+        elif running:
+            txt = "النقاش شغّال، ننتظر الدور الجاي"
+        else:
+            txt = "ما أحد يفكر الحين"
+        col = THEMES[self.theme]["accent" if (who or running) else "dim"]
+        self.room_bar_lbl.setStyleSheet("color: %s; font-weight: bold;" % col)
+        self.room_bar_lbl.setText(txt)
+        self.room_bar_stop.setVisible(running)
+        self.room_bar.setVisible(True)
+
+    def room_stop_from_chat(self):
+        dlg = self.room_dialog_running_for(self.current.get("room")) if self.current else None
+        if dlg is not None:
+            dlg.stop_run()
 
     def room_sync(self, room):
         """Rebuild the room's chat from the room's messages (the room file is the source of truth)."""
@@ -11649,7 +11860,8 @@ class App(QMainWindow):
 
     def room_sync_from_store(self, c):
         rid = c.get("room")
-        dlg = self.docks["room"].inner if "room" in self.docks else None
+        fr = self.docks.get("room") or self.room_bg
+        dlg = fr.inner if fr is not None else None
         pool = dlg.rooms if dlg is not None else rooms_load()
         room = next((r for r in pool if r["id"] == rid), None)
         if room is not None:
@@ -12753,8 +12965,10 @@ class App(QMainWindow):
                     self.update_btn.setVisible(True)
                     if not silent:
                         self.start_update()
-                    elif self.cfg.get("auto_update", True) is not False:
+                    elif self.cfg.get("auto_update") is True:
                         self.auto_apply()
+                    else:
+                        self.tell_update(m)
                 elif not silent:
                     QMessageBox.information(self, "التحديثات", "أنت على آخر إصدار (%s)" % APP_VERSION)
             elif kind == "update_check_err":
