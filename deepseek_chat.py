@@ -3315,7 +3315,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.30.2"
+APP_VERSION = "2.30.3"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4602,9 +4602,13 @@ class AppSettingsDialog(QDialog):
         self.suggest_box = QCheckBox("اقتراح أسئلة متابعة تحت كل رد (يصرف شوي بسيط)")
         self.suggest_box.setChecked(bool(suggest))
         lay.addWidget(self.suggest_box)
-        self.auto_box = QCheckBox("حدّث البرنامج تلقائياً لما ينزل إصدار جديد (إذا طفيتها يطلع لك إشعار وبس، وأنت تقرر)")
-        self.auto_box.setChecked(bool(auto_update))
-        lay.addWidget(self.auto_box)
+        self.auto_box = QCheckBox()  # kept only so the form keeps its shape; the program never updates by itself
+        self.auto_box.setChecked(False)
+        self.auto_box.hide()
+        note_u = QLabel("التحديثات: لما ينزل إصدار جديد يطلع لك زر برتقالي فوق. البرنامج ما يحدّث نفسه أبداً؛ أنت تضغط الزر وتوافق، وبعدها يثبّت ويعيد التشغيل.")
+        note_u.setWordWrap(True)
+        note_u.setObjectName("chip")
+        lay.addWidget(note_u)
         hs = QLabel("المهارات")
         hs.setObjectName("h2")
         lay.addWidget(hs)
@@ -10050,13 +10054,13 @@ class App(QMainWindow):
         dlg = AppSettingsDialog(self, self.key_edit.text(), self.remember_box.isChecked(), self.theme,
                                 (self.cfg.get("update_url") or get_update_url(self.cfg)),
                                 self.cfg.get("chat_width", "wide"),
-                                self.cfg.get("suggest", True) is not False, self.cfg.get("auto_update") is True,
+                                self.cfg.get("suggest", True) is not False, False,
                                 self.cfg.get("skill_offers", True) is not False, bool(self.cfg.get("khaled_button")))
         if not dlg.exec():
             return
         v = dlg.values()
         self.cfg["suggest"] = bool(v["suggest"])
-        self.cfg["auto_update"] = bool(v["auto_update"])
+        self.cfg["auto_update"] = False  # never automatic
         self.cfg["skill_offers"] = bool(v["skill_offers"])
         self.cfg["khaled_button"] = bool(v["khaled"])
         self.key_edit.setText(v["key"])
@@ -10145,25 +10149,6 @@ class App(QMainWindow):
         except Exception:
             pass
 
-    def auto_apply(self):
-        """A new version was published: download it right away; the restart waits until nothing is running."""
-        m = self.pending_update
-        if not m or self._upd_applying or self._upd_restart:
-            return
-        self._upd_applying = True
-        self._auto_upd = True
-        self.update_btn.setEnabled(False)
-        self.update_btn.setText("جاري التحديث…")
-
-        def work():
-            try:
-                n = apply_update(m, lambda s: self.q.put(("update_progress", s)))
-                self.q.put(("update_done", n))
-            except Exception as e:
-                self.q.put(("update_err", str(e)))
-
-        threading.Thread(target=work, daemon=True).start()
-
     def try_restart_after_update(self):
         if not self._upd_restart:
             self.idle_timer.stop()
@@ -10175,8 +10160,14 @@ class App(QMainWindow):
 
     def restart_now(self):
         try:
+            for R_ in list(self.runs.values()):
+                self.checkpoint(R_, force=True)  # whatever is still answering is offered for resuming after the restart
+            if self.runs:
+                self.cfg["resume_why"] = "أعدت تشغيل البرنامج للتحديث بموافقتك"
             if self.remember_box.isChecked() and self.key_edit.text().strip():
                 self.cfg["api_key"] = self.key_edit.text().strip()
+                self.save_cfg()
+            elif self.runs:
                 self.save_cfg()
             self._quitting = True
             restart_app(self.key_edit.text().strip())
@@ -10186,16 +10177,34 @@ class App(QMainWindow):
         QApplication.quit()
 
     def start_update(self):
+        """The orange button: say what will happen (install the new files, restart) and only go on after your approval."""
         m = self.pending_update
-        if not m:
-            return
-        if self.runs:
-            QMessageBox.information(self, "التحديث", "انتظر حتى تنتهي الردود الشغالة ثم حدّث.")
+        if not m or self._upd_applying:
             return
         notes = str(m.get("notes", "")).strip()
-        msg = "يوجد إصدار جديد %s (أنت على %s).\n%s\n\nيتم تنزيل الملفات الجديدة فقط ثم يُعاد تشغيل البرنامج. محادثاتك وإعداداتك ما تتأثر.\nتحدّث الحين؟" % (
-            m.get("version"), APP_VERSION, ("\n" + notes) if notes else "")
-        if QMessageBox.question(self, "تحديث 5belan", msg) != YES:
+        busy = []
+        if self.runs:
+            busy.append("%d %s تشتغل على رد" % (len(self.runs), "محادثة" if len(self.runs) == 1 else "محادثات"))
+        if self._bg_running:
+            busy.append("مهام بالخلفية")
+        for fr_ in (self.docks.get("room"), self.room_bg):
+            if fr_ is not None and isinstance(fr_.inner, RoomDialog) and fr_.inner._running():
+                busy.append("غرفة نقاش تشتغل")
+                break
+        box = QMessageBox(self)
+        box.setWindowTitle("تحديث 5belan")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("يوجد إصدار جديد %s (أنت على %s).\nإذا وافقت: أنزّل الملفات الجديدة، وأثبّت التحديث، وأعيد تشغيل البرنامج." % (m.get("version"), APP_VERSION))
+        extra = (notes + "\n\n") if notes else ""
+        extra += "محادثاتك وإعداداتك ما تتأثر."
+        if busy:
+            extra += "\n\nتنبيه: فيه شغل شغّال الحين (%s) وراح يتوقف عند إعادة التشغيل. بعد ما يفتح البرنامج أسألك إذا تبيني أكمّله من وين وقف." % "، ".join(busy)
+        box.setInformativeText(extra)
+        yes = box.addButton("موافق، ثبّت وأعد التشغيل", QMessageBox.ButtonRole.AcceptRole)
+        no = box.addButton("لاحقاً", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(no)
+        box.exec()
+        if box.clickedButton() is not yes:
             return
         self._auto_upd = False
         self._upd_applying = True
@@ -13908,8 +13917,6 @@ class App(QMainWindow):
                     self.update_btn.setVisible(True)
                     if not silent:
                         self.start_update()
-                    elif self.cfg.get("auto_update") is True:
-                        self.auto_apply()
                     else:
                         self.tell_update(m)
                 elif not silent:
@@ -14218,7 +14225,8 @@ class App(QMainWindow):
             chat["updated"] = time.time()
         self.persist()
         self.refresh_list()
-        why = (crashed or {}).get("why", "غير معروف")
+        why = (crashed or {}).get("why") or self.cfg.pop("resume_why", None) or "غير معروف"
+        self.cfg.pop("resume_why", None)
         titles = "\n".join("• " + _cut(c.get("title") or "محادثة", 50) for c, _r in pairs)
         box = QMessageBox(self)
         box.setWindowTitle("5belan")
