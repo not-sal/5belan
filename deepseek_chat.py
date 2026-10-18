@@ -3244,7 +3244,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.24.0"
+APP_VERSION = "2.24.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5743,9 +5743,8 @@ class RoomDialog(QDialog):
         ml.setContentsMargins(8, 8, 8, 8)
         ml.setSpacing(8)
         self.mlist = QListWidget()
-        self.mlist.setMinimumHeight(84)
-        self.mlist.setMaximumHeight(110)
-        ml.addWidget(self.mlist)
+        self.mlist.setMinimumHeight(150)
+        ml.addWidget(self.mlist, 1)
         mrow = QHBoxLayout()
         for txt, fn in (("من محادثة", self.add_from_chat), ("عضو جديد", self.add_new), ("حذف العضو", self.del_member)):
             b = QPushButton(txt)
@@ -5853,8 +5852,7 @@ class RoomDialog(QDialog):
         ll.addWidget(b_exp)
         ll.addStretch(1)
         self.tabs.addTab(tl, "الحدود")
-        self.tabs.setFixedHeight(340)
-        lay.addWidget(self.tabs)
+        lay.addWidget(self.tabs, 1)
 
         self.view = QTextBrowser()
         self.view.setLayoutDirection(Qt.RightToLeft)
@@ -5865,7 +5863,6 @@ class RoomDialog(QDialog):
         hint.setWordWrap(True)
         hint.setObjectName("chip")
         lay.addWidget(hint)
-        lay.addStretch(1)
         self.status = QLabel("")
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
