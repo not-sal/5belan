@@ -3315,7 +3315,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.30.1"
+APP_VERSION = "2.30.2"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -9314,7 +9314,7 @@ class App(QMainWindow):
         self._dots = 0
         self.dots_timer = QTimer(self)
         self.dots_timer.timeout.connect(self._tick_dots)
-        self.dots_timer.start(500)
+        self.dots_timer.start(60000)  # nothing animates any more (kept only so old code paths stay valid)
 
         # ---------- main area ----------
         main = QWidget()
@@ -10831,22 +10831,14 @@ class App(QMainWindow):
 
     def _chat_row_text(self, c, sel):
         pj = self.get_project(c.get("project"))
-        dots = "." * (1 + getattr(self, "_dots", 0) % 3)
         who = self.room_thinking.get(c.get("room")) if c.get("room") else None
-        busy = ("يفكر" + dots + " ") if c["id"] in self.runs else (("%s يفكر%s " % (who, dots)) if who else "")
+        busy = "(يفكر) " if c["id"] in self.runs else (("(%s يفكر) " % who) if who else "")  # still, no moving dots: they made it feel like something was wrong
         return (busy + ("[جديد] " if c.get("unread") else "") + ("[مثبّتة] " if c.get("pinned") else "") + ("[أرشيف] " if c.get("archived") else "") + c["title"]
                 + (("   ‹%s›" % pj["name"]) if pj and sel == "*" else ""))
 
     def _tick_dots(self):
-        """Animate the «يفكر…» mark on chats that are answering (only their rows are touched)."""
-        if not self.runs and not self.room_thinking:
-            return
-        self._dots += 1
-        self.update_room_bar()
-        sel = getattr(self, "_list_sel", "*")
-        for i, c in enumerate(self.view_chats):
-            if (c["id"] in self.runs or (c.get("room") and c["room"] in self.room_thinking)) and i < self.listw.count():
-                self.listw.item(i).setText(self._chat_row_text(c, sel))
+        """No animation any more: a chat that is answering shows a still «(يفكر)» and its title is coloured (see refresh_list)."""
+        return
 
     def on_select(self, row):
         if row < 0 or row >= len(self.view_chats):
@@ -12739,7 +12731,7 @@ class App(QMainWindow):
         who = self.room_thinking.get(rid)
         running = self.room_dialog_running_for(rid) is not None
         if who:
-            txt = "%s يفكر الآن%s" % (who, "." * (1 + getattr(self, "_dots", 0) % 3))
+            txt = "%s يفكر الآن" % who
         elif running:
             txt = "النقاش شغّال، ننتظر الدور الجاي"
         else:
