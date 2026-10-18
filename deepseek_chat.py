@@ -3244,7 +3244,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.23.0"
+APP_VERSION = "2.24.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5483,22 +5483,72 @@ def room_member_files(room, m):
     return out
 
 
+ROOM_END_MODES = (("manual", "أنا أنهيها فقط"), ("consensus", "إجماع كل الأعضاء"), ("boss", "المدير يختم (مع الرؤساء)"))
+
+
+def room_end_mode(room):
+    """How the talk may end by itself: only I end it / everybody agrees / the manager (and the heads) close it."""
+    mode = room.get("end_mode")
+    if mode in ("manual", "consensus", "boss"):
+        return mode
+    if room.get("stop", True) is False:
+        return "manual"
+    return "boss" if room_boss(room) is not None else "consensus"
+
+
+def room_parse_command(room, text):
+    """«/name text», «/المدير text», «/مجموعة g text» (also with @) -> (kind, member who answers, rest) or None."""
+    t = (text or "").strip()
+    if not t or t[0] not in "/@":
+        return None
+    body = t[1:].lstrip()
+    ms = list(room["members"])
+    boss = room_boss(room)
+    if boss is not None:
+        for w in ("المدير الكبير", "المدير", "مدير"):
+            if body.startswith(w):
+                return ("boss", boss, body[len(w):].strip())
+    if body.startswith("مجموعة"):
+        rest = body[len("مجموعة"):].strip()
+        for g in sorted({m.get("group") for m in ms if m.get("group")}, key=len, reverse=True):
+            if rest.startswith(g):
+                grp = [m for m in ms if m.get("group") == g and not m.get("mute")]
+                who = next((m for m in grp if room_level(m) == "head"), None) or (grp[0] if grp else None)
+                if who is not None:
+                    return ("group", who, rest[len(g):].strip())
+        return None
+    hit = [m for m in ms if body.startswith(m["name"])]
+    if hit:
+        m = max(hit, key=lambda x: len(x["name"]))
+        return ("member", m, body[len(m["name"]):].strip())
+    return None
+
+
 def room_member_prompt(room, m):
     ms = room["members"]
     others = "، ".join("%s (%s)" % (x["name"], dict(ROOM_LEVELS).get(room_level(x), "")) for x in ms if x is not m) or "-"
     lv, g = room_level(m), m.get("group", "")
     boss = room_boss(room)
     if lv == "boss":
-        hier = ("You are the TOP MANAGER. Group heads report to you; you see their reports, decide, direct the work and say who should do what. "
-                "Only you end the discussion, by finishing your reply with %s once the matter is settled." % ROOM_AGREE)
+        hier = "You are the TOP MANAGER. Group heads report to you; you see their reports, decide, direct the work and say who should do what."
     elif lv == "head":
         hier = ("You are the HEAD of group «%s». Guide your group, then give the manager a short report (your replies reach both your group and the manager)." % (g or "-"))
     else:
         hier = "You are a member of group «%s»; you talk with your group and your head." % (g or "-")
-    if boss is not None and lv != "boss":
-        hier += " Do not use the agreement word: only the manager ends the discussion."
-    elif boss is None:
-        hier += " If the participants reached agreement or nothing new is left, end your reply with %s." % ROOM_AGREE
+    mode = room_end_mode(room)
+    careful = (" Use %s only when you are truly satisfied and have nothing new to add; do not rush to agree: first test the weak points. "
+               "If a note «تنبيه» says the discussion is about to close, state any remaining objection (without the word), otherwise confirm with the word." % ROOM_AGREE)
+    if mode == "manual":
+        hier += " Never use any agreement word: only the referee ends the discussion."
+    elif mode == "boss" and boss is not None:
+        if lv == "boss":
+            hier += " Together with the heads you close the discussion, only once the matter is really settled." + careful
+        elif lv == "head":
+            hier += careful
+        else:
+            hier += " Do not use the agreement word: only the manager and the heads close the discussion."
+    else:
+        hier += careful
     prompt = (
         "You are %s, a participant in a discussion room. Other participants: %s. The user is the referee (shown as «الحكم»); follow what the referee says.\n"
         "%s\nYour role: %s\nTopic: %s\n"
@@ -5519,7 +5569,12 @@ def room_turn_messages(room, m):
     user = "Topic: %s\n\nDiscussion so far:\n%s\n\nIt is your turn, %s." % (room.get("topic", ""), talk, m["name"])
     asked = next((x for x in reversed(vis) if x["who"] == "الحكم"), None)
     if asked is not None and asked.get("to") == m["name"]:
-        user += " The referee addressed YOU directly in the last referee message: answer it first."
+        lv = room_level(m)
+        user += " The referee addressed YOU directly in the last referee message: answer it now, briefly, from what you know."
+        if lv == "head":
+            user += " You are the head of your group: first say what is happening in your group, then answer."
+        elif lv == "boss":
+            user += " Answer as the top manager, based on the heads' reports and the referee's messages."
     return [{"role": "system", "content": room_member_prompt(room, m)}, {"role": "user", "content": user}]
 
 
@@ -5652,9 +5707,10 @@ class RoomDialog(QDialog):
     sig_done = Signal(str)
     sig_plan = Signal(object)
 
-    def __init__(self, app):
+    def __init__(self, app, rid=None):
         super().__init__(app)
         self.app = app
+        self._want_rid = rid
         self.setWindowTitle("غرفة نقاش")
         self.resize(560, 780)
         self.rooms = rooms_load()
@@ -5772,9 +5828,26 @@ class RoomDialog(QDialog):
         ll.addLayout(br_)
         self.rounds_free.toggled.connect(lambda on: self.rounds.setEnabled(not on and not self._running()))
         self.budget_free.toggled.connect(lambda on: self.budget.setEnabled(not on and not self._running()))
-        self.stopword = QCheckBox("يوقفون لما يتفقون (أو لما المدير يختم)")
-        self.stopword.setChecked(True)
-        ll.addWidget(self.stopword)
+        er = QHBoxLayout()
+        er.addWidget(QLabel("طريقة الإنهاء"))
+        self.end_mode = QComboBox()
+        for k, t in ROOM_END_MODES:
+            self.end_mode.addItem(t, k)
+        self.end_mode.setToolTip("كيف يقدر النقاش ينتهي لوحده. «أنا أنهيها فقط» ما ينتهي إلا بالحدود أو بزر الإيقاف")
+        er.addWidget(self.end_mode, 1)
+        ll.addLayout(er)
+        mr = QHBoxLayout()
+        mr.addWidget(QLabel("أقل جولات قبل الإنهاء"))
+        self.min_rounds = QSpinBox()
+        self.min_rounds.setRange(1, 100)
+        self.min_rounds.setValue(2)
+        self.min_rounds.setToolTip("الاتفاق قبل هذا العدد من الجولات (بعد آخر رسالة منك) ما يُحسب")
+        mr.addWidget(self.min_rounds, 1)
+        ll.addLayout(mr)
+        self.final_call = QCheckBox("جولة تأكيد أخيرة قبل ما ينتهي")
+        self.final_call.setChecked(True)
+        self.final_call.setToolTip("لما يتفقون، جولة وحدة زيادة: اللي عنده اعتراض يقوله، وإلا يؤكد وينتهي")
+        ll.addWidget(self.final_call)
         b_exp = QPushButton("تصدير النقاش (Markdown)")
         b_exp.clicked.connect(self.export_md)
         ll.addWidget(b_exp)
@@ -5786,14 +5859,18 @@ class RoomDialog(QDialog):
         self.view = QTextBrowser()
         self.view.setLayoutDirection(Qt.RightToLeft)
         self.view.document().setDefaultTextOption(auto_direction_option())
-        self.view.setMinimumHeight(140)
-        lay.addWidget(self.view, 1)
+        self.view.hide()  # the talk is shown in the big chat (see App.room_sync)
+        lay.addWidget(self.view)
+        hint = QLabel("النقاش يظهر بالشات الكبير. اكتب رسالتك هناك. اكتب / لاختيار شخص أو مجموعة أو المدير تسأله مباشرة.")
+        hint.setWordWrap(True)
+        hint.setObjectName("chip")
+        lay.addWidget(hint)
+        lay.addStretch(1)
         self.status = QLabel("")
+        self.status.setWordWrap(True)
         lay.addWidget(self.status)
         self.inp = QLineEdit()
-        self.inp.setPlaceholderText("ردّك عليهم (Enter يرسل ويكمّلون النقاش)")
-        self.inp.returnPressed.connect(self.send)
-        lay.addWidget(self.inp)
+        self.inp.hide()
         brow = QHBoxLayout()
         self.b_go = QPushButton("ابدأ / كمّل")
         self.b_go.setObjectName("primary")
@@ -5810,7 +5887,7 @@ class RoomDialog(QDialog):
             brow.addWidget(b)
         lay.addLayout(brow)
         self._locked_widgets = (self.b_go, self.b_dist, self.b_sum, self.topic, self.mlist, self.m_name, self.m_role, self.m_level, self.m_group,
-                                self.m_model, self.m_think, self.m_mute, self.rounds, self.rounds_free, self.budget, self.budget_free, self.stopword, self.combo, self.flist)
+                                self.m_model, self.m_think, self.m_mute, self.rounds, self.rounds_free, self.budget, self.budget_free, self.end_mode, self.min_rounds, self.final_call, self.combo, self.flist)
         self.sig_msg.connect(self._on_msg)
         self.sig_status.connect(self.status.setText)
         self.sig_done.connect(self._on_done)
@@ -5824,13 +5901,35 @@ class RoomDialog(QDialog):
             c.currentIndexChanged.connect(self._member_edited)
         self.m_mute.toggled.connect(self._member_edited)
         self._fill_combo()
-        if self.rooms:
-            self.combo.setCurrentIndex(0)
-            self._load(self.rooms[0])
+        first = next((r for r in self.rooms if r["id"] == self._want_rid), None) or (self.rooms[0] if self.rooms else None)
+        if first is not None:
+            self._fill_combo(first["id"])
+            self._load(first)
         else:
             self.new_room()
 
     # ----- rooms
+    def select_room(self, rid):
+        """Show another room (used when you write in a room chat from the big chat)."""
+        if self._running():
+            return False
+        r = next((x for x in self.rooms if x["id"] == rid), None)
+        if r is None:
+            return False
+        self._save()
+        self._fill_combo(rid)
+        self._load(r)
+        return True
+
+    def _link_chat(self, r):
+        """Make sure the room has its chat in the list and show it in the big chat."""
+        if not (r.get("topic") or r.get("msgs")):
+            return
+        c = self.app.room_sync(r)
+        self.app.refresh_list()
+        if c["id"] in self.app.order and self.app.current is not c:
+            self.app.listw.setCurrentRow(self.app.order.index(c["id"]))
+
     def _fill_combo(self, select=None):
         self.combo.blockSignals(True)
         self.combo.clear()
@@ -5847,11 +5946,15 @@ class RoomDialog(QDialog):
         if r is None:
             return
         r["topic"] = self.topic.toPlainText().strip()
+        if self.combo.currentIndex() >= 0:
+            self.combo.setItemText(self.combo.currentIndex(), _cut(r["topic"] or "غرفة بلا موضوع", 40))
         r["rounds"] = self.rounds.value()
         r["budget"] = self.budget.value()
         r["rounds_free"] = self.rounds_free.isChecked()
         r["budget_free"] = self.budget_free.isChecked()
-        r["stop"] = self.stopword.isChecked()
+        r["end_mode"] = self.end_mode.currentData()
+        r["min_rounds"] = self.min_rounds.value()
+        r["final_call"] = self.final_call.isChecked()
 
     def _save(self):
         self._collect()
@@ -5861,7 +5964,7 @@ class RoomDialog(QDialog):
         if self._running():
             return
         self._save()
-        r = {"id": uuid.uuid4().hex[:10], "topic": "", "members": [], "msgs": [], "files": [], "spent": 0.0, "rounds": 3, "budget": 0.05, "stop": True}
+        r = {"id": uuid.uuid4().hex[:10], "topic": "", "members": [], "msgs": [], "files": [], "spent": 0.0, "rounds": 3, "budget": 0.05, "end_mode": "consensus", "min_rounds": 2, "final_call": True}
         self.rooms.insert(0, r)
         self._fill_combo(r["id"])
         self._load(r)
@@ -5902,13 +6005,16 @@ class RoomDialog(QDialog):
         self.budget_free.setChecked(bool(r.get("budget_free")))
         self.rounds.setEnabled(not self.rounds_free.isChecked())
         self.budget.setEnabled(not self.budget_free.isChecked())
-        self.stopword.setChecked(r.get("stop", True))
+        self.end_mode.setCurrentIndex(max(0, self.end_mode.findData(room_end_mode(r))))
+        self.min_rounds.setValue(int(r.get("min_rounds", 2)))
+        self.final_call.setChecked(r.get("final_call", True))
         self._fill_members()
         self._fill_files()
         self.view.clear()
         for m in r["msgs"]:
             self._show(m["who"], m["text"])
         self._status_idle()
+        self._link_chat(r)
         if r.get("running"):
             r["running"] = False
             self.status.setText("التطبيق وقف وسط النقاش آخر مرة. كل الرسائل انحفظت وتقدر تكمّل. " + self.status.text())
@@ -5977,6 +6083,8 @@ class RoomDialog(QDialog):
                 if x is not m and room_level(x) == "boss":
                     x["level"] = "member"  # only one top manager
         m["level"] = lv
+        if lv == "boss" and self.end_mode.currentData() == "consensus":
+            self.end_mode.setCurrentIndex(self.end_mode.findData("boss"))  # with a manager, the manager (and heads) close the talk
         if m["name"] != old:
             for f in self.room["files"]:
                 f["to"] = [m["name"] if t == old else t for t in f.get("to", [])]
@@ -6158,6 +6266,8 @@ class RoomDialog(QDialog):
 
     def _on_msg(self, who, text):
         self._show(who, text)
+        if self.room is not None:
+            self.app.room_refresh(self.room)
 
     def _running(self):
         return self._thread is not None and self._thread.is_alive()
@@ -6182,19 +6292,73 @@ class RoomDialog(QDialog):
     # ----- running
     def send(self):
         text = self.inp.text().strip()
-        if not text or self.room is None:
-            return
         self.inp.clear()
+        self.send_text(text)
+
+    def send_text(self, text):
+        """A message from you (typed in the big chat). «/name», «/مجموعة g», «/المدير» ask one person directly; plain text goes to everybody."""
+        text = (text or "").strip()
+        r = self.room
+        if not text or r is None:
+            return
+        cmd = room_parse_command(r, text)
+        if cmd is None and text.startswith("/"):
+            self.app.statusBar().showMessage("ما عرفت مين تقصد. اكتب / وتطلع لك الأسماء.", 5000)
+            return
         msg = {"who": "الحكم", "text": text, "vis": ["*"]}
-        if text.startswith("@"):
-            hit = [m["name"] for m in self.room["members"] if text[1:].startswith(m["name"])]
-            if hit:
-                msg["to"] = max(hit, key=len)  # that member answers first and knows it is meant for them
-        self.room["msgs"].append(msg)
-        self._show("الحكم", text)
+        if cmd is not None:
+            msg["to"] = cmd[1]["name"]
+        else:
+            r["final_pending"] = False
+            r["rounds_done"] = 0  # a new direction from you: the minimum of rounds before ending starts again
+        r["msgs"].append(msg)
         self._save()
-        if not self._running():
+        self.app.room_refresh(r)
+        if self._running():
+            return  # the running talk reads it at the next turn
+        if cmd is not None:
+            self.start_direct(cmd[1])
+        else:
             self.start_run()
+
+    def _ready(self, r, need_two=False):
+        if need_two and len(r["members"]) < 2:
+            QMessageBox.information(self, "غرفة نقاش", "أضف عضوين على الأقل.")
+            return None
+        key = self.app.key_edit.text().strip()
+        if not key:
+            QMessageBox.information(self, "غرفة نقاش", "حط مفتاح DeepSeek أول من إعدادات التطبيق.")
+            return None
+        if not r.get("budget_free") and r.get("spent", 0.0) >= r["budget"]:
+            QMessageBox.information(self, "غرفة نقاش", "الغرفة وصلت سقف الصرف. ارفع السقف أو اختر «بلا حد» عشان تكمل.")
+            return None
+        return key
+
+    def start_direct(self, m):
+        r = self.room
+        if r is None or self._running():
+            return
+        key = self._ready(r)
+        if key is None:
+            return
+        self._stop.clear()
+        self._lock(True)
+        self._thread = threading.Thread(target=self._direct_worker, args=(r, key, m), daemon=True)
+        self._thread.start()
+
+    def _direct_worker(self, r, key, m):
+        try:
+            self.sig_status.emit("يرد: %s…" % m["name"])
+            model = m.get("model") or MODELS[0]
+            msg, u = api_chat(key, model, room_turn_messages(r, m), think=m.get("think", "off"), timeout=180, max_tokens=700)
+            r["spent"] = r.get("spent", 0.0) + usage_cost(model, u)[0]
+            text = str(msg.get("content") or "").replace(ROOM_AGREE, "").strip() or "(…)"
+            r["msgs"].append({"who": m["name"], "text": text, "vis": room_vis(m)})
+            rooms_save(self.rooms)
+            self.sig_msg.emit(m["name"], text)
+            self.sig_done.emit("ردّ %s. كمّل النقاش بزر «ابدأ / كمّل» أو اسأل غيره" % m["name"])
+        except Exception as e:
+            self.sig_done.emit("صار خطأ: " + str(e)[:120])
 
     def start_run(self):
         r = self.room
@@ -6221,7 +6385,9 @@ class RoomDialog(QDialog):
             if QMessageBox.question(self, "بلا حدود", "لا حد للجولات ولا للصرف: النقاش ما يوقف إلا بزر «إيقاف»، أو لما يتفقون، أو لو صاروا يكررون، أو لو صار خطأ.\nتكمل؟") != YES:
                 return
         r["running"] = True
+        r["final_pending"] = False
         self._save()
+        self._link_chat(r)
         self._stop.clear()
         self._lock(True)
         self._thread = threading.Thread(target=self._worker, args=(r, key), daemon=True)
@@ -6239,10 +6405,12 @@ class RoomDialog(QDialog):
             if asked is not None and asked.get("to") and r["msgs"][-1] is asked:
                 order = sorted(order, key=lambda m: m["name"] != asked["to"])  # stable: the addressed member goes first
             boss = room_boss(r)
-            n = len(order)
+            mode = room_end_mode(r)
+            heads = [m for m in order if room_level(m) == "head"]
             import itertools
             rounds_iter = itertools.count(1) if r.get("rounds_free") else range(1, r["rounds"] + 1)
             for rd in rounds_iter:
+                said = {}
                 for m in order:
                     if self._stop.is_set():
                         raise StopIteration("أوقفتها")
@@ -6257,18 +6425,31 @@ class RoomDialog(QDialog):
                     text = text.replace(ROOM_AGREE, "").strip() or "(…)"
                     prev = [x["text"] for x in r["msgs"] if x["who"] == m["name"]][-1:]
                     r["msgs"].append({"who": m["name"], "text": text, "agree": agree, "vis": room_vis(m)})
+                    said[m["name"]] = agree
                     rooms_save(self.rooms)  # every message is on disk at once: a crash loses nothing
                     self.sig_msg.emit(m["name"], text)
                     if prev and difflib.SequenceMatcher(None, prev[0], text).ratio() > 0.85:
                         raise StopIteration("صاروا يكررون نفس الكلام")
-                    if r.get("stop", True):
-                        if boss is not None:
-                            if m is boss and agree:
-                                raise StopIteration("المدير ختم النقاش")
-                        else:
-                            last = r["msgs"][-min(n, 2):]
-                            if len(last) >= min(n, 2) and all(x.get("agree") for x in last):
-                                raise StopIteration("اتفقوا")
+                # ---- end of a full round: may the talk end now? (balanced: minimum rounds, then a last confirmation round)
+                r["rounds_done"] = r.get("rounds_done", 0) + 1
+                if mode == "manual" or r["rounds_done"] < r.get("min_rounds", 2):
+                    r["final_pending"] = False
+                    continue
+                if mode == "boss" and boss is not None:
+                    met = bool(said.get(boss["name"])) and all(said.get(h["name"]) for h in heads)
+                else:
+                    met = bool(order) and all(said.get(m["name"]) for m in order)
+                if not met:
+                    r["final_pending"] = False
+                    continue
+                if r.get("final_call", True) and not r.get("final_pending"):
+                    r["final_pending"] = True
+                    note = "النقاش قارب ينتهي: الجولة الجاية تأكيد أخير. اللي عنده اعتراض أو نقطة ناقصة يقولها الحين، ومن غير كذا يأكد."
+                    r["msgs"].append({"who": "تنبيه", "text": note, "vis": ["*"]})
+                    rooms_save(self.rooms)
+                    self.sig_msg.emit("تنبيه", note)
+                    continue
+                raise StopIteration("المدير ختم النقاش" if (mode == "boss" and boss is not None) else "اتفقوا")
         except StopIteration as e:
             reason = str(e)
         except Exception as e:
@@ -6280,6 +6461,8 @@ class RoomDialog(QDialog):
         if self.room is not None:
             self.room["running"] = False
         self._save()
+        if self.room is not None:
+            self.app.room_refresh(self.room, final=True)
         self.status.setText("وقفت: %s · صرف %.4f$ من %s" % (reason, self.room.get("spent", 0.0), self._cap_text(self.room)))
         try:
             if self.app.tray is not None and not self.isActiveWindow():
@@ -8124,6 +8307,7 @@ class App(QMainWindow):
         self.inp.document().setDefaultTextOption(rtl_direction_option())  # typing always starts from the right
         self.inp.installEventFilter(self)
         self.inp.textChanged.connect(self.grow_input)
+        self.inp.textChanged.connect(lambda: QTimer.singleShot(0, self._room_slash_hint) if self.inp.toPlainText() == "/" else None)
         self.inp.attach_requested.connect(self.add_attachments)
         self.inp.image_requested.connect(self.add_pasted_image)
         self.inp.text_requested.connect(self.add_pasted_text)
@@ -9377,6 +9561,7 @@ class App(QMainWindow):
                     "project": c.get("project") or "",
                     "unread": bool(c.get("unread")),
                     "bg": bool(c.get("bg")),
+                    "room": c.get("room"),
                     "journal": (c.get("journal") or [])[-300:],
                     "archived": bool(c.get("archived")),
                     "msgs": [strip_for_save(m) for m in c["msgs"]],
@@ -9447,6 +9632,8 @@ class App(QMainWindow):
             return
         self._stash_draft()
         self.current = self.view_chats[row]
+        if self.current.get("room"):
+            self.room_sync_from_store(self.current)
         if self.current.get("unread"):
             self.current["unread"] = False
             self.persist()
@@ -9476,9 +9663,9 @@ class App(QMainWindow):
             if i < start_i:
                 continue
             if m["role"] == "user":
-                self.add_user_bubble(m.get("shown", ""), m.get("names") or [], m.get("quotes") or [], i)
+                self.add_user_bubble(m.get("shown", ""), m.get("names") or [], m.get("quotes") or [], None if self.current.get("room") else i)
             else:
-                self.append_bot_label()
+                self.append_bot_label(m.get("speaker"))
                 steps = m.get("activity")
                 if not steps and m.get("reasoning"):
                     steps = [{"k": "think", "text": m["reasoning"]}]  # chats saved before the Thinking block existed
@@ -9506,11 +9693,14 @@ class App(QMainWindow):
             self.scroll_bottom()
 
     # ---------- Thinking block + dividers ----------
-    def append_bot_label(self):
-        """The assistant's name, with its small picture in front when 5belan.png exists."""
+    def append_bot_label(self, speaker=None):
+        """The assistant's name, with its small picture in front when 5belan.png exists (a room member shows its own name instead)."""
         gap = QTextBlockFormat()
         gap.setTopMargin(20)
         self._end_cursor().insertBlock(gap, QTextCharFormat())
+        if speaker:
+            self.append(speaker + ":\n", "bot_name")
+            return
         if os.path.exists(ICON_PATH):
             img = QImage(ICON_PATH)
             if not img.isNull():
@@ -9922,7 +10112,7 @@ class App(QMainWindow):
         c.insertText("⧉ نسخ", a)
         try:
             idx = int(mid[1:])
-            is_last = bool(self.current) and idx == len(self.current["msgs"]) - 1 and idx > 0
+            is_last = bool(self.current) and idx == len(self.current["msgs"]) - 1 and idx > 0 and not self.current.get("room")
         except Exception:
             is_last = False
         if is_last:
@@ -11146,8 +11336,116 @@ class App(QMainWindow):
             self.statusBar().showMessage("انحفظت الذاكرة", 2500)
         self.open_dock("memory", "الذاكرة", lambda: MemoryDialog(self), ok, 420)
 
-    def open_room(self):
-        self.open_dock("room", "غرفة نقاش", lambda: RoomDialog(self), width=520)
+    def open_room(self, rid=None):
+        self.open_dock("room", "غرفة نقاش", lambda: RoomDialog(self, rid), width=520)
+
+    # ---------- room chats: the talk is shown in the big chat ----------
+    def room_chat_for(self, room):
+        cid = "room-" + room["id"]
+        for c in self.chats:
+            if c["id"] == cid:
+                return c
+        c = {"id": cid, "title": "غرفة: نقاش", "updated": time.time(), "msgs": [], "room": room["id"],
+             "settings": self.collect_settings(), "project": ""}
+        self.chats.append(c)
+        return c
+
+    def room_sync(self, room):
+        """Rebuild the room's chat from the room's messages (the room file is the source of truth)."""
+        c = self.room_chat_for(room)
+        if not c.get("renamed"):
+            c["title"] = "غرفة: " + _cut(room.get("topic") or "نقاش", 30)
+        msgs = []
+        if room.get("topic"):
+            msgs.append({"role": "user", "shown": "الموضوع: " + room["topic"], "content": room["topic"], "names": []})
+        for m in list(room["msgs"]):
+            if m["who"] == "الحكم":
+                msgs.append({"role": "user", "shown": m["text"], "content": m["text"], "names": []})
+            else:
+                msgs.append({"role": "assistant", "content": m["text"], "speaker": m["who"]})
+        c["msgs"] = msgs
+        c["updated"] = time.time()
+        return c
+
+    def room_refresh(self, room, final=False):
+        c = self.room_sync(room)
+        if not hasattr(self, "_room_timer"):
+            self._room_timer = QTimer(self)
+            self._room_timer.setSingleShot(True)
+            self._room_timer.timeout.connect(self._room_flush)
+            self._room_save_timer = QTimer(self)
+            self._room_save_timer.setSingleShot(True)
+            self._room_save_timer.timeout.connect(self.persist)
+        self._room_pending = c
+        self._room_timer.start(120)
+        if final:
+            self.persist()
+        else:
+            self._room_save_timer.start(4000)
+
+    def _room_flush(self):
+        c = getattr(self, "_room_pending", None)
+        if c is None:
+            return
+        if self.current is c:
+            sb = self.view.verticalScrollBar()
+            self.render_chat(keep_scroll=sb.value() < sb.maximum() - 60)
+        else:
+            c["unread"] = True
+            self.refresh_list()
+
+    def room_sync_from_store(self, c):
+        rid = c.get("room")
+        dlg = self.docks["room"].inner if "room" in self.docks else None
+        pool = dlg.rooms if dlg is not None else rooms_load()
+        room = next((r for r in pool if r["id"] == rid), None)
+        if room is not None:
+            self.room_sync(room)
+            return room
+        return None
+
+    def room_dialog_for(self, rid):
+        if "room" not in self.docks:
+            self.open_room(rid)
+        dlg = self.docks["room"].inner
+        if dlg.room is None or dlg.room["id"] != rid:
+            if not dlg.select_room(rid):
+                return None
+        return dlg
+
+    def room_send(self):
+        text = self.inp.toPlainText().strip()
+        if not text:
+            return
+        dlg = self.room_dialog_for(self.current["room"])
+        if dlg is None:
+            self.statusBar().showMessage("الغرفة تشتغل الحين، أوقفها أول.", 4000)
+            return
+        self.inp.clear()
+        dlg.send_text(text)
+
+    def _room_slash_hint(self):
+        if not (self.current and self.current.get("room")) or self.inp.toPlainText() != "/":
+            return
+        room = self.room_sync_from_store(self.current)
+        if room is None:
+            return
+        menu = QMenu(self)
+        menu.setLayoutDirection(Qt.RightToLeft)
+        items = []
+        if room_boss(room) is not None:
+            items.append(("المدير الكبير", "/المدير "))
+        for g in sorted({m.get("group") for m in room["members"] if m.get("group")}):
+            items.append(("مجموعة " + g, "/مجموعة " + g + " "))
+        for m in room["members"]:
+            tag = {"boss": "المدير", "head": "رئيس"}.get(room_level(m), "")
+            items.append((m["name"] + ((" · " + tag) if tag else ""), "/" + m["name"] + " "))
+        if not items:
+            return
+        for label, ins in items:
+            menu.addAction(label, lambda i=ins: (self.inp.setPlainText(i), self.inp.moveCursor(QTextCursor.End), self.inp.setFocus()))
+        menu.exec(self.inp.mapToGlobal(QPoint(0, -min(220, 26 * len(items) + 12))))
+        self.inp.setFocus()
 
     def open_usage(self):
         self.open_dock("usage", "الصرف", lambda: UsageDialog(self, self.chats), width=520)
@@ -11224,7 +11522,7 @@ class App(QMainWindow):
         self.send()
 
     def regenerate(self):
-        if self.busy or not self.current:
+        if self.busy or not self.current or self.current.get("room"):
             return
         msgs = self.current["msgs"]
         if len(msgs) < 2 or msgs[-1]["role"] != "assistant" or msgs[-2]["role"] != "user":
@@ -11645,6 +11943,9 @@ class App(QMainWindow):
         return full_text, names
 
     def send(self):
+        if self.current and self.current.get("room"):
+            self.room_send()
+            return
         if self.busy:
             self.stop_event.set()
             self.set_send_mode("stopping")
