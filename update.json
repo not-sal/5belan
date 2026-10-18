@@ -1,10 +1,10 @@
 {
-  "version": "2.26.0",
-  "notes": "Room: saved groups tab (create, rename, delete, add members into a group, pick the head), group picker for members, slash menu lists groups with their members",
+  "version": "2.27.0",
+  "notes": "Room: shows who is thinking right now (members list, chat list row, live line in the big chat)",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "d39b3c3933add80e734b45a9e6d07c8b68c3c3e4174b1964b5a467e0b026283c"
+      "sha256": "12c0b376493737ddf26b8de2193e18e4a46e24efc4fc9d2fd000d6d3d40966e7"
     },
     {
       "name": "guard.py",

@@ -3244,7 +3244,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.26.0"
+APP_VERSION = "2.27.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5735,6 +5735,7 @@ class RoomDialog(QDialog):
     sig_status = Signal(str)
     sig_done = Signal(str)
     sig_plan = Signal(object)
+    sig_turn = Signal(str)
 
     def __init__(self, app, rid=None):
         super().__init__(app)
@@ -5939,6 +5940,8 @@ class RoomDialog(QDialog):
         self.sig_status.connect(self.status.setText)
         self.sig_done.connect(self._on_done)
         self.sig_plan.connect(self._on_plan)
+        self.sig_turn.connect(self._on_turn)
+        self._thinking = ""
         self.combo.currentIndexChanged.connect(self._pick)
         self.mlist.currentRowChanged.connect(self._member_selected)
         self.m_name.textEdited.connect(self._member_edited)
@@ -6075,7 +6078,7 @@ class RoomDialog(QDialog):
         self.mlist.blockSignals(True)
         self.mlist.clear()
         for m in self.room["members"]:
-            self.mlist.addItem(self._member_label(m))
+            self.mlist.addItem(self._label_of(m))
         self.mlist.blockSignals(False)
         if self.room["members"]:
             self.mlist.setCurrentRow(min(row, len(self.room["members"]) - 1))
@@ -6086,6 +6089,26 @@ class RoomDialog(QDialog):
         lv = room_level(m)
         tag = {"boss": "المدير", "head": "رئيس"}.get(lv, "")
         return m["name"] + ((" · " + tag) if tag else "") + ((" · " + m["group"]) if m.get("group") else "") + (" · مكتوم" if m.get("mute") else "")
+
+    def _label_of(self, m):
+        return self._member_label(m) + ("  (يفكر الآن…)" if m["name"] == getattr(self, "_thinking", "") else "")
+
+    def _on_turn(self, name):
+        """Who is thinking right now: marked in the members list, in the chat list and as a live line in the big chat."""
+        self._thinking = name
+        if self.room is None:
+            return
+        if name:
+            self.app.room_thinking[self.room["id"]] = name
+        else:
+            self.app.room_thinking.pop(self.room["id"], None)
+        self.mlist.blockSignals(True)
+        for i, m in enumerate(self.room["members"]):
+            if i < self.mlist.count():
+                self.mlist.item(i).setText(self._label_of(m))
+        self.mlist.blockSignals(False)
+        self.app.refresh_list()
+        self.app.room_refresh(self.room)
 
     def _member_selected(self, row):
         self._loading = True
@@ -6200,7 +6223,7 @@ class RoomDialog(QDialog):
         row = self.mlist.currentRow()
         self.mlist.blockSignals(True)
         for i, m in enumerate(self.room["members"]):
-            self.mlist.item(i).setText(self._member_label(m))
+            self.mlist.item(i).setText(self._label_of(m))
         self.mlist.blockSignals(False)
         self._fill_groups(self.glist.currentRow())
         self._member_selected(row)
@@ -6566,6 +6589,7 @@ class RoomDialog(QDialog):
     def _direct_worker(self, r, key, m):
         try:
             self.sig_status.emit("يرد: %s…" % m["name"])
+            self.sig_turn.emit(m["name"])
             model = m.get("model") or MODELS[0]
             msg, u = api_chat(key, model, room_turn_messages(r, m), think=m.get("think", "off"), timeout=180, max_tokens=700)
             r["spent"] = r.get("spent", 0.0) + usage_cost(model, u)[0]
@@ -6634,6 +6658,7 @@ class RoomDialog(QDialog):
                     if not r.get("budget_free") and r.get("spent", 0.0) >= r["budget"]:
                         raise StopIteration("وصلت سقف الصرف")
                     self.sig_status.emit("جولة %d من %s · يتكلم: %s · صرف %.4f$ من %s" % (rd, "بلا حد" if r.get("rounds_free") else r["rounds"], m["name"], r.get("spent", 0.0), self._cap_text(r)))
+                    self.sig_turn.emit(m["name"])
                     model = m.get("model") or MODELS[0]
                     msg, u = api_chat(key, model, room_turn_messages(r, m), think=m.get("think", "off"), timeout=180, max_tokens=500)
                     r["spent"] = r.get("spent", 0.0) + usage_cost(model, u)[0]
@@ -6674,6 +6699,7 @@ class RoomDialog(QDialog):
         self.sig_done.emit(reason)
 
     def _on_done(self, reason):
+        self._on_turn("")
         self._lock(False)
         if self.room is not None:
             self.room["running"] = False
@@ -6703,6 +6729,7 @@ class RoomDialog(QDialog):
     def _sum_worker(self, r, key):
         try:
             who = room_boss(r) or r["members"][0]
+            self.sig_turn.emit(who["name"])
             talk = "\n".join("[%s]: %s" % (x["who"], x["text"]) for x in r["msgs"][-40:])
             msgs = [{"role": "system", "content": "Summarize the discussion below in the language of the topic, under 150 words: the decisions reached, the open points, and what the referee should do next. Plain text, no preamble."},
                     {"role": "user", "content": "Topic: %s\n\n%s" % (r.get("topic", ""), talk)}]
@@ -6754,6 +6781,8 @@ class RoomDialog(QDialog):
         self._stop.set()
         try:
             self._save()
+            if self.room is not None:
+                self.app.room_thinking.pop(self.room["id"], None)
         except Exception:
             pass
         super().done(r)
@@ -8198,6 +8227,7 @@ class App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.runs = {}  # chat id -> Run, for every chat that is answering right now
+        self.room_thinking = {}  # room id -> name of the member who is thinking right now
         self.setWindowTitle("5belan")
         if os.path.exists(ICON_PATH):
             self.setWindowIcon(QIcon(ICON_PATH))
@@ -9818,7 +9848,7 @@ class App(QMainWindow):
         for c in self.view_chats:
             self.listw.addItem(self._chat_row_text(c, sel))
             it = self.listw.item(self.listw.count() - 1)
-            if c["id"] in self.runs or c.get("unread"):
+            if c["id"] in self.runs or c.get("unread") or (c.get("room") and c["room"] in self.room_thinking):
                 it.setForeground(QColor(THEMES[self.theme]["accent"]))
         if self.current and self.current["id"] in self.order:
             self.listw.setCurrentRow(self.order.index(self.current["id"]))
@@ -9830,18 +9860,20 @@ class App(QMainWindow):
 
     def _chat_row_text(self, c, sel):
         pj = self.get_project(c.get("project"))
-        busy = ("يفكر" + "." * (1 + getattr(self, "_dots", 0) % 3) + " ") if c["id"] in self.runs else ""
+        dots = "." * (1 + getattr(self, "_dots", 0) % 3)
+        who = self.room_thinking.get(c.get("room")) if c.get("room") else None
+        busy = ("يفكر" + dots + " ") if c["id"] in self.runs else (("%s يفكر%s " % (who, dots)) if who else "")
         return (busy + ("[جديد] " if c.get("unread") else "") + ("[مثبّتة] " if c.get("pinned") else "") + ("[أرشيف] " if c.get("archived") else "") + c["title"]
                 + (("   ‹%s›" % pj["name"]) if pj and sel == "*" else ""))
 
     def _tick_dots(self):
         """Animate the «يفكر…» mark on chats that are answering (only their rows are touched)."""
-        if not self.runs:
+        if not self.runs and not self.room_thinking:
             return
         self._dots += 1
         sel = getattr(self, "_list_sel", "*")
         for i, c in enumerate(self.view_chats):
-            if c["id"] in self.runs and i < self.listw.count():
+            if (c["id"] in self.runs or (c.get("room") and c["room"] in self.room_thinking)) and i < self.listw.count():
                 self.listw.item(i).setText(self._chat_row_text(c, sel))
 
     def on_select(self, row):
@@ -9893,6 +9925,10 @@ class App(QMainWindow):
                     self._insert_suggestions(m["sugg"])
                 self.add_divider()
                 last_reply = m["content"]
+        rt = self.room_thinking.get(self.current.get("room")) if self.current.get("room") else None
+        if rt:
+            self.append_bot_label(rt)
+            self.append("يفكر الآن…\n", "dim")
         if self.busy and self.live is not None:
             self.append_bot_label()
             self.reply_start = self._end_cursor().position()
