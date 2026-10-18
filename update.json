@@ -1,10 +1,10 @@
 {
-  "version": "2.21.0",
-  "notes": "Room phase 2: groups, heads and top manager, room files with targets, manager distributes files with an editable plan",
+  "version": "2.22.0",
+  "notes": "Room: crash-safe storage (saved after every message, backups), pull last 6 topics or whole chat, mute, @mention, summary, export",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "40b95488fd32c363a1b4b9ee5b3f13d3caed816ad48f7afe14ea1a74a2c14b17"
+      "sha256": "8bde0a849e244d90ff23b587a88225ee937d46ec6d4cae153450a44c7ea925a3"
     },
     {
       "name": "guard.py",
