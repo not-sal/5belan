@@ -1,10 +1,10 @@
 {
-  "version": "2.24.0",
-  "notes": "Room talk shown in the big chat, slash commands to ask a member, a group head or the manager, balanced ending (mode, minimum rounds, final confirmation round)",
+  "version": "2.24.1",
+  "notes": "Room panel: bigger member list, removed the empty area",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "ecc9547190a018ab6f96d1e4fd7ce5447d5a7e60c22856fcb3660c9a23e599eb"
+      "sha256": "22d4fee33a2df06cd341ab138ea1d82002b338df68b428538f97178954a0eaff"
     },
     {
       "name": "guard.py",
