@@ -3244,7 +3244,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.25.1"
+APP_VERSION = "2.26.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5791,8 +5791,9 @@ class RoomDialog(QDialog):
         self.m_level = QComboBox()
         for k, t in ROOM_LEVELS:
             self.m_level.addItem(t, k)
-        self.m_group = QLineEdit()
-        self.m_group.setPlaceholderText("المجموعة")
+        self.m_group = QComboBox()
+        self.m_group.addItem("بدون مجموعة", "")
+        self.m_group.setToolTip("المجموعة (تنشئها من تبويب «المجموعات»)")
         r1.addWidget(self.m_level)
         r1.addWidget(self.m_group, 1)
         ml.addLayout(r1)
@@ -5828,6 +5829,25 @@ class RoomDialog(QDialog):
         self.b_dist.clicked.connect(self.distribute)
         fl.addWidget(self.b_dist)
         self.tabs.addTab(tf, "الملفات")
+        tg = QWidget()
+        gl = QVBoxLayout(tg)
+        gl.setContentsMargins(8, 8, 8, 8)
+        gl.setSpacing(8)
+        self.glist = QListWidget()
+        gl.addWidget(self.glist, 1)
+        grow = QHBoxLayout()
+        for txt, fn in (("مجموعة جديدة", self.new_group), ("إعادة تسمية", self.rename_group), ("حذف المجموعة", self.del_group)):
+            b = QPushButton(txt)
+            b.clicked.connect(fn)
+            grow.addWidget(b)
+        gl.addLayout(grow)
+        grow2 = QHBoxLayout()
+        for txt, fn in (("عضو جديد فيها", lambda: self.add_new(self._cur_group())), ("من محادثة فيها", lambda: self.add_from_chat(self._cur_group())), ("حدد الرئيس", self.pick_head)):
+            b = QPushButton(txt)
+            b.clicked.connect(fn)
+            grow2.addWidget(b)
+        gl.addLayout(grow2)
+        self.tabs.insertTab(1, tg, "المجموعات")
         # --- limits tab
         tl = QWidget()
         ll = QVBoxLayout(tl)
@@ -5914,7 +5934,7 @@ class RoomDialog(QDialog):
             brow.addWidget(b)
         lay.addLayout(brow)
         self._locked_widgets = (self.b_go, self.b_dist, self.b_sum, self.topic, self.mlist, self.m_name, self.m_role, self.m_level, self.m_group,
-                                self.m_model, self.m_think, self.m_mute, self.rounds, self.rounds_free, self.budget, self.budget_free, self.end_mode, self.min_rounds, self.final_call, self.combo)
+                                self.m_model, self.m_think, self.m_mute, self.glist, self.rounds, self.rounds_free, self.budget, self.budget_free, self.end_mode, self.min_rounds, self.final_call, self.combo)
         self.sig_msg.connect(self._on_msg)
         self.sig_status.connect(self.status.setText)
         self.sig_done.connect(self._on_done)
@@ -5922,7 +5942,7 @@ class RoomDialog(QDialog):
         self.combo.currentIndexChanged.connect(self._pick)
         self.mlist.currentRowChanged.connect(self._member_selected)
         self.m_name.textEdited.connect(self._member_edited)
-        self.m_group.textEdited.connect(self._member_edited)
+        self.m_group.currentIndexChanged.connect(self._member_edited)
         self.m_role.textChanged.connect(self._member_edited)
         for c in (self.m_level, self.m_model, self.m_think):
             c.currentIndexChanged.connect(self._member_edited)
@@ -6025,6 +6045,7 @@ class RoomDialog(QDialog):
     def _load(self, r):
         self._loading = True
         r.setdefault("files", [])
+        r.setdefault("groups", [])
         self.room = r
         self.topic.setPlainText(r.get("topic", ""))
         self.rounds.setValue(int(r.get("rounds", 3)))
@@ -6050,6 +6071,7 @@ class RoomDialog(QDialog):
 
     # ----- members
     def _fill_members(self, row=0):
+        self._fill_groups(self.glist.currentRow())
         self.mlist.blockSignals(True)
         self.mlist.clear()
         for m in self.room["members"]:
@@ -6076,7 +6098,7 @@ class RoomDialog(QDialog):
             self.m_name.setText(m["name"])
             self.m_role.setPlainText(m.get("role", ""))
             self.m_level.setCurrentIndex(max(0, self.m_level.findData(room_level(m))))
-            self.m_group.setText(m.get("group", ""))
+            self.m_group.setCurrentIndex(max(0, self.m_group.findData(m.get("group", ""))))
             self.m_group.setVisible(room_level(m) != "boss")
             self.m_model.setCurrentText(m.get("model", MODELS[0]))
             self.m_think.setCurrentText(m.get("think", "off"))
@@ -6084,7 +6106,7 @@ class RoomDialog(QDialog):
         else:
             self.m_name.clear()
             self.m_role.clear()
-            self.m_group.clear()
+            self.m_group.setCurrentIndex(0)
         self._loading = False
 
     def _member_edited(self, *_a):
@@ -6097,10 +6119,10 @@ class RoomDialog(QDialog):
         old = m["name"]
         m["name"] = self.m_name.text().strip() or m["name"]
         m["role"] = self.m_role.toPlainText().strip()
-        m["group"] = self.m_group.text().strip()
+        m["group"] = self.m_group.currentData() or ""
         if self.m_level.currentData() == "boss":
             m["group"] = ""  # the top manager stands above the groups
-            self.m_group.clear()
+            self.m_group.setCurrentIndex(0)
         self.m_group.setVisible(self.m_level.currentData() != "boss")
         m["model"] = self.m_model.currentText()
         m["think"] = self.m_think.currentText()
@@ -6111,6 +6133,10 @@ class RoomDialog(QDialog):
                 if x is not m and room_level(x) == "boss":
                     x["level"] = "member"  # only one top manager
         m["level"] = lv
+        if lv == "head" and m["group"]:
+            for x in self.room["members"]:
+                if x is not m and room_level(x) == "head" and x.get("group") == m["group"]:
+                    x["level"] = "member"  # one head per group
         if lv == "boss" and self.end_mode.currentData() == "consensus":
             self.end_mode.setCurrentIndex(self.end_mode.findData("boss"))  # with a manager, the manager (and heads) close the talk
         if m["name"] != old:
@@ -6120,6 +6146,7 @@ class RoomDialog(QDialog):
         for i, x in enumerate(self.room["members"]):
             self.mlist.item(i).setText(self._member_label(x))
         self.mlist.blockSignals(False)
+        self._fill_groups(self.glist.currentRow())
         self._fill_files()
 
     def _unique(self, name):
@@ -6130,15 +6157,142 @@ class RoomDialog(QDialog):
             n += 1
         return name
 
-    def add_new(self):
+    # ----- saved groups
+    def _sync_groups(self):
+        gs = self.room.setdefault("groups", [])
+        for m in self.room["members"]:
+            g = m.get("group")
+            if g and g not in gs:
+                gs.append(g)  # rooms made before groups were saved
+        return gs
+
+    def _head_of(self, g):
+        return next((m for m in self.room["members"] if m.get("group") == g and room_level(m) == "head"), None)
+
+    def _fill_groups(self, row=0):
+        if self.room is None:
+            return
+        gs = self._sync_groups()
+        self.glist.blockSignals(True)
+        self.glist.clear()
+        for g in gs:
+            h = self._head_of(g)
+            n = sum(1 for m in self.room["members"] if m.get("group") == g)
+            self.glist.addItem("%s · الرئيس: %s · %d أعضاء" % (g, h["name"] if h else "بلا رئيس", n))
+        if gs:
+            self.glist.setCurrentRow(min(max(row, 0), len(gs) - 1))
+        self.glist.blockSignals(False)
+        cur = self.m_group.currentData()
+        self.m_group.blockSignals(True)
+        self.m_group.clear()
+        self.m_group.addItem("بدون مجموعة", "")
+        for g in gs:
+            self.m_group.addItem(g, g)
+        self.m_group.setCurrentIndex(max(0, self.m_group.findData(cur or "")))
+        self.m_group.blockSignals(False)
+
+    def _cur_group(self):
+        row = self.glist.currentRow()
+        gs = self.room.get("groups", []) if self.room else []
+        return gs[row] if 0 <= row < len(gs) else None
+
+    def _refresh_all_members(self):
+        row = self.mlist.currentRow()
+        self.mlist.blockSignals(True)
+        for i, m in enumerate(self.room["members"]):
+            self.mlist.item(i).setText(self._member_label(m))
+        self.mlist.blockSignals(False)
+        self._fill_groups(self.glist.currentRow())
+        self._member_selected(row)
+        self._save()
+
+    def new_group(self):
+        if self._running() or self.room is None:
+            return
+        name, ok = QInputDialog.getText(self, "مجموعة جديدة", "اسم المجموعة:")
+        name = name.strip()[:30]
+        if not ok or not name:
+            return
+        gs = self._sync_groups()
+        if name in gs:
+            QMessageBox.information(self, "غرفة نقاش", "فيه مجموعة بنفس الاسم.")
+            return
+        gs.append(name)
+        self._fill_groups(len(gs) - 1)
+        self._save()
+
+    def rename_group(self):
+        g = self._cur_group()
+        if self._running() or g is None:
+            return
+        name, ok = QInputDialog.getText(self, "إعادة تسمية", "الاسم الجديد:", text=g)
+        name = name.strip()[:30]
+        gs = self.room["groups"]
+        if not ok or not name or name == g or name in gs:
+            return
+        gs[gs.index(g)] = name
+        for m in self.room["members"]:
+            if m.get("group") == g:
+                m["group"] = name
+        self._refresh_all_members()
+
+    def del_group(self):
+        g = self._cur_group()
+        if self._running() or g is None:
+            return
+        if QMessageBox.question(self, "حذف", "تحذف المجموعة «%s»؟ أعضاؤها ما ينحذفون، بس يطلعون منها." % g) != YES:
+            return
+        self.room["groups"].remove(g)
+        for m in self.room["members"]:
+            if m.get("group") == g:
+                m["group"] = ""
+                if room_level(m) == "head":
+                    m["level"] = "member"
+        self._refresh_all_members()
+
+    def pick_head(self):
+        g = self._cur_group()
+        if self._running() or g is None:
+            return
+        mem = [m for m in self.room["members"] if m.get("group") == g]
+        if not mem:
+            QMessageBox.information(self, "غرفة نقاش", "ما فيه أعضاء بهذي المجموعة. أضف أعضاء أول.")
+            return
+        names = ["بلا رئيس"] + [m["name"] for m in mem]
+        cur = self._head_of(g)
+        pick, ok = QInputDialog.getItem(self, "رئيس المجموعة", "مين رئيس «%s»؟" % g, names, names.index(cur["name"]) if cur else 0, False)
+        if not ok:
+            return
+        for m in mem:
+            if room_level(m) == "head":
+                m["level"] = "member"
+        if pick != names[0]:
+            next(m for m in mem if m["name"] == pick)["level"] = "head"
+        self._refresh_all_members()
+
+    def _ask_group(self):
+        """(ok, group) — asks which saved group the new member joins (only when the room has groups)."""
+        gs = self._sync_groups()
+        if not gs:
+            return True, ""
+        names = ["بدون مجموعة"] + gs
+        pick, ok = QInputDialog.getItem(self, "المجموعة", "أي مجموعة يكون فيها؟", names, 0, False)
+        return ok, ("" if pick == names[0] else pick)
+
+    def add_new(self, group=None):
         if self._running() or self.room is None:
             return
         name, ok = QInputDialog.getText(self, "عضو جديد", "اسم العضو:")
-        if ok and name.strip():
-            self.room["members"].append({"name": self._unique(name.strip()[:30]), "role": "", "model": MODELS[0], "think": "off", "level": "member", "group": ""})
-            self._fill_members(len(self.room["members"]) - 1)
+        if not (ok and name.strip()):
+            return
+        if group is None:
+            ok2, group = self._ask_group()
+            if not ok2:
+                return
+        self.room["members"].append({"name": self._unique(name.strip()[:30]), "role": "", "model": MODELS[0], "think": "off", "level": "member", "group": group or ""})
+        self._fill_members(len(self.room["members"]) - 1)
 
-    def add_from_chat(self):
+    def add_from_chat(self, group=None):
         if self._running() or self.room is None:
             return
         chats = [c for c in self.app.chats if not c.get("bg") and not c.get("room") and c.get("msgs")]
@@ -6161,10 +6315,14 @@ class RoomDialog(QDialog):
         if box.clickedButton() not in (b6, ball):
             return
         whole = box.clickedButton() is ball
+        if group is None:
+            ok2, group = self._ask_group()
+            if not ok2:
+                return
         ctx, cut = room_chat_context(c, whole)
         self.room["members"].append({"name": self._unique(_cut(c["title"], 24)), "role": "You continue the work of the chat «%s»." % c["title"],
                                      "context": ctx, "context_mode": "whole" if whole else "last6", "model": MODELS[0], "think": "off",
-                                     "level": "member", "group": "", "chat": c["id"]})
+                                     "level": "member", "group": group or "", "chat": c["id"]})
         self._fill_members(len(self.room["members"]) - 1)
         if cut:
             QMessageBox.information(self, "من محادثة", "المحادثة طويلة؛ أخذت أحدث جزء منها (حتى %d حرف)." % (ROOM_CTX_WHOLE if whole else ROOM_CTX_PARTIAL))
@@ -11497,19 +11655,39 @@ class App(QMainWindow):
             return
         menu = QMenu(self)
         menu.setLayoutDirection(Qt.RightToLeft)
-        items = []
+
+        def put(ins):
+            self.inp.setPlainText(ins)
+            self.inp.moveCursor(QTextCursor.End)
+            self.inp.setFocus()
+
+        def tag_of(m):
+            return {"boss": "المدير", "head": "رئيس"}.get(room_level(m), "")
+
+        count = 0
         if room_boss(room) is not None:
-            items.append(("المدير الكبير", "/المدير "))
-        for g in sorted({m.get("group") for m in room["members"] if m.get("group")}):
-            items.append(("مجموعة " + g, "/مجموعة " + g + " "))
+            menu.addAction("المدير الكبير", lambda: put("/المدير "))
+            count += 1
+        groups = []
+        for g in list(room.get("groups") or []) + [m.get("group") for m in room["members"]]:
+            if g and g not in groups:
+                groups.append(g)
+        for g in groups:
+            mem = [m for m in room["members"] if m.get("group") == g]
+            head = next((m for m in mem if room_level(m) == "head"), None)
+            sub = menu.addMenu("%s · %s" % (g, ("الرئيس: " + head["name"]) if head else "بلا رئيس"))
+            sub.addAction("اسأل المجموعة (يرد الرئيس)", lambda g=g: put("/مجموعة " + g + " "))
+            sub.addSeparator()
+            for m in sorted(mem, key=lambda x: room_level(x) != "head"):
+                sub.addAction(m["name"] + ((" · " + tag_of(m)) if tag_of(m) else ""), lambda n=m["name"]: put("/" + n + " "))
+            count += 1
         for m in room["members"]:
-            tag = {"boss": "المدير", "head": "رئيس"}.get(room_level(m), "")
-            items.append((m["name"] + ((" · " + tag) if tag else ""), "/" + m["name"] + " "))
-        if not items:
+            if not m.get("group") and room_level(m) != "boss":
+                menu.addAction(m["name"], lambda n=m["name"]: put("/" + n + " "))
+                count += 1
+        if not count:
             return
-        for label, ins in items:
-            menu.addAction(label, lambda i=ins: (self.inp.setPlainText(i), self.inp.moveCursor(QTextCursor.End), self.inp.setFocus()))
-        menu.exec(self.inp.mapToGlobal(QPoint(0, -min(220, 26 * len(items) + 12))))
+        menu.exec(self.inp.mapToGlobal(QPoint(0, -min(260, 28 * count + 12))))
         self.inp.setFocus()
 
     def open_usage(self):
