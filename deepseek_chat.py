@@ -3315,7 +3315,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.30.0"
+APP_VERSION = "2.30.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -13509,6 +13509,8 @@ class App(QMainWindow):
         api_msgs = [{"role": "system", "content": system}]
         for m in self.current["msgs"]:
             item = {"role": m["role"], "content": m["content"]}
+            if m["role"] == "assistant" and m.get("resume_digest") and isinstance(m["content"], str):
+                item["content"] = m["content"] + "\n" + m["resume_digest"]
             if m["role"] == "assistant" and m.get("skill_offer") and isinstance(m["content"], str):
                 item["content"] = m["content"] + "\n[offered skill «%s»: %s]" % (m["skill_offer"].get("name", ""), m["skill_offer"].get("state") or "not answered")
             if m["role"] == "assistant" and runner is not None and think != "off":
@@ -14147,10 +14149,13 @@ class App(QMainWindow):
             return
         R.last_ckpt = now
         steps = [dict(x, text=str(x.get("text", ""))[:1500], err=str(x.get("err", ""))[:300]) for x in L["steps"][-80:]]
-        save_json(RESUME_PATH, {
+        if getattr(self, "_ckpts", None) is None:
+            self._ckpts = {}
+        self._ckpts[R.chat["id"]] = {
             "chat_id": R.chat["id"], "ts": now, "user_text": R.last_text,
             "steps": steps, "body": str(L["body"])[-8000:], "total_steps": len(L["steps"]),
-        })
+        }
+        save_json(RESUME_PATH, {"runs": self._ckpts})  # one entry per running chat
 
     def heartbeat(self):
         m = mem_mb()
@@ -14160,58 +14165,124 @@ class App(QMainWindow):
             self.checkpoint(R)
 
     def clear_resume(self, cid=None):
-        """Remove the crash-recovery file (only when it belongs to chat cid, if given)."""
+        """Forget the crash-recovery record of chat cid (all of them when cid is None); the file goes when nothing is left."""
         try:
-            if os.path.exists(RESUME_PATH):
-                if cid is not None and (load_json(RESUME_PATH, {}) or {}).get("chat_id") != cid:
-                    return
+            cks = getattr(self, "_ckpts", None)
+            if cks is None:
+                cks = self._ckpts = {}
+            if cid is None:
+                cks.clear()
+            else:
+                cks.pop(cid, None)
+            if cks:
+                save_json(RESUME_PATH, {"runs": cks})
+            elif os.path.exists(RESUME_PATH):
                 os.remove(RESUME_PATH)
         except Exception:
             pass
 
+    @staticmethod
+    def _resume_records():
+        """The interrupted runs saved on disk: {chat id: record} (also reads the one-run file of older versions)."""
+        rs = load_json(RESUME_PATH, None)
+        if isinstance(rs, dict) and isinstance(rs.get("runs"), dict):
+            return {k: v for k, v in rs["runs"].items() if isinstance(v, dict)}
+        if isinstance(rs, dict) and rs.get("chat_id"):
+            return {rs["chat_id"]: rs}
+        return {}
+
+    @staticmethod
+    def _resume_digest(rec):
+        """The note the model gets about what was already done before the interruption (kept out of the visible chat text)."""
+        steps = rec.get("steps") or []
+        done = [" ".join(str(x.get("text", ""))[:160].split()) for x in steps if x.get("k") == "tool" and x.get("ok", True)]
+        lines = ["[SYSTEM NOTE, not written by the user: the app closed unexpectedly while this reply was being worked on. "
+                 "Operations already DONE before it closed (%d in total, the last %d are listed): do NOT repeat them." % (int(rec.get("total_steps", len(done))), min(len(done), 40))]
+        lines += ["- " + x for x in done[-40:]]
+        body = str(rec.get("body", "")).strip()
+        if body:
+            lines.append("What was being written when it stopped:\n" + body[-1500:])
+        lines.append("]")
+        return "\n".join(lines)
+
     def recover_after_crash(self):
-        """If the last run died in the middle of a reply, bring back what it had done and offer to continue."""
+        """The last run ended in the middle of replies (any reason: a crash, closed from outside, a restart): offer to continue every
+        interrupted chat. «كمّل» resumes them all in the background, each from where it stopped; the chat shows the work done as a normal
+        collapsed thinking block, not as a wall of text."""
         if self.runs:  # a reply started before this check: its checkpoint file is live work, not a crash
             return
-        rs = load_json(RESUME_PATH, None)
+        recs = {k: v for k, v in self._resume_records().items() if v.get("steps") or v.get("body")}
         crashed = PREV_CRASH
-        if not isinstance(rs, dict) or not rs.get("steps") and not rs.get("body"):
-            if isinstance(rs, dict):
-                self.clear_resume()
+        self.clear_resume()
+        pairs = [(c, recs[c["id"]]) for c in self.chats if c.get("id") in recs]
+        if not pairs:
             if crashed:
                 self.statusBar().showMessage("آخر مرة البرنامج سكّر فجأة — السبب في events.log", 15000)
             return
-        chat = next((c for c in self.chats if c.get("id") == rs.get("chat_id")), None)
-        self.clear_resume()
-        if chat is None:
-            return
-        steps = rs.get("steps") or []
-        done = [str(s.get("text", ""))[:160] for s in steps if s.get("k") == "tool" and s.get("ok", True)]
-        lines = ["تنبيه: البرنامج سكّر فجأة وهو يشتغل على طلبك. هذا اللي كان تم قبل ما يسكّر (%d عملية):" % int(rs.get("total_steps", len(done)))]
-        lines += ["- " + d for d in done[-40:]]
-        body = str(rs.get("body", "")).strip()
-        if body:
-            lines.append("\nآخر شي كان يكتبه:\n" + body[-1500:])
-        lines.append("\nاكتب «كمّل» عشان يكمل من وين وقف.")
-        chat["msgs"].append({"role": "assistant", "content": "\n".join(lines), "reasoning": "", "activity": steps})
-        chat["updated"] = time.time()
+        for chat, rec in pairs:  # what had been done stays in each chat, as a collapsed thinking block
+            body = str(rec.get("body", "")).strip()
+            chat["msgs"].append({"role": "assistant", "content": (body[-1500:] + "\n\n[انقطع البرنامج هنا]") if body else "[انقطع البرنامج هنا قبل ما يكمل الرد]",
+                                 "reasoning": "", "activity": rec.get("steps") or [], "resume_digest": self._resume_digest(rec), "cut": True})
+            chat["updated"] = time.time()
         self.persist()
-        self.current = chat
-        self.apply_settings(self.chat_settings(chat))
         self.refresh_list()
-        self.render_chat()
         why = (crashed or {}).get("why", "غير معروف")
+        titles = "\n".join("• " + _cut(c.get("title") or "محادثة", 50) for c, _r in pairs)
         box = QMessageBox(self)
         box.setWindowTitle("5belan")
         box.setIcon(QMessageBox.Warning)
-        box.setText("آخر مرة البرنامج سكّر فجأة وهو في نص الشغل، وحفظت اللي سواه.")
-        box.setInformativeText("السبب المحتمل:\n" + why + "\n\nتبيني أكمّل من وين وقفت؟")
-        yes = box.addButton("كمّل", QMessageBox.AcceptRole)
-        box.addButton("لا، خلّه", QMessageBox.RejectRole)
+        box.setText("آخر مرة البرنامج سكّر وفيه %d %s كانت تشتغل، وحفظت اللي سوته." % (len(pairs), "محادثة" if len(pairs) == 1 else "محادثات"))
+        box.setInformativeText("%s\n\nالسبب المحتمل:\n%s\n\nأكمّلها بالخلفية من وين وقفت؟" % (titles, why))
+        yes = box.addButton("كمّل بالخلفية", QMessageBox.AcceptRole)
+        box.addButton("لا، خلّها", QMessageBox.RejectRole)
         box.exec()
-        if box.clickedButton() is yes and self.key_edit.text().strip() and not self.busy:
-            self.inp.setPlainText("كمّل من وين وقفت. شف اللي تم أعلاه وكمّل الباقي بدون ما تعيد اللي خلص.")
-            self.send()
+        if box.clickedButton() is yes and self.key_edit.text().strip():
+            self.resume_chats([c for c, _r in pairs])
+        else:
+            self.current = pairs[0][0]
+            self.apply_settings(self.chat_settings(self.current))
+            self.refresh_list()
+            self.render_chat()
+
+    def resume_chats(self, chats):
+        """Start every interrupted chat again, each in its own background run; the screen ends on the first one."""
+        prev_att, prev_q = self.attachments, self.quotes
+        self.attachments, self.quotes = [], []
+        self._stash_draft()
+        kept = dict(self.drafts)
+        started = []
+        for chat in chats:
+            if chat["id"] in self.runs:
+                continue
+            self.current = chat
+            self.apply_settings(self.chat_settings(chat))
+            self._shown_override = "[استئناف تلقائي بعد الانقطاع]"
+            self._fu_sending = True
+            self.inp.setPlainText("[استئناف تلقائي بعد انقطاع البرنامج] كمّل شغلك على طلبي السابق من وين وقفت بالضبط. "
+                                  "العمليات اللي تمت مذكورة في ملاحظة النظام برسالتك السابقة، لا تعيدها. لما تخلص عطني النتيجة النهائية.")
+            try:
+                self.send()
+            finally:
+                self._fu_sending = False
+                self._shown_override = None
+            if chat["id"] in self.runs:
+                started.append(chat)
+            else:
+                self.inp.clear()
+        self.attachments, self.quotes = prev_att, prev_q
+        self.refresh_quotes()
+        self.refresh_files_label()
+        for k_, v_ in kept.items():
+            self.drafts.setdefault(k_, v_)
+        if started:
+            self.current = started[0]
+            self.apply_settings(self.chat_settings(self.current))
+            self.refresh_list()
+            self.render_chat()
+            self._restore_draft()
+            self.statusBar().showMessage("كمّلت %d %s بالخلفية" % (len(started), "محادثة" if len(started) == 1 else "محادثات"), 8000)
+        else:
+            self.statusBar().showMessage("ما قدرت أكمّل المحادثات (تأكد من المفتاح).", 8000)
 
     def finish(self, R, failed=False):
         """A reply (of any chat) ended: free its run, then tidy the screen if that chat is the one shown."""
