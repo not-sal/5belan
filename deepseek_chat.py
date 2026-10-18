@@ -1135,6 +1135,30 @@ SHELL_TOOLS = [
     }
 ]
 
+FOLLOWUP_MAX_PENDING = 5      # waiting follow-ups per chat
+FOLLOWUP_MAX_CHAIN = 10       # automatic follow-ups in a row (no message from the user in between)
+FOLLOWUP_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_followup",
+            "description": (
+                "Wake yourself up later in THIS chat. You can only answer when the user writes to you, so use this when something has to happen "
+                "after some time (check a result, re-run something, remind the user, continue a long job): after the delay the app sends you "
+                "your own note as a message, even if the user is not looking, and you answer and act with your tools. Do not use it for "
+                "anything you can do right now."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "minutes": {"type": "integer", "description": "Wake me after this many minutes (1 to 1440)."},
+                    "note": {"type": "string", "description": "A precise note to your future self: exactly what to check or do when woken, with every detail you will need (paths, names, expected result)."},
+                },
+                "required": ["minutes", "note"],
+            },
+        },
+    },
+]
 PYTHON_TOOLS = [
     {
         "type": "function",
@@ -1322,6 +1346,15 @@ def tools_prompt(runner):
             "visible text), browser_click (click a link/button by its visible text), browser_type (type into a field, optional submit), "
             "browser_back. Always browser_read after opening or clicking before you act. Use the built-in browser for research and reading; "
             "use open_in_chrome when the user wants their own Chrome with their logins."
+        )
+    if getattr(runner, "followup", None) is not None:
+        parts.append(
+            "WAKING YOURSELF UP: you can only answer when the user sends a message; you cannot speak on your own later. So never write "
+            "«in my next reply I will…» or «wait for my next message» for work you can do now: do it now, in this reply, with your tools. "
+            "If something really has to happen LATER (check a result after some minutes, run something again, remind the user, continue a long job), "
+            "call schedule_followup(minutes, note) with a precise note to yourself saying exactly what to do; the app sends you that note as a "
+            "message at that time and you act on it. Tell the user in one short line that you scheduled it and when. "
+            "At most %d waiting follow-ups per chat." % FOLLOWUP_MAX_PENDING
         )
     parts.append(
         "PROGRESS HEADINGS: before each batch of tool calls, write 1-3 SHORT lines in Arabic and then call the tools: "
@@ -2022,6 +2055,7 @@ class ToolRunner:
         self.shell_mode = shell_mode if shell_mode in ("off", "ask", "free") else "off"
         self.allow_computer = bool(allow_computer)
         self.browser = browser  # callable(action, **kwargs) -> str, or None
+        self.followup = None  # callable(minutes, note) -> str, set by the app: lets the model wake itself up later
         self.backup = bool(backup)
         self.cache = {}
         self.changes = []
@@ -2070,6 +2104,8 @@ class ToolRunner:
             out += COMPUTER_TOOLS
         if self.browser is not None:
             out += BROWSER_TOOLS
+        if self.followup is not None:
+            out += FOLLOWUP_TOOLS
         return out
 
     def resolve(self, path, write=False):
@@ -2203,7 +2239,20 @@ class ToolRunner:
             return "حفظ ملاحظات المجلد: %s" % a.get("folder", "")
         if name == "submit_plan":
             return "عرض خطة للموافقة (%d خطوات)" % len(a.get("steps") or [])
+        if name == "schedule_followup":
+            return "جدولة متابعة بعد %s دقيقة: %s" % (a.get("minutes", "?"), _cut(a.get("note", ""), 80))
         return name
+
+    def schedule_followup(self, a):
+        try:
+            mins = int(a.get("minutes"))
+        except (TypeError, ValueError):
+            raise ToolError("minutes must be a whole number (1 to 1440)")
+        mins = max(1, min(1440, mins))
+        note = str(a.get("note") or "").strip()
+        if not note:
+            raise ToolError("the note is empty: write exactly what you will do when you are woken")
+        return self.followup(mins, note[:1500])
 
     def run(self, name, args_text):
         try:
@@ -2239,6 +2288,8 @@ class ToolRunner:
         if self.allow_computer:
             mapping["open_program"] = self.open_program
             mapping["open_in_chrome"] = self.open_in_chrome
+        if self.followup is not None:
+            mapping["schedule_followup"] = self.schedule_followup
         if self.browser is not None:
             mapping.update({
                 "browser_open": self.browser_open,
@@ -3032,6 +3083,7 @@ TOOL_GROUPS = {
     "submit_plan": ("plan", "الخطة"),
     "analyze_file": ("read", "قراءة واستعراض الملفات"),
     "save_notes": ("write", "إنشاء وتعديل الملفات"),
+    "schedule_followup": ("followup", "متابعة مجدولة"),
 }
 
 
@@ -3077,7 +3129,7 @@ _SUMMARY_KEYS = {
     "write_file": "write", "edit_file": "write", "save_notes": "write", "make_dir": "mkdir",
     "move_path": "delete", "delete_path": "delete", "run_command": "cmd", "run_python": "py", "pip_install": "pip",
     "browser_open": "browse", "browser_read": "browse_x", "browser_click": "browse_x", "browser_type": "browse_x", "browser_back": "browse_x",
-    "open_program": "open", "open_in_chrome": "open", "submit_plan": "plan",
+    "open_program": "open", "open_in_chrome": "open", "submit_plan": "plan", "schedule_followup": "followup",
 }
 _SUMMARY_TEXT = {
     "read": ("قرأ ملف", "قرأ %d ملفات"), "analyze": ("حلّل ملف", "حلّل %d ملفات"),
@@ -3086,7 +3138,7 @@ _SUMMARY_TEXT = {
     "delete": ("نقل أو حذف عنصر", "نقل أو حذف %d عناصر"), "cmd": ("نفّذ أمر", "نفّذ %d أوامر"),
     "py": ("شغّل كود بايثون", "شغّل كود بايثون %d مرات"), "pip": ("ثبّت مكتبات بايثون", "ثبّت مكتبات بايثون"),
     "browse": ("تصفّح صفحة", "تصفّح %d صفحات"), "open": ("فتح برنامج أو موقع", "فتح %d برامج أو مواقع"),
-    "plan": ("وضع خطة", "وضع خطة"),
+    "plan": ("وضع خطة", "وضع خطة"), "followup": ("جدول متابعة", "جدول %d متابعات"),
 }
 
 
@@ -3244,7 +3296,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.28.0"
+APP_VERSION = "2.29.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4012,8 +4064,28 @@ class ChatView(QTextBrowser):
         m.exec(e.globalPos())
 
 
-SHELL_LANGS_WIN = {"powershell", "ps1", "pwsh", "cmd", "bat", "batch", "psh"}
+SHELL_LANGS_WIN = {"powershell", "ps1", "pwsh", "cmd", "bat", "batch", "psh", "ps"}
 SHELL_LANGS_UNIX = {"bash", "sh", "zsh", "shell", "console", "terminal", "fish"}
+
+
+_CMD_START_RE = re.compile(
+    r"(?i)^(?:\$ |PS [^>\n]*> |> )?(?:(?:get|set|new|remove|start|stop|restart|invoke|test|copy|move|write|select|where|foreach|import|export|add|clear|out|format|expand|compress|enable|disable|install|uninstall|update)-[a-z]+"
+    r"|cd|dir|ls|cat|echo|mkdir|rmdir|del|copy|move|ren|type|pip3?|py|python3?|winget|choco|scoop|npm|npx|node|yarn|git|curl|wget|ping|ipconfig|netstat|tasklist|taskkill|sudo|apt(?:-get)?|brew|dotnet|java|code|explorer|start|setx?|reg|sc|netsh|schtasks|wmic|whoami|hostname|systeminfo|where|which|chmod|chown|tar|unzip|zip|docker|ssh|scp)(?:\s|$)|^(?:\.[\\/]|\$[A-Za-z_]|&\s)")
+
+
+def looks_like_shell(code):
+    """An untagged block that starts like a terminal command (so it gets the run button too)."""
+    first = next((ln.strip() for ln in str(code or "").splitlines() if ln.strip()), "")
+    return bool(first) and bool(_CMD_START_RE.match(first))
+
+
+def strip_prompts(code):
+    """Remove «$ », «> » and «PS C:\\x> » prompts that replies often copy in front of commands."""
+    lines = str(code or "").splitlines()
+    pr = re.compile(r"^\s*(?:\$ |PS [^>\n]*> |> )")
+    if lines and all(pr.match(ln) or not ln.strip() for ln in lines):
+        return "\n".join(pr.sub("", ln, count=1) for ln in lines)
+    return str(code or "")
 
 
 def shell_family(lang):
@@ -8774,6 +8846,10 @@ class App(QMainWindow):
         self.task_timer.timeout.connect(self.tick_tasks)
         self.task_timer.start(30000)
         QTimer.singleShot(9000, self.tick_tasks)
+        self.followup_timer = QTimer(self)
+        self.followup_timer.timeout.connect(self.tick_followups)
+        self.followup_timer.start(15000)
+        QTimer.singleShot(12000, self.tick_followups)
         self.refresh_projects()
         self.proj_box.currentIndexChanged.connect(self.on_project_changed)
         self._tg_busy = False
@@ -9814,20 +9890,14 @@ class App(QMainWindow):
         self.run_code(self.copy_store.get(cid, ""), py)
 
     def run_code(self, code, py=False):
+        """The «تشغيل» button under a reply's command/code block: it runs right away (pressing it is the approval); the OS-protection check still applies."""
+        if not py:
+            code = strip_prompts(code)
         if not code.strip():
             return
         danger = None if py else shell_danger(code)
         if danger:
             QMessageBox.warning(self, "5belan", "رفضت تشغيله: %s.\nالبرنامج ما يلمس ملفات النظام أبداً." % danger)
-            return
-        box = QMessageBox(self)
-        box.setWindowTitle("تشغيل الكود" if py else "تشغيل الأمر")
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setText("تشغيل كود بايثون هذا على جهازك؟ النتائج تنحفظ في مرفقات المحادثة." if py else "تشغيل هذا الأمر على جهازك؟")
-        box.setDetailedText(_cut(code, 20000))
-        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        box.setDefaultButton(QMessageBox.StandardButton.No)
-        if box.exec() != QMessageBox.StandardButton.Yes:
             return
         runner = ToolRunner(roots=[], shell_mode="free")
         runner.work_dir = os.path.join(self.chat_dir(), "work") if self.current else os.path.join(DATA_DIR, "work")
@@ -10482,6 +10552,8 @@ class App(QMainWindow):
         a.setFontWeight(QFont.Weight.Bold)
         c.insertText("⧉ نسخ", a)
         fam = shell_family(lang)
+        if fam is None and (lang or "").strip().lower() in ("", "text", "txt", "plaintext", "plain") and looks_like_shell(code):
+            fam = "win" if IS_WIN else "unix"
         lg_ = CANVAS_LANGS.get((lang or "").lower())
         if lg_ == "py":
             c.insertText("      ", h)
@@ -11197,6 +11269,79 @@ class App(QMainWindow):
             except Exception as ex:
                 log_event("sort failed for %s: %s" % (fp, ex))
         return moved, newseen
+
+    # ---------- follow-ups: the model wakes itself up later (schedule_followup) ----------
+    def add_followup(self, cid, chat, mins, note):
+        """Called from the worker thread by the model's tool; the list itself is written on the UI thread (queue event)."""
+        pend = [f for f in (self.cfg.get("followups") or []) if f.get("chat") == cid]
+        if len(pend) >= FOLLOWUP_MAX_PENDING:
+            raise ToolError("this chat already has %d waiting follow-ups; do the work now or tell the user" % len(pend))
+        if int(chat.get("fu_chain", 0)) >= FOLLOWUP_MAX_CHAIN:
+            raise ToolError("%d automatic follow-ups ran in a row without a message from the user; stop scheduling and report to the user" % FOLLOWUP_MAX_CHAIN)
+        at = time.time() + mins * 60
+        self.q.put(("followup_add", {"id": uuid.uuid4().hex[:8], "chat": cid, "at": at, "note": note, "mins": mins}))
+        return "Scheduled: you will get this note as a message in this chat in %d minutes (at %s). Tell the user briefly." % (mins, time.strftime("%H:%M", time.localtime(at)))
+
+    def tick_followups(self):
+        fus = self.cfg.get("followups") or []
+        if not fus or not self.key_edit.text().strip():
+            return
+        now = time.time()
+        for f in list(fus):
+            if f.get("at", 0) > now:
+                continue
+            chat = next((c for c in self.chats if c["id"] == f.get("chat")), None)
+            if chat is None:
+                fus.remove(f)
+                self.save_cfg()
+                continue
+            if chat["id"] in self.runs:
+                continue  # that chat is answering right now: try again at the next tick
+            fus.remove(f)
+            self.save_cfg()
+            self.fire_followup(chat, f)
+            break  # one at a time
+
+    def fire_followup(self, chat, f):
+        """Send the model its own note as a message in its chat (same path as a Telegram message), with the chat's own settings."""
+        late = max(0, int((time.time() - f.get("at", time.time())) / 60))
+        text = ("[SCHEDULED FOLLOW-UP: sent automatically by the app, not typed by the user. You asked to be woken up after %d minutes. "
+                "The user may not be looking at the screen. Do now what your note says, then report briefly.%s]\n\nYour note: %s"
+                % (f.get("mins", 0), (" (the app was closed, this is %d minutes late)" % late) if late > 3 else "", f.get("note", "")))
+        prev_att, prev_q = self.attachments, self.quotes
+        self.attachments, self.quotes = [], []
+        self._stash_draft()  # whatever you were typing stays with its chat
+        kept = dict(self.drafts)
+        self.current = chat
+        self.apply_settings(self.chat_settings(chat))
+        self.title_label.setText(chat.get("title", ""))
+        self.refresh_list()
+        self.render_chat()
+        chat["fu_chain"] = int(chat.get("fu_chain", 0)) + 1
+        self._shown_override = "[متابعة مجدولة] " + _cut(f.get("note", ""), 300)
+        self._fu_sending = True
+        self.inp.setPlainText(text)
+        try:
+            self.send()
+        finally:
+            self._fu_sending = False
+            self._shown_override = None
+            self.attachments, self.quotes = prev_att, prev_q
+            self.refresh_quotes()
+            self.refresh_files_label()
+            for k_, v_ in kept.items():
+                self.drafts.setdefault(k_, v_)
+            if not self.inp.toPlainText().strip():
+                self._restore_draft()
+        if chat["id"] not in self.runs:
+            self.inp.clear()
+            self.statusBar().showMessage("ما قدرت أرسل المتابعة المجدولة (تأكد من المفتاح).", 6000)
+            return
+        try:
+            if self.tray is not None and not self.isActiveWindow():
+                self.tray.showMessage("خبيلان", "يكمل شغله بالمتابعة المجدولة: " + _cut(chat.get("title") or "", 40), QSystemTrayIcon.Information, 6000)
+        except Exception:
+            pass
 
     def tick_tasks(self):
         key = self.key_edit.text().strip()
@@ -12488,6 +12633,8 @@ class App(QMainWindow):
         except Exception as ex:
             log_event("could not copy attachments: %s" % ex)
         shown_text = getattr(self, "_shown_override", None) or text
+        if not getattr(self, "_fu_sending", False):
+            self.current["fu_chain"] = 0  # a message from the user: automatic follow-ups may chain again
         msg = {"role": "user", "content": content, "shown": shown_text, "names": names}
         if quotes:
             msg["quotes"] = quotes
@@ -12548,6 +12695,7 @@ class App(QMainWindow):
             runner.stop_event = run.stop_event
             runner.undo_dir = os.path.join(self.chat_dir(), "undo")
             runner.work_dir = os.path.join(self.chat_dir(), "work")
+            runner.followup = lambda mins_, note_, cid_=cid, ch_=self.current: self.add_followup(cid_, ch_, mins_, note_)
         if runner is not None:
             runner.llm = self.make_llm(key, lambda u: self.q.put(("usage", (MODELS[0], u, time.time()), run)))
         system = SYSTEM_PROMPT + "\n" + memory_prompt() + (tools_prompt(runner) if runner else "")
@@ -13061,6 +13209,10 @@ class App(QMainWindow):
                         del j_[:len(j_) - 300]
                     if jc_ is self.current:
                         self.undo_btn.setVisible(True)
+            elif kind == "followup_add":
+                self.cfg.setdefault("followups", []).append(val)
+                self.save_cfg()
+                self.statusBar().showMessage("خبيلان جدول متابعة بعد %d دقيقة" % val.get("mins", 0), 6000)
             elif kind == "usage":
                 if L is not None:
                     try:
