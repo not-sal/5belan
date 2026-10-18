@@ -6385,7 +6385,7 @@ def make_qss(c):
     QLabel#h2 { font-size: 14px; font-weight: bold; padding-top: 8px; }
     QLabel#chip { color: %(dim)s; }
     QListWidget#chats { background: transparent; border: none; padding: 0; }
-    QListWidget#chats::item { padding: 10px 12px; min-height: 28px; border: none; border-radius: 10px; margin: 1px 0; color: %(text)s; }
+    QListWidget#chats::item { padding: 10px 12px; min-height: 28px; border: none; border-radius: 10px; margin: 1px 0; }
     QListWidget#chats::item:hover { background: %(hover)s; }
     QListWidget#chats::item:selected { background: %(bubble)s; color: %(text)s; border-right: 3px solid %(accent)s; }
     QPlainTextEdit { background: transparent; color: %(text)s; border: none; padding: 4px; }
@@ -6983,6 +6983,10 @@ class App(QMainWindow):
         self.bal_timer = QTimer(self)
         self.bal_timer.timeout.connect(lambda: self.refresh_balance())
         self.bal_timer.start(5 * 60 * 1000)
+        self._dots = 0
+        self.dots_timer = QTimer(self)
+        self.dots_timer.timeout.connect(self._tick_dots)
+        self.dots_timer.start(500)
 
         # ---------- main area ----------
         main = QWidget()
@@ -8397,10 +8401,12 @@ class App(QMainWindow):
         self.order = [c["id"] for c in self.view_chats]
         self.listw.blockSignals(True)
         self.listw.clear()
+        self._list_sel = sel
         for c in self.view_chats:
-            pj = self.get_project(c.get("project"))
-            self.listw.addItem(("[يشتغل] " if c["id"] in self.runs else "") + ("[جديد] " if c.get("unread") else "") + ("[مثبّتة] " if c.get("pinned") else "") + ("[أرشيف] " if c.get("archived") else "") + c["title"]
-                               + (("   ‹%s›" % pj["name"]) if pj and sel == "*" else ""))
+            self.listw.addItem(self._chat_row_text(c, sel))
+            it = self.listw.item(self.listw.count() - 1)
+            if c["id"] in self.runs or c.get("unread"):
+                it.setForeground(QColor(THEMES[self.theme]["accent"]))
         if self.current and self.current["id"] in self.order:
             self.listw.setCurrentRow(self.order.index(self.current["id"]))
         else:
@@ -8408,6 +8414,22 @@ class App(QMainWindow):
         self.listw.blockSignals(False)
         self.title_label.setText(self.current["title"] if self.current else "محادثة جديدة")
         self.update_cost_tip()
+
+    def _chat_row_text(self, c, sel):
+        pj = self.get_project(c.get("project"))
+        busy = ("يفكر" + "." * (1 + getattr(self, "_dots", 0) % 3) + " ") if c["id"] in self.runs else ""
+        return (busy + ("[جديد] " if c.get("unread") else "") + ("[مثبّتة] " if c.get("pinned") else "") + ("[أرشيف] " if c.get("archived") else "") + c["title"]
+                + (("   ‹%s›" % pj["name"]) if pj and sel == "*" else ""))
+
+    def _tick_dots(self):
+        """Animate the «يفكر…» mark on chats that are answering (only their rows are touched)."""
+        if not self.runs:
+            return
+        self._dots += 1
+        sel = getattr(self, "_list_sel", "*")
+        for i, c in enumerate(self.view_chats):
+            if c["id"] in self.runs and i < self.listw.count():
+                self.listw.item(i).setText(self._chat_row_text(c, sel))
 
     def on_select(self, row):
         if row < 0 or row >= len(self.view_chats):
@@ -9266,17 +9288,43 @@ class App(QMainWindow):
         self.act_tray.setCheckable(True)
         self.act_tray.setChecked(self.cfg.get("close_to_tray", True) is not False)
         self.act_tray.toggled.connect(lambda on: (self.cfg.__setitem__("close_to_tray", bool(on)), self.save_cfg()))
+        self.act_notify = m.addAction("إشعار ويندوز عند كل رد")
+        self.act_notify.setCheckable(True)
+        self.act_notify.setChecked(self.cfg.get("notify_reply", True) is not False)
+        self.act_notify.toggled.connect(lambda on: (self.cfg.__setitem__("notify_reply", bool(on)), self.save_cfg()))
         m.addSeparator()
         m.addAction("خروج", self.quit_app)
         self._tray_menu = m
         self.tray.setContextMenu(m)
         self.tray.activated.connect(lambda r: self.show_from_tray() if r in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None)
+        self.tray.messageClicked.connect(self._open_notified_chat)
         self.tray.show()
         QApplication.setQuitOnLastWindowClosed(False)
         try:  # the computer is shutting down / the user is signing out
             QApplication.instance().commitDataRequest.connect(self.on_session_end)
         except Exception:
             pass
+
+    def notify_reply(self, chat, is_cur):
+        """A Windows notification for a finished reply (not when you are already looking at that chat in the active window)."""
+        try:
+            if self.tray is None or self.cfg.get("notify_reply", True) is False:
+                return
+            if is_cur and self.isActiveWindow() and not self.isMinimized():
+                return
+            ms = chat.get("msgs", [])
+            txt = clean_reply(str(ms[-1].get("content", ""))) if ms and ms[-1].get("role") == "assistant" else ""
+            txt = " ".join(txt.split())
+            self._notif_chat = chat["id"]
+            self.tray.showMessage(_cut(chat.get("title") or "خبيلان", 50), _cut(txt, 140) or "خلص الرد", QSystemTrayIcon.Information, 8000)
+        except Exception:
+            pass
+
+    def _open_notified_chat(self):
+        cid = getattr(self, "_notif_chat", None)
+        self.show_from_tray()
+        if cid and cid in self.order:
+            self.listw.setCurrentRow(self.order.index(cid))
 
     def show_from_tray(self):
         self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
@@ -11416,6 +11464,8 @@ class App(QMainWindow):
         pend = R.interrupt or R.queued
         merged = R.interrupt is not None
         is_cur = self.current is R.chat
+        if not failed:
+            self.notify_reply(R.chat, is_cur)
         if is_cur:
             self.sync_run_ui()
             self.inp.setFocus()

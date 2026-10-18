@@ -1,10 +1,10 @@
 {
   "version": "2.19.1",
-  "notes": "2.19.1: بوكس الكتابة يمين لليسار دايماً، وزر «رد على المحدد» يطلع فوق النص المحدد",
+  "notes": "Windows notification on each reply, animated thinking mark on chats in the list",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "51dfd874f236a756d75377473312637427488a7f3e0bc812fea7d1b537878487"
+      "sha256": "3fcfbfa8d2aedb54503afe4ff810471a7838288183e34c05a1dbf7629f49929a"
     },
     {
       "name": "guard.py",
