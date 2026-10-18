@@ -1,10 +1,10 @@
 {
-  "version": "2.20.0",
-  "notes": "Discussion room: members from chats or new roles, rounds limit, spending cap, agreement word, repetition guard, referee messages",
+  "version": "2.21.0",
+  "notes": "Room phase 2: groups, heads and top manager, room files with targets, manager distributes files with an editable plan",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "d3caa8c6068ea27fddc7878b0e18d6d084b2c1fe647cf056d9c3f9d893f82fcc"
+      "sha256": "40b95488fd32c363a1b4b9ee5b3f13d3caed816ad48f7afe14ea1a74a2c14b17"
     },
     {
       "name": "guard.py",
