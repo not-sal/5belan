@@ -3244,7 +3244,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.22.1"
+APP_VERSION = "2.22.2"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5685,8 +5685,10 @@ class RoomDialog(QDialog):
         tm = QWidget()
         ml = QVBoxLayout(tm)
         ml.setContentsMargins(8, 8, 8, 8)
+        ml.setSpacing(8)
         self.mlist = QListWidget()
-        self.mlist.setFixedHeight(62)
+        self.mlist.setMinimumHeight(84)
+        self.mlist.setMaximumHeight(110)
         ml.addWidget(self.mlist)
         mrow = QHBoxLayout()
         for txt, fn in (("من محادثة", self.add_from_chat), ("عضو جديد", self.add_new), ("حذف العضو", self.del_member)):
@@ -5770,7 +5772,7 @@ class RoomDialog(QDialog):
         ll.addWidget(b_exp)
         ll.addStretch(1)
         self.tabs.addTab(tl, "الحدود")
-        self.tabs.setFixedHeight(280)
+        self.tabs.setFixedHeight(340)
         lay.addWidget(self.tabs)
 
         self.view = QTextBrowser()
@@ -5927,6 +5929,7 @@ class RoomDialog(QDialog):
             self.m_role.setPlainText(m.get("role", ""))
             self.m_level.setCurrentIndex(max(0, self.m_level.findData(room_level(m))))
             self.m_group.setText(m.get("group", ""))
+            self.m_group.setVisible(room_level(m) != "boss")
             self.m_model.setCurrentText(m.get("model", MODELS[0]))
             self.m_think.setCurrentText(m.get("think", "off"))
             self.m_mute.setChecked(bool(m.get("mute")))
@@ -5947,6 +5950,10 @@ class RoomDialog(QDialog):
         m["name"] = self.m_name.text().strip() or m["name"]
         m["role"] = self.m_role.toPlainText().strip()
         m["group"] = self.m_group.text().strip()
+        if self.m_level.currentData() == "boss":
+            m["group"] = ""  # the top manager stands above the groups
+            self.m_group.clear()
+        self.m_group.setVisible(self.m_level.currentData() != "boss")
         m["model"] = self.m_model.currentText()
         m["think"] = self.m_think.currentText()
         m["mute"] = self.m_mute.isChecked()

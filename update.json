@@ -1,10 +1,10 @@
 {
-  "version": "2.22.1",
-  "notes": "Room limits raised: files 40k per file and 120k total, whole chat 150k characters",
+  "version": "2.22.2",
+  "notes": "Room: bigger member list, no group field for the top manager",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "6eabf6b8079292bcf07d606ee080b914b376c33649a9fb5556c2a6b0a4e4683f"
+      "sha256": "dab7bbaeae0e81e8453ce5a07584c6a097426fc415b51f5c9a5c1a0be31ee2ee"
     },
     {
       "name": "guard.py",
