@@ -3244,7 +3244,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.22.0"
+APP_VERSION = "2.22.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5362,8 +5362,8 @@ ROOMS_PATH = os.path.join(DATA_DIR, "rooms.json")
 ROOM_AGREE = "[[اتفقنا]]"
 _ROOMS_LOCK = threading.Lock()
 _ROOMS_BAK_T = [0.0]
-ROOM_CTX_PARTIAL = 12000   # characters kept from "last 6 topics"
-ROOM_CTX_WHOLE = 60000     # characters kept when a whole chat is pulled in (the newest part wins)
+ROOM_CTX_PARTIAL = 30000   # characters kept from "last 6 topics"
+ROOM_CTX_WHOLE = 150000    # characters kept when a whole chat is pulled in (the newest part wins)
 
 
 def rooms_load():
@@ -5417,7 +5417,7 @@ def room_chat_context(chat, whole):
     if not whole:
         users = [i for i, m in enumerate(msgs) if m.get("role") == "user"]
         msgs = msgs[users[-6]:] if len(users) > 6 else msgs
-    per = 6000 if whole else 1500
+    per = 20000 if whole else 4000
     lines = []
     for m in msgs:
         who = "user" if m.get("role") == "user" else "assistant"
@@ -5429,8 +5429,8 @@ def room_chat_context(chat, whole):
         return "[earlier part cut]\n" + text[-cap:], True
     return text, False
 ROOM_KEEP = 14           # only the latest visible messages are sent to a member: keeps token use flat however long the talk is
-ROOM_FILE_CAP = 6000     # characters of one file a member gets per turn
-ROOM_FILES_CAP = 16000   # characters of all files together per member
+ROOM_FILE_CAP = 40000    # characters of one file a member gets per turn
+ROOM_FILES_CAP = 120000  # characters of all files together per member
 ROOM_LEVELS = (("member", "عضو"), ("head", "رئيس مجموعة"), ("boss", "المدير الكبير"))
 
 
@@ -6050,7 +6050,7 @@ class RoomDialog(QDialog):
         bad = []
         for p in paths:
             try:
-                text = read_document(p)[:60000]
+                text = read_document(p)[:300000]
             except Exception as e:
                 bad.append("%s (%s)" % (os.path.basename(p), str(e)[:60]))
                 continue
