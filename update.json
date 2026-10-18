@@ -1,10 +1,10 @@
 {
-  "version": "2.19.1",
+  "version": "2.19.2",
   "notes": "Windows notification on each reply, animated thinking mark on chats in the list",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "3fcfbfa8d2aedb54503afe4ff810471a7838288183e34c05a1dbf7629f49929a"
+      "sha256": "29206110ca52f26d75652527ac8c4f320e9d75cc72a2a21a3b8331db5bff7d05"
     },
     {
       "name": "guard.py",
