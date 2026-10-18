@@ -1,10 +1,10 @@
 {
-  "version": "2.24.1",
-  "notes": "Room panel: bigger member list, removed the empty area",
+  "version": "2.25.0",
+  "notes": "Room: attach files and pictures any time (also from the big composer), vision members see pictures, room chats hidden from the member picker",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "22d4fee33a2df06cd341ab138ea1d82002b338df68b428538f97178954a0eaff"
+      "sha256": "3aeacf282dbbbae8f0d6db3569f65a5f303539d7b974a0facda6576cd1728431"
     },
     {
       "name": "guard.py",
