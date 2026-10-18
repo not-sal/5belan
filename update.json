@@ -1,10 +1,10 @@
 {
-  "version": "2.22.0",
-  "notes": "Room: crash-safe storage (saved after every message, backups), pull last 6 topics or whole chat, mute, @mention, summary, export",
+  "version": "2.22.1",
+  "notes": "Room limits raised: files 40k per file and 120k total, whole chat 150k characters",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "8bde0a849e244d90ff23b587a88225ee937d46ec6d4cae153450a44c7ea925a3"
+      "sha256": "6eabf6b8079292bcf07d606ee080b914b376c33649a9fb5556c2a6b0a4e4683f"
     },
     {
       "name": "guard.py",
