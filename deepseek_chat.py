@@ -3244,7 +3244,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.25.0"
+APP_VERSION = "2.25.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5876,9 +5876,10 @@ class RoomDialog(QDialog):
         self.final_call.setChecked(True)
         self.final_call.setToolTip("لما يتفقون، جولة وحدة زيادة: اللي عنده اعتراض يقوله، وإلا يؤكد وينتهي")
         ll.addWidget(self.final_call)
-        b_exp = QPushButton("تصدير النقاش (Markdown)")
-        b_exp.clicked.connect(self.export_md)
-        ll.addWidget(b_exp)
+        self.b_exp = QPushButton("تصدير النقاش (Markdown)")
+        self.b_exp.clicked.connect(self.export_md)
+        ll.addWidget(self.b_exp)
+        self.b_exp.setVisible(False)  # only once somebody has spoken
         ll.addStretch(1)
         self.tabs.addTab(tl, "الحدود")
         lay.addWidget(self.tabs, 1)
@@ -6318,14 +6319,20 @@ class RoomDialog(QDialog):
 
     def _on_msg(self, who, text):
         self._show(who, text)
+        self._refresh_export()
         if self.room is not None:
             self.app.room_refresh(self.room)
 
     def _running(self):
         return self._thread is not None and self._thread.is_alive()
 
+    def _refresh_export(self):
+        r = self.room
+        self.b_exp.setVisible(bool(r and any(m["who"] not in ("الحكم", "تنبيه") for m in r["msgs"])))
+
     def _status_idle(self):
         r = self.room
+        self._refresh_export()
         self.status.setText(("صرف الغرفة %.4f$ من %s · رسائل %d" % (r.get("spent", 0.0), self._cap_text(r), len(r["msgs"]))) if r else "")
 
     @staticmethod

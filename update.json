@@ -1,10 +1,10 @@
 {
-  "version": "2.25.0",
-  "notes": "Room: attach files and pictures any time (also from the big composer), vision members see pictures, room chats hidden from the member picker",
+  "version": "2.25.1",
+  "notes": "Room: export button appears only after members have spoken",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "3aeacf282dbbbae8f0d6db3569f65a5f303539d7b974a0facda6576cd1728431"
+      "sha256": "60cdfa0bf29753b47da2a554dd9ea7856bbfbd6b1924a285f1dae8f8dd021280"
     },
     {
       "name": "guard.py",
