@@ -1,10 +1,10 @@
 {
-  "version": "2.22.2",
-  "notes": "Room: bigger member list, no group field for the top manager",
+  "version": "2.23.0",
+  "notes": "Room: unlimited option for rounds and for spending cap, each on its own",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "dab7bbaeae0e81e8453ce5a07584c6a097426fc415b51f5c9a5c1a0be31ee2ee"
+      "sha256": "a69f2e6f58571cb04f3eb9d84ab6ff25c46b6f06793d96e29ec198e7c2c219fc"
     },
     {
       "name": "guard.py",
