@@ -223,18 +223,18 @@ def main():
             say(">> اشغّل البرنامج...  سكّر نافذة البرنامج عشان توقف.")
             code = run_once(app)
             uptime = time.time() - t0
+            native = code < 0 or code >= 0xC0000000  # a crash inside Qt/Windows (access violation...), never a problem of the file itself
 
-            if code != 0 and uptime >= RUNTIME_MIN:
+            if code != 0 and (uptime >= RUNTIME_MIN or native):
                 # it ran fine for a while and then died: a runtime crash, not a broken file.
                 # Never swap the file for an old copy here; just restart so the app can offer to resume.
                 say("")
-                say("!! The app crashed while running (exit code %s) after %.0f s. The file is fine, not restoring any old copy." % (code, uptime))
+                say("!! The app crashed while running (exit code %s) after %.0f s. A native crash is not a problem of the file: not restoring any old copy." % (code, uptime))
                 try:
                     with open(os.path.join(BASE, "events.log"), "a", encoding="utf-8") as lf:
                         lf.write("%s  guard: app exited with code %s after %.0f s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), code, uptime))
                 except Exception:
                     pass
-                native = code < 0 or code >= 0xC0000000
                 if native and restarts < MAX_RESTARTS:
                     restarts += 1
                     say(">> Restarting automatically (%d of %d)..." % (restarts, MAX_RESTARTS))

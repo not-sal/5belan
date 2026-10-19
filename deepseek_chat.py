@@ -3315,7 +3315,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.30.3"
+APP_VERSION = "2.31.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5716,6 +5716,15 @@ def room_member_prompt(room, m):
     gp = ((room.get("group_prompts") or {}).get(g) or "").strip() if g else ""
     if gp:
         prompt += "\n\nINSTRUCTIONS FOR YOUR GROUP «%s» (from the referee; they apply to the head and to every member):\n%s" % (g, gp)
+    gplan = ((room.get("group_plans") or {}).get(g) or {}) if g else {}
+    if gp and lv == "head":
+        prompt += ("\n\nYOU ORGANISE THIS GROUP: the referee gave the group one mission and did not split it among the members. It is your job to divide it between them "
+                   "(by their roles and strengths), tell each one what to do, follow what they write, correct them, and merge their work into one clear result for the manager.")
+    if gplan.get("plan") and lv == "head":
+        prompt += "\n\nYOUR PLAN for the group (already shared with the members):\n" + gplan["plan"]
+    mine = (gplan.get("assignments") or {}).get(m["name"]) if gplan else None
+    if mine and lv == "member":
+        prompt += "\n\nYOUR ASSIGNMENT FROM YOUR HEAD (this is your part of the group's mission; do it and report to the head):\n" + mine
     prompt += ("\n\nTo hand over a text file (notes, a report, code, a table as csv) write a block that starts with a line ```file:NAME.EXT and ends with ```; "
                "the referee finds it in the room attachments, listed as coming from you, and the others can read it.")
     if m.get("context"):
@@ -6052,6 +6061,45 @@ def room_distribution(key, room):
     return room_parse_plan(str(msg.get("content") or ""), room), usage_cost(model, u)[0]
 
 
+def room_group_sig(room, g):
+    """What a group plan depends on: the group's prompt, its head and its members with their roles."""
+    mem = sorted((x["name"], x.get("role", ""), room_level(x)) for x in room["members"] if x.get("group") == g)
+    return json.dumps([(room.get("group_prompts") or {}).get(g, ""), mem], ensure_ascii=False)
+
+
+def room_plan_group(key, room, g):
+    """The head of group g divides the group's mission between its members. Returns ({"plan", "assignments": {name: task}}, cost in USD)."""
+    head = next((x for x in room["members"] if x.get("group") == g and room_level(x) == "head"), None)
+    mem = [x for x in room["members"] if x.get("group") == g and x is not head]
+    if head is None or not mem:
+        return None, 0.0
+    mission = (room.get("group_prompts") or {}).get(g, "")
+    roster = "\n".join("- %s | %s" % (x["name"], _cut(" ".join((x.get("role") or "no role given").split()), 200)) for x in mem)
+    sysm = ("You are %s, the head of the group «%s» in a discussion room. Topic: %s.\nThe referee gave your group ONE mission and did not split it among the members: "
+            "you organise it. Give every member one clear task of their own (use exactly their names), and write a short plan of how the work flows "
+            "and how you will merge the results for the manager. Answer with JSON only: "
+            '{"plan":"<short plan>","assignments":{"<member name>":"<that member\'s task>"}}' % (head["name"], g, room.get("topic", "")))
+    utext = "MISSION OF THE GROUP:\n%s\n\nMEMBERS:\n%s" % (mission, roster)
+    model = head.get("model") or MODELS[0]
+    msg, u = api_chat(key, model, [{"role": "system", "content": sysm}, {"role": "user", "content": utext}], think="off", timeout=180, max_tokens=1400)
+    text = str(msg.get("content") or "")
+    obj = None
+    mt = re.search(r"\{.*\}", text, re.S)
+    if mt:
+        try:
+            obj = json.loads(mt.group(0))
+        except Exception:
+            obj = None
+    names = {x["name"] for x in mem}
+    asg = {}
+    if isinstance(obj, dict) and isinstance(obj.get("assignments"), dict):
+        asg = {k: str(v)[:600] for k, v in obj["assignments"].items() if k in names and str(v).strip()}
+    for n in names:
+        asg.setdefault(n, "ساعد في مهمة المجموعة بحسب دورك، والتزم بتوجيهات الرئيس.")
+    plan = str((obj or {}).get("plan") or text or "").strip()[:1500] if (obj or text) else ""
+    return {"plan": plan, "assignments": asg}, usage_cost(model, u)[0]
+
+
 class RoomTargetDialog(QDialog):
     """Pick who may see a file: the manager decides, everybody, or chosen members."""
 
@@ -6173,7 +6221,8 @@ class RoomDialog(QDialog):
         self.m_name = QLineEdit()
         self.m_name.setPlaceholderText("اسم العضو")
         ml.addWidget(self.m_name)
-        lrole = QLabel("مهمة العضو وبرومته (وش يمسك بالضبط؟)")
+        lrole = QLabel("مهمة العضو وبرومته (اختياري: لو تركتها فاضية وهو بمجموعة، رئيس المجموعة يعطيه مهمته)")
+        lrole.setWordWrap(True)
         lrole.setObjectName("chip")
         ml.addWidget(lrole)
         self.m_role = QPlainTextEdit()
@@ -6274,13 +6323,18 @@ class RoomDialog(QDialog):
             b.clicked.connect(fn)
             grow2.addWidget(b, i_ // 2, i_ % 2)
         gl.addLayout(grow2)
-        lg = QLabel("تعليمات هذي المجموعة (للرئيس وكل أعضائها)")
+        lg = QLabel("برومت المجموعة: اكتب مهمة المجموعة بس، والرئيس يوزّعها على أعضائها بنفسه")
         lg.setObjectName("chip")
+        lg.setWordWrap(True)
         gl.addWidget(lg)
         self.g_prompt = QPlainTextEdit()
-        self.g_prompt.setPlaceholderText("مثلاً: مهمة هذي المجموعة تحليل التكلفة فقط، والرئيس يلخّص لي رأيهم بنقطتين")
-        self.g_prompt.setFixedHeight(96)
+        self.g_prompt.setPlaceholderText("مثلاً: حللوا خيارات المنصة من ناحية التكلفة والسرعة، وطلعوا لي توصية وحدة. ما أحتاج أحدد لكل عضو شي.")
+        self.g_prompt.setFixedHeight(110)
         gl.addWidget(self.g_prompt)
+        b_replan = QPushButton("الرئيس يرتّبها من جديد")
+        b_replan.setToolTip("عند البدء القادم يوزّع الرئيس المهمة على الأعضاء من جديد")
+        b_replan.clicked.connect(self.replan_group)
+        gl.addWidget(b_replan)
         self.tabs.insertTab(2, tg, "المجموعات")
         # --- map: who holds which task
         self.map_view = QTextBrowser()
@@ -6526,6 +6580,14 @@ class RoomDialog(QDialog):
         self.g_prompt.setEnabled(g is not None and not self._running())
         self._loading = False
 
+    def replan_group(self):
+        g = self._cur_group()
+        if self.room is None or g is None:
+            return
+        (self.room.setdefault("group_plans", {})).pop(g, None)
+        self._save()
+        self.status.setText("عند البدء القادم رئيس «%s» يرتّب المهمة من جديد." % g)
+
     def _group_prompt_edited(self):
         if self._loading or self.room is None:
             return
@@ -6572,8 +6634,12 @@ class RoomDialog(QDialog):
             gp = (ghost.get("group_prompts") or {}).get(g)
             if gp:
                 h.append('<p style="margin-right:16px"><b>تعليمات المجموعة:</b> <span style="color:%s">%s</span></p>' % (dim, escape(_cut(gp, 240))))
+            plan_ = (ghost.get("group_plans") or {}).get(g) or {}
             for m in sorted(mem, key=lambda x: room_level(x) != "head"):
                 h.append(line(m, "رئيس" if room_level(m) == "head" else "عضو"))
+                given = (plan_.get("assignments") or {}).get(m["name"])
+                if given:
+                    h.append('<p style="margin-right:32px;color:%s">وزّع له الرئيس: %s</p>' % (acc, escape(_cut(given, 200))))
             if not mem:
                 h.append('<p style="margin-right:16px;color:%s">ما فيها أحد</p>' % dim)
         loose = [m for m in ghost["members"] if not m.get("group") and room_level(m) != "boss"]
@@ -7469,10 +7535,41 @@ class RoomDialog(QDialog):
             self.sig_msg.emit(m["name"], text)
         return held > 0
 
+    def _plan_groups(self, r, key):
+        """A group that has one prompt and a head: the head divides the mission among the members (again whenever the prompt or the members changed)."""
+        plans = r.setdefault("group_plans", {})
+        for g in list(r.get("groups") or []):
+            if not (r.get("group_prompts") or {}).get(g):
+                continue
+            sig = room_group_sig(r, g)
+            if (plans.get(g) or {}).get("sig") == sig:
+                continue
+            head = next((x for x in r["members"] if x.get("group") == g and room_level(x) == "head"), None)
+            if head is None or head.get("mute") or self._stop.is_set():
+                continue
+            self.sig_status.emit("رئيس «%s» يوزّع مهمة المجموعة على أعضائها…" % g)
+            self.sig_turn.emit(head["name"])
+            try:
+                plan, cost = room_plan_group(key, r, g)
+            except Exception as e:
+                self.sig_status.emit("تعذّر ترتيب مجموعة «%s»: %s" % (g, str(e)[:80]))
+                continue
+            r["spent"] = r.get("spent", 0.0) + cost
+            if not plan:
+                continue
+            plan["sig"] = sig
+            plans[g] = plan
+            lines = ["خطة المجموعة «%s»:" % g, plan.get("plan", "")] + ["- %s: %s" % (n, t) for n, t in plan["assignments"].items()]
+            note = {"who": head["name"], "text": "\n".join(x for x in lines if x), "vis": room_vis(head), "plan": True}
+            r["msgs"].append(note)
+            rooms_save(self.rooms)
+            self.sig_msg.emit(head["name"], note["text"])
+
     def _worker(self, r, key):
         reason = "خلصت الجولات، دورك ترد أو تكمّل"
         natural = True
         try:
+            self._plan_groups(r, key)
             order = room_order(r)
             asked = next((x for x in reversed(r["msgs"]) if x["who"] == "الحكم"), None)
             if asked is not None and asked.get("to") and r["msgs"][-1] is asked:
@@ -10854,6 +10951,9 @@ class App(QMainWindow):
             return
         self._stash_draft()
         self.current = self.view_chats[row]
+        # if the program dies while a chat is being opened, the problem report names that chat
+        write_state(last_event="opening chat «%s» (%d messages, %d with steps)" % (_cut(self.current.get("title") or "", 40), len(self.current.get("msgs") or []),
+                                                                                  sum(1 for m_ in (self.current.get("msgs") or []) if isinstance(m_, dict) and m_.get("activity"))))
         if self.current.get("room"):
             self.room_sync_from_store(self.current)
         if self.current.get("unread"):
@@ -10863,6 +10963,7 @@ class App(QMainWindow):
         self.apply_settings(self.chat_settings(self.current))
         self.title_label.setText(self.current["title"])
         self.render_chat()
+        write_state(last_event="opened chat «%s»" % _cut(self.current.get("title") or "", 40))
 
     def render_chat(self, keep_scroll=False):
         sb = self.view.verticalScrollBar()
