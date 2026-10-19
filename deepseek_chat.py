@@ -26,10 +26,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 SHELL_NAME = "PowerShell" if IS_WIN else "bash"
-DETACH_SHORT = "Start-Process -WindowStyle Hidden" if IS_WIN else "nohup ... &"
-DETACH_HINT = ("launch it detached with Start-Process -WindowStyle Hidden (never run it in the foreground), then check it with a separate short command. "
-               if IS_WIN else
-               "launch it detached with: nohup <command> > /tmp/app.log 2>&1 & (never run it in the foreground), then check it with a separate short command. ")
 API_URL = "https://api.deepseek.com/chat/completions"
 BALANCE_URL = "https://api.deepseek.com/user/balance"
 
@@ -949,7 +945,8 @@ def strip_for_save(msg):
         out["skill_offer"] = msg["skill_offer"]
     if msg.get("activity"):
         # keep the file small: only the last steps, each shortened (full logs were making chats.json huge)
-        out["activity"] = [dict(s, text=str(s.get("text", ""))[:3000]) for s in msg["activity"][-60:]]
+        out["activity"] = [dict(s, text=str(s.get("text", ""))[:3000], **({"diff": str(s["diff"])[:6000]} if s.get("diff") else {}))
+                           for s in msg["activity"][-60:]]
     return out
 
 
@@ -971,6 +968,19 @@ BACKUP_MAX_BYTES = 20 * 1024 * 1024
 SEARCH_MAX_RESULTS = 50
 SEARCH_MAX_FILES = 30000
 SEARCH_MAX_SECONDS = 20
+READ_MAX_LINES = 1000      # lines one read_file call returns for a code/text file
+READ_LINE_CAP = 1500       # a longer line is cut in the output (the file is not touched)
+GREP_MAX_RESULTS = 400
+GREP_MAX_BYTES = 3 * 1024 * 1024
+DIFF_MAX_LINES = 400       # lines of a change diff kept for the details view
+# folders a code search skips unless asked (dependencies, build output, caches)
+CODE_SKIP_DIRS = {
+    "node_modules", "__pycache__", ".git", "$recycle.bin", "system volume information", ".venv", "venv", ".tox", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", ".next", ".nuxt", ".svelte-kit", ".turbo", ".cache", ".gradle", ".idea", "dist", "build", "target",
+    "coverage", "bower_components", ".parcel-cache", ".angular", "obj", ".terraform",
+}
+CODE_DOT_DIRS = {".github", ".vscode", ".devcontainer", ".husky", ".circleci", ".gitlab", ".config", ".storybook"}
+DOC_EXTS = {".pdf", ".docx", ".xlsx"}
 
 BLOCKED_DIR_NAMES = {".ssh", ".aws", ".gnupg", ".azure", ".kube"}
 BLOCKED_EXTS = {".pem", ".key", ".pfx", ".p12", ".ppk", ".kdbx", ".kdb", ".wallet"}
@@ -1005,16 +1015,63 @@ READ_TOOLS = [
         "function": {
             "name": "read_file",
             "description": (
-                "Read a file on the user's computer as text. Works for text/code files, PDF, Word (.docx) and Excel (.xlsx). "
-                "Long files are returned in chunks: pass start to continue."
+                "Read a file on the user's computer. Code and text files come back with line numbers (cat -n style): use offset and limit "
+                "to read a part of a big file (the output says how to continue). The line numbers and the tab after them are NOT part of "
+                "the file: never copy them into edit_file. PDF, Word (.docx) and Excel (.xlsx) come back as plain text in chunks (pass start to continue)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Absolute path of the file"},
-                    "start": {"type": "integer", "description": "Character offset to start reading from (default 0)"},
+                    "offset": {"type": "integer", "description": "Code/text files: first line to show, 1-based (default 1)"},
+                    "limit": {"type": "integer", "description": "Code/text files: how many lines (default and max %d)" % READ_MAX_LINES},
+                    "start": {"type": "integer", "description": "Documents (PDF/Word/Excel): character offset to continue from"},
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": (
+                "Search inside files with a regular expression (like ripgrep) and get file:line: matches. Best way to find where something is "
+                "defined or used in a code base. Skips dependencies and build output (node_modules, .git, venv, dist, build...) unless "
+                "include_hidden=true. Escape regex characters such as ( ) [ ] . * + ? when you mean them literally."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regular expression (Python syntax), e.g. def\\s+load_|TODO"},
+                    "path": {"type": "string", "description": "Absolute folder (searched recursively) or file. Default: the first allowed folder"},
+                    "glob": {"type": "string", "description": "Only files matching this glob, e.g. *.py, **/*.{ts,tsx}, src/**/*.js"},
+                    "ignore_case": {"type": "boolean", "description": "Case-insensitive (default false)"},
+                    "context": {"type": "integer", "description": "Lines of context before and after each match (0-5, default 0)"},
+                    "output": {"type": "string", "enum": ["lines", "files", "count"], "description": "lines (default): matching lines; files: only file names; count: matches per file"},
+                    "max_results": {"type": "integer", "description": "Default 100, max %d" % GREP_MAX_RESULTS},
+                    "include_hidden": {"type": "boolean", "description": "Also search dependency/build/hidden folders"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": (
+                "Find files by name pattern (glob) in a folder tree, newest first. A pattern without / matches in every sub-folder "
+                "(*.py finds all Python files); use src/*.py for one folder or src/**/*.py for a tree."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob, e.g. **/*.tsx, *.json, test_*.py, src/**/index.{js,ts}"},
+                    "path": {"type": "string", "description": "Absolute folder to search. Default: the first allowed folder"},
+                    "include_hidden": {"type": "boolean", "description": "Also look in dependency/build/hidden folders"},
+                },
+                "required": ["pattern"],
             },
         },
     },
@@ -1065,8 +1122,10 @@ WRITE_TOOLS = [
         "function": {
             "name": "edit_file",
             "description": (
-                "Change an existing text file by replacing an exact piece of text with new text. "
-                "Read the file first and copy the 'find' text exactly. Fails when the text is not found or is ambiguous."
+                "Change an existing text file by replacing exact pieces of text. Read the file first and copy 'find' exactly (indentation "
+                "included, without read_file's line numbers). Give find/replace for one change, or 'edits' for several changes to the same "
+                "file in one call (applied in order, all or nothing). Each find must match exactly once unless all=true. Prefer this over "
+                "write_file for existing files: it is safer and cheaper."
             ),
             "parameters": {
                 "type": "object",
@@ -1075,8 +1134,17 @@ WRITE_TOOLS = [
                     "find": {"type": "string", "description": "Exact text that must exist in the file"},
                     "replace": {"type": "string", "description": "Text that replaces it (empty string deletes it)"},
                     "all": {"type": "boolean", "description": "Replace every occurrence (default false: exactly one)"},
+                    "edits": {
+                        "type": "array",
+                        "description": "Several changes at once instead of find/replace: [{find, replace, all}]",
+                        "items": {
+                            "type": "object",
+                            "properties": {"find": {"type": "string"}, "replace": {"type": "string"}, "all": {"type": "boolean"}},
+                            "required": ["find", "replace"],
+                        },
+                    },
                 },
-                "required": ["path", "find", "replace"],
+                "required": ["path"],
             },
         },
     },
@@ -1154,6 +1222,102 @@ SHELL_TOOLS = [
     }
 ]
 
+BG_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "start_background",
+            "description": (
+                "Start a long-running command in the background (a dev server, a watcher, a long build or test run) and return at once "
+                "with its id and the first seconds of output. It keeps running between your replies. Check it with read_background, "
+                "end it with stop_background. Never use run_command for something that does not finish on its own."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The command line (PowerShell syntax on Windows)"},
+                    "explanation": {"type": "string", "description": "Short plain explanation (shown to the user)"},
+                    "cwd": {"type": "string", "description": "Working directory (absolute path)"},
+                },
+                "required": ["command", "explanation"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_background",
+            "description": "Status (running / exited with code) and the latest output of a background command started with start_background. Without id: list them all.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The id start_background returned (omit to list all)"},
+                    "lines": {"type": "integer", "description": "How many of the last output lines (default 60, max 400)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_background",
+            "description": "Stop a background command (and everything it started).",
+            "parameters": {
+                "type": "object",
+                "properties": {"id": {"type": "string", "description": "The id start_background returned"}},
+                "required": ["id"],
+            },
+        },
+    },
+]
+BG_MAX = 8
+BG_PROCS = {}               # id -> {"proc", "cmd", "cwd", "log", "script", "t0"}: commands left running in the background
+_BG_LOCK = threading.Lock()
+
+
+def bg_stop_all():
+    """On exit: nothing the agent started in the background outlives the program."""
+    with _BG_LOCK:
+        items = list(BG_PROCS.values())
+    for it in items:
+        try:
+            if it["proc"].poll() is None:
+                ToolRunner._kill_tree(it["proc"])
+        except Exception:
+            pass
+
+
+atexit.register(bg_stop_all)
+TODO_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_write",
+            "description": (
+                "Keep a short todo list for a task with several steps; the user sees it live above the message box. Send the WHOLE list "
+                "each time (it replaces the old one). Exactly one item is in_progress while you work; mark an item completed as soon as it "
+                "is done. Skip it for small one-step requests."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "The step, short, in the user's language"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                            },
+                            "required": ["content", "status"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    },
+]
 FOLLOWUP_MAX_PENDING = 5      # waiting follow-ups per chat
 FOLLOWUP_MAX_CHAIN = 10       # automatic follow-ups in a row (no message from the user in between)
 FOLLOWUP_TOOLS = [
@@ -1303,8 +1467,9 @@ def tools_prompt(runner):
     roots = runner.roots
     if roots:
         parts.append(
-            "FILES: read tools (list_folder, read_file, search_files) work only inside these folders:\n"
+            "FILES: read tools (list_folder, read_file, grep, find_files, search_files) work only inside these folders:\n"
             + "\n".join("- " + r for r in roots)
+            + "\nTo find code use grep (regex, file:line results) and find_files (glob); read big files by parts with read_file offset/limit."
         )
         if runner.writable:
             msg = (
@@ -1317,14 +1482,29 @@ def tools_prompt(runner):
                 msg += "\nThe user approves each file change and can refuse; if refused, stop and tell them."
             parts.append(msg)
             parts.append(
-                "Always use absolute paths. Read a file before editing and copy the exact text you replace; never guess contents. "
-                "Prefer edit_file over write_file on an existing file. A .bak backup is kept when backups are on. "
-                "Use a file: block only for brand-new files handed over in the chat, never for a file you already changed with a tool."
+                "Always use absolute paths. Read a file before editing and copy the exact text you replace (without read_file's line numbers); "
+                "never guess contents. Prefer edit_file over write_file on an existing file (several changes to one file go in one edit_file "
+                "call with 'edits'). Every change can be undone by the user. Use a file: block only for brand-new files handed over in the "
+                "chat, never for a file you already changed with a tool."
             )
         else:
             parts.append("Editing files is OFF (read-only). Say editing must be enabled from the الأدوات والصلاحيات button if asked to change a file.")
     if runner.llm is not None and runner.roots:
-        parts.append("Very large files: use analyze_file(path, question) instead of reading them piece by piece.")
+        parts.append("Very large documents (PDF/Word/Excel/logs): use analyze_file(path, question) instead of reading them piece by piece.")
+    if runner.roots:
+        verify = ("run the project's own tests, linter, type-check or build (find them in package.json, pyproject.toml, Makefile, "
+                  "README...) with run_command and fix what fails" if runner.shell_mode != "off" else
+                  "commands are OFF here, so you cannot run tests: say what the user should run to check it")
+        parts.append(
+            "CODING WORK (when the task involves code):\n"
+            "1. Understand first: find_files, grep and read_file to learn the structure, the conventions and how the code is used. "
+            "Never invent file contents, functions or APIs.\n"
+            "2. Change: the smallest correct change with edit_file, in the style of the surrounding code; no unrelated reformatting, "
+            "no features nobody asked for.\n"
+            "3. Verify: " + verify + ".\n"
+            "4. Report briefly: which files changed, how you checked it, what is left. Do not paste back code you already wrote to files."
+            + ("\nFor work with several steps keep a short todo list with todo_write and update it as you go (one item in progress at a time)."
+               if getattr(runner, "todo", None) is not None else ""))
     if runner.writable:
         parts.append(
             "FOLDER NOTES: when you learn lasting useful facts about an allowed folder (what is in it, how it is organised, the user's "
@@ -1341,8 +1521,9 @@ def tools_prompt(runner):
             "SHELL: run_command runs ONE command through " + SHELL_NAME + " and returns its output. Use it for system tasks, scripts, "
             "git, installing tools, reading system info, etc. Put the real command in 'command' and a short plain explanation in "
             "'explanation'. Run one command, read the output, then continue. Avoid destructive commands unless the user clearly asked. "
-            "Commands must finish on their own (limit 180s) and must never wait for input. To start a server or any long-running program, "
-            + DETACH_HINT +
+            "Commands must finish on their own (limit 180s, timeout_seconds up to 1800 for a long build) and must never wait for input. "
+            "A server, watcher or anything that keeps running goes through start_background (check it with read_background, end it "
+            "with stop_background when you are done, unless the user wants it left running). "
             "Do not repeat a command that already timed out or failed the same way; change approach or report to the user."
         )
         if runner.shell_mode == "ask":
@@ -1618,11 +1799,113 @@ def _same_root(path, roots):
     return None
 
 
+def glob_to_regex(pat):
+    """A glob like **/*.py, src/*.ts or *.{js,ts} as a regex matched against a path relative to the search folder (always / separators)."""
+    pat = str(pat or "").replace("\\", "/").strip()
+    while pat.startswith("./"):
+        pat = pat[2:]
+    out, i = "", 0
+    while i < len(pat):
+        if pat.startswith("**/", i):
+            out += "(?:.*/)?"
+            i += 3
+            continue
+        if pat.startswith("**", i):
+            out += ".*"
+            i += 2
+            continue
+        c = pat[i]
+        if c == "*":
+            out += "[^/]*"
+        elif c == "?":
+            out += "[^/]"
+        elif c == "{" and pat.find("}", i) > i:
+            j = pat.find("}", i)
+            out += "(?:" + "|".join(re.escape(x) for x in pat[i + 1:j].split(",")) + ")"
+            i = j + 1
+            continue
+        else:
+            out += re.escape(c)
+        i += 1
+    return re.compile("^" + out + "$", re.I if IS_WIN else 0)
+
+
+def _is_text_file(path):
+    """Code and plain text (read by lines, with line numbers), as opposed to documents (PDF/Word/Excel) and binaries."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in DOC_EXTS or ext in BINARY_EXTS:
+        return False
+    try:
+        with open(path, "rb") as f:
+            return b"\x00" not in f.read(8192)
+    except OSError:
+        return False
+
+
+def _closest_hint(text, find):
+    """Why an exact text was not found, and where the closest line is, so the next try can copy it exactly."""
+    if re.sub(r"\s+", " ", find).strip() and re.sub(r"\s+", " ", find).strip() in re.sub(r"\s+", " ", text):
+        return " The text IS in the file but with different spaces, tabs or line breaks: copy it exactly from read_file (without the line numbers)."
+    first = next((ln.strip() for ln in find.splitlines() if ln.strip()), "")
+    if not first:
+        return ""
+    lines = text.splitlines()
+    stripped = [ln.strip() for ln in lines]
+    best = difflib.get_close_matches(first, stripped, n=1, cutoff=0.55)
+    if best:
+        i = stripped.index(best[0])
+        return " The closest line is line %d: %r. Read the lines around it and copy them exactly." % (i + 1, lines[i][:200])
+    return " Read the file again (it may have changed) and copy the exact text."
+
+
+def unified_diff_text(old, new, path):
+    """A short unified diff of a change (shown under the edit in the details; never sent to the model)."""
+    name = os.path.basename(path)
+    lines = list(difflib.unified_diff(old.splitlines(), new.splitlines(), "a/" + name, "b/" + name, n=2, lineterm=""))
+    if len(lines) > DIFF_MAX_LINES:
+        lines = lines[:DIFF_MAX_LINES] + ["... (%d more diff lines)" % (len(lines) - DIFF_MAX_LINES)]
+    return "\n".join(lines)
+
+
+def diff_counts(old, new):
+    plus = minus = 0
+    for ln in difflib.unified_diff(old.splitlines(), new.splitlines(), n=0, lineterm=""):
+        if ln.startswith("+") and not ln.startswith("+++"):
+            plus += 1
+        elif ln.startswith("-") and not ln.startswith("---"):
+            minus += 1
+    return plus, minus
+
+
+_GIT_ROOT_CACHE = {}
+
+
+def git_root_of(path):
+    """The folder of the git repository that holds path, or None (cached: called on every edit)."""
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    key = _norm(d)
+    if key in _GIT_ROOT_CACHE:
+        return _GIT_ROOT_CACHE[key]
+    cur, found = os.path.abspath(d), None
+    for _ in range(40):
+        if os.path.exists(os.path.join(cur, ".git")):
+            found = cur
+            break
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    _GIT_ROOT_CACHE[key] = found
+    return found
+
+
 def _read_text_enc(path):
     """Read a text file and keep the encoding so we can write it back the same way."""
     with open(path, "rb") as f:
         data = f.read()
-    for enc in ("utf-8-sig", "utf-8", "cp1256"):
+    if data.startswith(b"\xef\xbb\xbf"):  # keep a BOM only when the file already had one (utf-8-sig would ADD one to every file)
+        return data[3:].decode("utf-8", errors="replace"), "utf-8-sig"
+    for enc in ("utf-8", "cp1256"):
         try:
             return data.decode(enc), enc
         except Exception:
@@ -1925,7 +2208,7 @@ PLAN_TOOLS = [
         },
     }
 ]
-MUTATING_TOOLS = {"write_file", "edit_file", "make_dir", "move_path", "delete_path", "run_command", "open_program", "run_python", "pip_install"}
+MUTATING_TOOLS = {"write_file", "edit_file", "make_dir", "move_path", "delete_path", "run_command", "open_program", "run_python", "pip_install", "start_background"}
 UNDO_MAX_FILE = 20 * 1024 * 1024
 UNDO_MAX_DIR = 50 * 1024 * 1024
 
@@ -1994,6 +2277,69 @@ def read_activity(limit=1500):
     except Exception:
         pass
     return out
+
+
+RULE_FILES = ("AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules", ".windsurfrules", os.path.join(".github", "copilot-instructions.md"))
+RULES_MAX = 8000
+RULES_TOTAL = 16000
+
+
+def project_rules_prompt(roots):
+    """The rule files a project keeps for AI assistants (AGENTS.md, CLAUDE.md, .cursorrules...) in the allowed folders."""
+    out, total, seen = [], 0, set()
+    for r in roots[:6]:
+        for name in RULE_FILES:
+            p = os.path.join(r, name)
+            try:
+                if not os.path.isfile(p) or _norm(p) in seen or is_blocked(p):
+                    continue
+                seen.add(_norm(p))
+                with open(p, "r", encoding="utf-8", errors="replace") as f:
+                    t = f.read().strip()[:RULES_MAX]
+            except OSError:
+                continue
+            if not t or total >= RULES_TOTAL:
+                continue
+            t = t[:RULES_TOTAL - total]
+            total += len(t)
+            out.append("PROJECT RULES from %s (the user's own instructions for AI assistants in this project: follow them unless the user "
+                       "says otherwise in the chat; the safety rules above still apply):\n%s" % (p, t))
+    return "\n\n".join(out)
+
+
+def git_context_prompt(roots):
+    """Branch, changed files and recent commits of every allowed folder that is a git repository (short timeouts; run off the UI thread)."""
+    git = shutil.which("git")
+    if not git:
+        return ""
+    out, done = [], set()
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    for r in roots[:4]:
+        g = git_root_of(r)
+        if not g or _norm(g) in done:
+            continue
+        done.add(_norm(g))
+        try:
+            st = subprocess.run([git, "-C", g, "status", "--porcelain=v1", "-b"], capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=4, creationflags=flags)
+            if st.returncode != 0:
+                continue
+            lines = st.stdout.splitlines()
+            lg = subprocess.run([git, "-C", g, "log", "-3", "--format=%h %s"], capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=4, creationflags=flags)
+        except Exception:
+            continue
+        branch = lines[0][3:] if lines and lines[0].startswith("## ") else "?"
+        changed = [ln[3:] for ln in lines[1:] if ln.strip()]
+        txt = "GIT: %s is a git repository, branch %s; %s." % (
+            g, branch, ("%d changed/untracked file(s): %s%s" % (len(changed), ", ".join(changed[:15]), " …" if len(changed) > 15 else "")) if changed else "working tree clean")
+        recent = [x for x in lg.stdout.strip().splitlines() if x.strip()] if lg.returncode == 0 else []
+        if recent:
+            txt += " Recent commits: " + " | ".join(recent)
+        out.append(txt)
+    if out:
+        out.append("Review your own changes with git diff (run_command) before you finish. Never commit, push, reset, stash or switch branches unless the user asks.")
+    return "\n".join(out)
 
 
 def folder_notes_prompt(roots):
@@ -2075,6 +2421,8 @@ class ToolRunner:
         self.allow_computer = bool(allow_computer)
         self.browser = browser  # callable(action, **kwargs) -> str, or None
         self.followup = None  # callable(minutes, note) -> str, set by the app: lets the model wake itself up later
+        self.todo = None  # callable(list of {content, status}) -> None, set by the app: shows the model's todo list live
+        self.last_diff = ""  # unified diff of the last file change (for the details view)
         self.backup = bool(backup)
         self.cache = {}
         self.changes = []
@@ -2116,7 +2464,7 @@ class ToolRunner:
             if self.allow_delete:
                 out += DELETE_TOOLS
         if self.shell_mode != "off":
-            out += SHELL_TOOLS
+            out += SHELL_TOOLS + BG_TOOLS
         if self.work_dir:
             out += PYTHON_TOOLS
         if self.allow_computer:
@@ -2125,6 +2473,8 @@ class ToolRunner:
             out += BROWSER_TOOLS
         if self.followup is not None:
             out += FOLLOWUP_TOOLS
+        if self.todo is not None:
+            out += TODO_TOOLS
         return out
 
     def resolve(self, path, write=False):
@@ -2189,6 +2539,8 @@ class ToolRunner:
     def backup_file(self, path):
         if not self.backup or not os.path.isfile(path):
             return ""
+        if git_root_of(path):
+            return ""  # inside a git repository: git and the undo journal keep the old version; no .bak files in the project
         try:
             if os.path.getsize(path) > BACKUP_MAX_BYTES:
                 return ""
@@ -2218,7 +2570,14 @@ class ToolRunner:
         if name == "list_folder":
             return "عرض محتويات: %s" % a.get("path", "")
         if name == "read_file":
-            return "قراءة: %s" % a.get("path", "")
+            rng = ""
+            if a.get("offset") or a.get("limit"):
+                rng = " (من السطر %s)" % (a.get("offset") or 1)
+            return "قراءة: %s%s" % (a.get("path", ""), rng)
+        if name == "grep":
+            return "بحث في الكود: %s%s" % (a.get("pattern", ""), ("  في " + a["glob"]) if a.get("glob") else "")
+        if name == "find_files":
+            return "دوّر ملفات: %s" % a.get("pattern", "")
         if name == "search_files":
             what = " / ".join(x for x in (a.get("name_contains"), a.get("text_contains")) if x)
             return "بحث في: %s %s" % (a.get("folder", ""), ("(" + what + ")") if what else "")
@@ -2260,7 +2619,33 @@ class ToolRunner:
             return "عرض خطة للموافقة (%d خطوات)" % len(a.get("steps") or [])
         if name == "schedule_followup":
             return "جدولة متابعة بعد %s دقيقة: %s" % (a.get("minutes", "?"), _cut(a.get("note", ""), 80))
+        if name == "start_background":
+            return "تشغيل بالخلفية: %s" % _cut(a.get("explanation") or a.get("command", ""), 120)
+        if name == "read_background":
+            return "متابعة أمر بالخلفية %s" % a.get("id", "")
+        if name == "stop_background":
+            return "إيقاف أمر بالخلفية %s" % a.get("id", "")
+        if name == "todo_write":
+            its = a.get("todos") if isinstance(a.get("todos"), list) else []
+            done = sum(1 for x in its if isinstance(x, dict) and x.get("status") == "completed")
+            cur = next((x.get("content", "") for x in its if isinstance(x, dict) and x.get("status") == "in_progress"), "")
+            return "قائمة المهام: %d من %d خلصت%s" % (done, len(its), ("، الحين: " + _cut(cur, 60)) if cur else "")
         return name
+
+    def todo_write(self, a):
+        items = a.get("todos")
+        if not isinstance(items, list):
+            raise ToolError("todos must be a list of {content, status}")
+        clean = []
+        for it in items[:40]:
+            if not isinstance(it, dict) or not str(it.get("content") or "").strip():
+                continue
+            st = it.get("status") if it.get("status") in ("pending", "in_progress", "completed") else "pending"
+            clean.append({"content": str(it["content"]).strip()[:200], "status": st})
+        self.todo(clean)
+        done = sum(1 for x in clean if x["status"] == "completed")
+        cur = next((x["content"] for x in clean if x["status"] == "in_progress"), "")
+        return "OK: todo list updated (%d of %d done%s)." % (done, len(clean), ("; now: " + cur) if cur else "")
 
     def schedule_followup(self, a):
         try:
@@ -2288,6 +2673,8 @@ class ToolRunner:
             "list_folder": self.list_folder,
             "read_file": self.read_file,
             "search_files": self.search_files,
+            "grep": self.grep,
+            "find_files": self.find_files,
         }
         if self.plan_first:
             mapping["submit_plan"] = self.submit_plan
@@ -2301,6 +2688,7 @@ class ToolRunner:
             mapping.update({"move_path": self.move_path, "delete_path": self.delete_path})
         if self.shell_mode != "off":
             mapping["run_command"] = self.run_command
+            mapping.update({"start_background": self.start_background, "read_background": self.read_background, "stop_background": self.stop_background})
         if self.work_dir:
             mapping["run_python"] = self.run_python
             mapping["pip_install"] = self.pip_install
@@ -2309,6 +2697,8 @@ class ToolRunner:
             mapping["open_in_chrome"] = self.open_in_chrome
         if self.followup is not None:
             mapping["schedule_followup"] = self.schedule_followup
+        if self.todo is not None:
+            mapping["todo_write"] = self.todo_write
         if self.browser is not None:
             mapping.update({
                 "browser_open": self.browser_open,
@@ -2360,11 +2750,13 @@ class ToolRunner:
     def read_file(self, a):
         p = self.resolve(a.get("path"))
         if not os.path.isfile(p):
-            raise ToolError("not a file")
+            raise ToolError("not a file" + (" (it is a folder: use list_folder)" if os.path.isdir(p) else ""))
         if os.path.splitext(p)[1].lower() in IMAGE_MIME:
             raise ToolError("this is an image; ask the user to attach it in the chat so you can see it")
         if os.path.getsize(p) > 100 * 1024 * 1024:
             raise ToolError("the file is larger than 100 MB")
+        if _is_text_file(p):
+            return self._read_lines(p, a)
         key = (p, os.path.getmtime(p))
         if key not in self.cache:
             if len(self.cache) >= 4:
@@ -2381,6 +2773,177 @@ class ToolRunner:
         if end < len(text):
             head += "\nMore content remains: call read_file again with start=%d" % end
         return head + "\n---\n" + chunk
+
+    def _read_lines(self, p, a):
+        """A code/text file by lines, numbered like cat -n, so edits and references can point at exact lines."""
+        key = ("lines", p, os.path.getmtime(p))
+        if key not in self.cache:
+            if len(self.cache) >= 6:
+                self.cache.clear()
+            text, _enc = _read_text_enc(p)
+            self.cache[key] = text.splitlines()
+        lines = self.cache[key]
+        n = len(lines)
+
+        def as_int(v, d):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return d
+
+        off = max(1, as_int(a.get("offset"), 1))
+        if a.get("start") and not a.get("offset"):  # an old-style character offset: continue from the line that holds it
+            pos, done = as_int(a.get("start"), 0), 0
+            for i_, ln in enumerate(lines):
+                done += len(ln) + 1
+                if done > pos:
+                    off = i_ + 1
+                    break
+        lim = max(1, min(READ_MAX_LINES, as_int(a.get("limit"), READ_MAX_LINES)))
+        if n == 0:
+            return "File: %s is empty (0 lines)." % p
+        if off > n:
+            return "File: %s has only %d lines; offset %d is past the end." % (p, n, off)
+        out, size, i = [], 0, off - 1
+        while i < n and i < off - 1 + lim:
+            ln = lines[i]
+            if len(ln) > READ_LINE_CAP:
+                ln = ln[:READ_LINE_CAP] + "  …[line cut, %d chars]" % len(lines[i])
+            row = "%6d\t%s" % (i + 1, ln)
+            if out and size + len(row) > TOOL_READ_CHUNK:
+                break
+            out.append(row)
+            size += len(row) + 1
+            i += 1
+        head = "File: %s (%d lines). Showing lines %d-%d." % (p, n, off, i)
+        if i < n:
+            head += " More below: call read_file with offset=%d." % (i + 1)
+        return head + "\n" + "\n".join(out)
+
+    def _walk_files(self, root, include_all=False):
+        """Files under root for code searches, skipping dependencies/build/hidden folders (and protected paths) unless include_all."""
+        for dirpath, dirnames, filenames in os.walk(root):
+            keep = []
+            for d in dirnames:
+                low = d.lower()
+                if low in (".git", "$recycle.bin", "system volume information"):
+                    continue
+                if not include_all and (low in CODE_SKIP_DIRS or (d.startswith(".") and low not in CODE_DOT_DIRS)):
+                    continue
+                if is_blocked(os.path.join(dirpath, d)):
+                    continue
+                keep.append(d)
+            dirnames[:] = sorted(keep)
+            for fn in sorted(filenames):
+                yield os.path.join(dirpath, fn)
+
+    def grep(self, a):
+        pat = a.get("pattern")
+        if not isinstance(pat, str) or not pat:
+            raise ToolError("pattern is missing")
+        try:
+            rx = re.compile(pat, re.I if a.get("ignore_case") else 0)
+        except re.error as e:
+            raise ToolError("bad regular expression (%s). Escape characters like ( ) [ ] . * + ? when you mean them literally." % e)
+        root = self.resolve(a.get("path") or self.roots[0])
+        fglob = str(a.get("glob") or "").strip()
+        frx = glob_to_regex(fglob) if fglob else None
+        try:
+            ctx = max(0, min(5, int(a.get("context") or 0)))
+        except (TypeError, ValueError):
+            ctx = 0
+        try:
+            cap = max(1, min(GREP_MAX_RESULTS, int(a.get("max_results") or 100)))
+        except (TypeError, ValueError):
+            cap = 100
+        mode = a.get("output") if a.get("output") in ("files", "count") else "lines"
+        files = [root] if os.path.isfile(root) else self._walk_files(root, bool(a.get("include_hidden")))
+        base = os.path.dirname(root) if os.path.isfile(root) else root
+        out, hits, scanned, nfiles, stopped = [], 0, 0, 0, ""
+        deadline = time.time() + SEARCH_MAX_SECONDS
+        for fp in files:
+            if self.stop_event is not None and self.stop_event.is_set():
+                stopped = "stopped by the user"
+                break
+            scanned += 1
+            if scanned > SEARCH_MAX_FILES or time.time() > deadline:
+                stopped = "search stopped early (too many files or too slow); narrow it with path or glob"
+                break
+            if frx is not None:
+                rel = os.path.relpath(fp, base).replace("\\", "/")
+                if not (frx.match(rel) or ("/" not in fglob and frx.match(os.path.basename(fp)))):
+                    continue
+            try:
+                if os.path.getsize(fp) > GREP_MAX_BYTES or is_blocked(fp):
+                    continue
+                with open(fp, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            if b"\x00" in data[:8192]:
+                continue
+            lines = decode_text(data).splitlines()
+            found = [i for i, ln in enumerate(lines) if rx.search(ln)]
+            if not found:
+                continue
+            nfiles += 1
+            if mode == "files":
+                out.append(fp)
+                hits += 1
+            elif mode == "count":
+                out.append("%s: %d" % (fp, len(found)))
+                hits += 1
+            else:
+                shown_upto = -1
+                for i in found:
+                    if hits >= cap:
+                        break
+                    lo, hi = max(0, i - ctx), min(len(lines) - 1, i + ctx)
+                    if ctx and shown_upto >= 0 and lo > shown_upto + 1:
+                        out.append("--")
+                    for j in range(max(lo, shown_upto + 1), hi + 1):
+                        t = lines[j] if len(lines[j]) <= 300 else lines[j][:300] + "…"
+                        out.append("%s%s%d%s %s" % (fp, ":" if j == i else "-", j + 1, ":" if j == i else "-", t))
+                    shown_upto = hi
+                    hits += 1
+            if hits >= cap:
+                stopped = "showing the first %d results; narrow the search for more" % cap
+                break
+        head = "grep %r in %s: %d match%s in %d file(s), %d file(s) checked" % (pat, root, hits, "" if hits == 1 else "es", nfiles, scanned)
+        if stopped:
+            head += " - " + stopped
+        return head + ("\n" + "\n".join(out) if out else "\n(no matches)")
+
+    def find_files(self, a):
+        pattern = str(a.get("pattern") or "").strip()
+        if not pattern:
+            raise ToolError("pattern is missing (for example **/*.py)")
+        root = self.resolve(a.get("path") or self.roots[0])
+        if not os.path.isdir(root):
+            raise ToolError("not a folder")
+        rx = glob_to_regex(pattern)
+        hits, scanned, stopped = [], 0, ""
+        deadline = time.time() + SEARCH_MAX_SECONDS
+        for fp in self._walk_files(root, bool(a.get("include_hidden"))):
+            scanned += 1
+            if scanned > SEARCH_MAX_FILES * 2 or time.time() > deadline:
+                stopped = "stopped early (too many files); narrow the folder or pattern"
+                break
+            rel = os.path.relpath(fp, root).replace("\\", "/")
+            if rx.match(rel) or ("/" not in pattern and rx.match(os.path.basename(fp))):
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                hits.append((st.st_mtime, fp, st.st_size))
+        hits.sort(reverse=True)
+        lines = ["%s\t%d bytes\t%s" % (fp, size, time.strftime("%Y-%m-%d %H:%M", time.localtime(mt))) for mt, fp, size in hits[:300]]
+        head = "find %r in %s: %d file(s)%s" % (pattern, root, len(hits), ", newest first" if hits else "")
+        if len(hits) > 300:
+            head += ", showing 300"
+        if stopped:
+            head += " - " + stopped
+        return head + ("\n" + "\n".join(lines) if lines else "\n(nothing found)")
 
     def search_files(self, a):
         root = self.resolve(a.get("folder"))
@@ -2552,15 +3115,30 @@ class ToolRunner:
         else:
             detail = "إنشاء ملف جديد:\n\n%s" % _cut(content, 1200)
         self._guard("كتابة ملف: %s" % path, detail)
+        old_text, enc = "", "utf-8"
+        if exists:
+            try:
+                old_text, enc = _read_text_enc(path)
+            except Exception:
+                old_text, enc = "", "utf-8"
+            if enc == "cp1256":
+                enc = "utf-8"  # new text may hold characters cp1256 cannot store
+            if "\r\n" in old_text and "\r\n" not in content:
+                content = content.replace("\n", "\r\n")  # keep the file's Windows line endings (no whole-file diff noise)
         bak = ""
         if exists and mode != "append":
             bak = self.backup_file(path)
         snap = self._snap(path) if exists else ""
         try:
-            with open(path, "a" if mode == "append" else "w", encoding="utf-8", newline="") as f:
+            with open(path, "a" if mode == "append" else "w", encoding=enc, newline="") as f:
                 f.write(content)
         except OSError as e:
             raise ToolError("could not write the file: %s" % e)
+        try:
+            new_text = (old_text + content) if mode == "append" else content
+            self.last_diff = unified_diff_text(old_text, new_text, path)
+        except Exception:
+            self.last_diff = ""
         self._j("restore" if snap else ("noundo" if exists else "remove"), path=path, snap=snap)
         self._note_change(path)
         what = "appended to" if mode == "append" else ("updated" if exists else "created")
@@ -2571,46 +3149,62 @@ class ToolRunner:
     def edit_file(self, a):
         path = self.resolve(a.get("path"), write=True)
         if not os.path.isfile(path):
-            raise ToolError("not a file")
+            raise ToolError("not a file (use write_file with mode=create for a new file)")
         ext = os.path.splitext(path)[1].lower()
-        if ext in BINARY_EXTS:
+        if ext in BINARY_EXTS or ext in DOC_EXTS:
             raise ToolError("I can only edit text files, not %s files" % ext)
-        find = a.get("find")
-        repl = a.get("replace")
-        if not isinstance(find, str) or not find:
-            raise ToolError("find must be a non-empty string")
-        if not isinstance(repl, str):
-            raise ToolError("replace must be a string")
+        edits = a.get("edits")
+        if edits:
+            if not isinstance(edits, list):
+                raise ToolError("edits must be a list of {find, replace}")
+            pairs = []
+            for k, e in enumerate(edits, 1):
+                if not isinstance(e, dict):
+                    raise ToolError("edit %d is not an object {find, replace}" % k)
+                pairs.append((e.get("find"), e.get("replace"), bool(e.get("all"))))
+        else:
+            pairs = [(a.get("find"), a.get("replace"), bool(a.get("all")))]
+        for k, (f, r, _al) in enumerate(pairs, 1):
+            tag = ("edit %d: " % k) if len(pairs) > 1 else ""
+            if not isinstance(f, str) or not f:
+                raise ToolError(tag + "find must be a non-empty string")
+            if not isinstance(r, str):
+                raise ToolError(tag + "replace must be a string")
         try:
             text, enc = _read_text_enc(path)
         except Exception as e:
             raise ToolError("could not read the file: %s" % e)
-        n = text.count(find)
-        if n == 0:
-            raise ToolError(
-                "that text was not found in %s. Read the file first (read_file) and copy the exact text including spaces."
-                % os.path.basename(path)
-            )
-        do_all = bool(a.get("all"))
-        if n > 1 and not do_all:
-            raise ToolError("that text appears %d times; include more surrounding text or pass all=true" % n)
-        new_text = text.replace(find, repl) if do_all else text.replace(find, repl, 1)
-        detail = "النص الحالي:\n%s\n\nالنص الجديد:\n%s" % (_cut(find, 700), _cut(repl, 700) or "(حذف)")
-        if do_all and n > 1:
-            detail += "\n\n(سيُطبَّق على %d موضع)" % n
-        self._guard("تعديل ملف: %s" % path, detail)
+        crlf = "\r\n" in text
+        new_text, total, details = text, 0, []
+        for k, (f, r, al) in enumerate(pairs, 1):
+            tag = ("edit %d: " % k) if len(pairs) > 1 else ""
+            if crlf and "\n" in f and "\r\n" not in f:  # the file uses Windows line endings: match and write them the same way
+                f2, r2 = f.replace("\n", "\r\n"), r.replace("\r\n", "\n").replace("\n", "\r\n")
+                if new_text.count(f2):
+                    f, r = f2, r2
+            n = new_text.count(f)
+            if n == 0:
+                raise ToolError(tag + "that text was not found in %s.%s" % (os.path.basename(path), _closest_hint(new_text, f)))
+            if n > 1 and not al:
+                raise ToolError(tag + "that text appears %d times in %s; include more surrounding lines so it is unique, or pass all=true" % (n, os.path.basename(path)))
+            new_text = new_text.replace(f, r) if al else new_text.replace(f, r, 1)
+            total += n if al else 1
+            details.append("النص الحالي:\n%s\n\nالنص الجديد:\n%s" % (_cut(f, 600), _cut(r, 600) or "(حذف)"))
+        if new_text == text:
+            raise ToolError("nothing would change: replace is the same as find")
+        self._guard("تعديل ملف: %s" % path, "\n\n— — —\n\n".join(details)[:4000])
         bak = self.backup_file(path)
         snap = self._snap(path)
         try:
-            with open(path, "w", encoding=enc, newline="") as f:
-                f.write(new_text)
+            with open(path, "w", encoding=enc, newline="") as fh:
+                fh.write(new_text)
         except OSError as e:
             raise ToolError("could not save the file: %s" % e)
         self._j("restore" if snap else "noundo", path=path, snap=snap)
         self._note_change(path)
-        return "OK: replaced %d occurrence(s) in %s%s" % (
-            n if do_all else 1, path, " | backup: " + bak if bak else ""
-        )
+        self.last_diff = unified_diff_text(text, new_text, path)
+        plus, minus = diff_counts(text, new_text)
+        return "OK: %d change(s) in %s (+%d -%d lines)%s" % (total, path, plus, minus, " | backup: " + bak if bak else "")
 
     def make_dir(self, a):
         path = self.resolve(a.get("path"), write=True)
@@ -2744,6 +3338,113 @@ class ToolRunner:
             except OSError:
                 pass
 
+    # ----- background commands (servers, watchers, long builds)
+    def start_background(self, a):
+        cmd = a.get("command")
+        if not isinstance(cmd, str) or not cmd.strip():
+            raise ToolError("command is missing")
+        explanation = str(a.get("explanation") or "").strip()
+        cwd = a.get("cwd")
+        if cwd:
+            try:
+                cwd = self.resolve(cwd)
+            except Exception:
+                cwd = None
+        if not cwd or not os.path.isdir(cwd):
+            cwd = self.roots[0] if self.roots else os.path.expanduser("~")
+        danger = shell_danger(cmd)
+        if danger:
+            raise ToolError("PROTECTED: refused, %s. Never touch operating-system files, drives, the registry or services, even if the user asks. Tell the user you refused." % danger)
+        with _BG_LOCK:
+            alive = [k for k, v in BG_PROCS.items() if v["proc"].poll() is None]
+        if len(alive) >= BG_MAX:
+            raise ToolError("%d background commands are already running (%s); stop one with stop_background first" % (len(alive), ", ".join(alive)))
+        self._guard_shell("تشغيل أمر بالخلفية (يظل شغّال)", "الأمر:\n%s" % _cut(cmd, 6000) + (("\n\nالشرح:\n%s" % explanation) if explanation else ""))
+        d = os.path.join(DATA_DIR, "bgprocs")
+        os.makedirs(d, exist_ok=True)
+        bid = "bg" + uuid.uuid4().hex[:6]
+        log = os.path.join(d, bid + ".log")
+        script = os.path.join(d, bid + (".ps1" if os.name == "nt" else ".sh"))
+        with open(script, "w", encoding=("utf-8-sig" if os.name == "nt" else "utf-8"), newline="\n") as f:
+            if os.name == "nt":
+                f.write("$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n")
+            f.write(cmd + "\n")
+        argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script] if os.name == "nt" else ["/bin/bash", "-l", script]
+        flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) if os.name == "nt" else 0
+        try:
+            with open(log, "wb") as lf:
+                proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT, creationflags=flags,
+                                        start_new_session=(os.name != "nt"))
+        except Exception as e:
+            raise ToolError("could not start it: %s" % e)
+        with _BG_LOCK:
+            BG_PROCS[bid] = {"proc": proc, "cmd": cmd, "cwd": cwd, "log": log, "script": script, "t0": time.time()}
+        end = time.time() + 4  # catch an immediate failure (wrong command, port in use...) right away
+        while time.time() < end and proc.poll() is None:
+            if self.stop_event is not None and self.stop_event.is_set():
+                break
+            time.sleep(0.2)
+        st = ("exited at once with code %s" % proc.returncode) if proc.poll() is not None else "running"
+        return "Started in the background: id=%s (%s) in %s\nFirst output:\n---\n%s" % (bid, st, cwd, self._bg_tail(log, 40))
+
+    @staticmethod
+    def _bg_tail(log, n):
+        try:
+            with open(log, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 200000))
+                data = f.read()
+        except OSError:
+            return "(no output)"
+        lines = data.decode("utf-8", errors="replace").splitlines()[-n:]
+        text = "\n".join(lines).strip()
+        return (text[-20000:] if text else "(no output yet)")
+
+    def read_background(self, a):
+        bid = str(a.get("id") or "").strip()
+        with _BG_LOCK:
+            items = dict(BG_PROCS)
+        if not bid:
+            if not items:
+                return "No background commands."
+            rows = []
+            for k, v in items.items():
+                rc = v["proc"].poll()
+                rows.append("%s\t%s\t%ds\t%s" % (k, "running" if rc is None else "exited %s" % rc, int(time.time() - v["t0"]), _cut(v["cmd"], 120)))
+            return "Background commands:\n" + "\n".join(rows)
+        v = items.get(bid)
+        if v is None:
+            raise ToolError("no background command with id %s (call read_background without id to list them)" % bid)
+        try:
+            n = max(1, min(400, int(a.get("lines") or 60)))
+        except (TypeError, ValueError):
+            n = 60
+        rc = v["proc"].poll()
+        return "%s: %s for %ds — %s\n---\n%s" % (bid, "running" if rc is None else "exited with code %s" % rc, int(time.time() - v["t0"]),
+                                                 _cut(v["cmd"], 200), self._bg_tail(v["log"], n))
+
+    def stop_background(self, a):
+        bid = str(a.get("id") or "").strip()
+        with _BG_LOCK:
+            v = BG_PROCS.get(bid)
+        if v is None:
+            raise ToolError("no background command with id %s" % bid)
+        if v["proc"].poll() is None:
+            self._kill_tree(v["proc"])
+            try:
+                v["proc"].wait(timeout=5)
+            except Exception:
+                pass
+        tail = self._bg_tail(v["log"], 15)
+        try:
+            os.remove(v["script"])
+        except OSError:
+            pass
+        with _BG_LOCK:
+            BG_PROCS.pop(bid, None)
+        return "Stopped %s. Last output:\n---\n%s" % (bid, tail)
+
     # ----- python (code interpreter)
     @staticmethod
     def python_exe():
@@ -2862,7 +3563,7 @@ class ToolRunner:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         try:
             proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=subprocess.STDOUT,
-                                    creationflags=flags, env=env)
+                                    creationflags=flags, env=env, start_new_session=(os.name != "nt"))
         except Exception as e:
             out_f.close()
             raise ToolError("could not run the command: %s" % e)
@@ -2893,8 +3594,8 @@ class ToolRunner:
             text = text[:TOOL_MAX_OUTPUT] + "\n[output truncated]"
         if why:
             return ("Command %s and was killed. Do NOT retry the same blocking command. If it is a server or long-running "
-                    "program, start it detached (%s) and check it with a separate short command.\n"
-                    "Output so far:\n---\n%s" % (why, DETACH_SHORT, text))
+                    "program, run it with start_background and check it with read_background.\n"
+                    "Output so far:\n---\n%s" % (why, text))
         return "exit code %s\n---\n%s" % (proc.returncode, text)
 
     @staticmethod
@@ -2905,6 +3606,14 @@ class ToolRunner:
                                stderr=subprocess.DEVNULL, timeout=15,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             else:
+                import signal
+                try:  # the command runs in its own session: kill the whole group, not only the shell (its children would live on)
+                    pg = os.getpgid(proc.pid)
+                    if pg != os.getpgid(0):
+                        os.killpg(pg, signal.SIGKILL)
+                        return
+                except Exception:
+                    pass
                 proc.kill()
         except Exception:
             try:
@@ -3086,6 +3795,8 @@ TOOL_GROUPS = {
     "list_folder": ("read", "قراءة واستعراض الملفات"),
     "read_file": ("read", "قراءة واستعراض الملفات"),
     "search_files": ("read", "قراءة واستعراض الملفات"),
+    "grep": ("read", "قراءة واستعراض الملفات"),
+    "find_files": ("read", "قراءة واستعراض الملفات"),
     "write_file": ("write", "إنشاء وتعديل الملفات"),
     "edit_file": ("write", "إنشاء وتعديل الملفات"),
     "make_dir": ("write", "إنشاء وتعديل الملفات"),
@@ -3105,6 +3816,10 @@ TOOL_GROUPS = {
     "analyze_file": ("read", "قراءة واستعراض الملفات"),
     "save_notes": ("write", "إنشاء وتعديل الملفات"),
     "schedule_followup": ("followup", "متابعة مجدولة"),
+    "todo_write": ("plan", "الخطة"),
+    "start_background": ("shell", "تشغيل أوامر على الجهاز"),
+    "read_background": ("shell", "تشغيل أوامر على الجهاز"),
+    "stop_background": ("shell", "تشغيل أوامر على الجهاز"),
 }
 
 
@@ -3146,11 +3861,11 @@ def _clean_title(text, limit=58):
 
 
 _SUMMARY_KEYS = {
-    "read_file": "read", "analyze_file": "analyze", "list_folder": "list", "search_files": "search",
+    "read_file": "read", "analyze_file": "analyze", "list_folder": "list", "search_files": "search", "grep": "search", "find_files": "search",
     "write_file": "write", "edit_file": "write", "save_notes": "write", "make_dir": "mkdir",
     "move_path": "delete", "delete_path": "delete", "run_command": "cmd", "run_python": "py", "pip_install": "pip",
     "browser_open": "browse", "browser_read": "browse_x", "browser_click": "browse_x", "browser_type": "browse_x", "browser_back": "browse_x",
-    "open_program": "open", "open_in_chrome": "open", "submit_plan": "plan", "schedule_followup": "followup",
+    "open_program": "open", "open_in_chrome": "open", "submit_plan": "plan", "schedule_followup": "followup", "todo_write": "plan", "start_background": "cmd", "read_background": "cmd", "stop_background": "cmd",
 }
 _SUMMARY_TEXT = {
     "read": ("قرأ ملف", "قرأ %d ملفات"), "analyze": ("حلّل ملف", "حلّل %d ملفات"),
@@ -3317,7 +4032,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.31.2"
+APP_VERSION = "2.32.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -3325,7 +4040,7 @@ UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
 
 # ---------- mixed Arabic / English text ----------
 _AR_ANY = re.compile(r"[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]")
-_LAT_TOK = r"[A-Za-z0-9][A-Za-z0-9_\-\.\\/:@#%+=~&?*()'\",]*"
+_LAT_TOK = r"(?:[A-Za-z0-9]|[\-\.\\/~$\"'(\[{<|][A-Za-z0-9\-\.\\/~$])[A-Za-z0-9_\-\.\\/:@#%+=~&?*()'\",$;|<>{}\[\]!]*"  # also command flags (-q), paths (./x, ~/x) and $VARS
 _LAT_RUN = re.compile(_LAT_TOK + "(?: " + _LAT_TOK + ")*")
 _LAT_TRAIL = " .,;:!?)'\"،؛؟"
 _LRI, _PDI = "⁦", "⁩"
@@ -8926,6 +9641,9 @@ def make_qss(c):
     QToolButton#iconbtn:checked { background: %(bubble)s; border-color: %(accent)s; }
     QFrame#vsep { color: %(border)s; }
     QLineEdit#roomtitle { border: 2px solid %(accent)s; border-radius: 10px; padding: 6px 12px; font-size: 16px; font-weight: bold; background: %(input)s; }
+    QFrame#todobar { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 12px; }
+    QFrame#todobar QLabel { background: transparent; }
+    QLabel#todohead { font-weight: bold; }
     QFrame#roombar { background: %(bubble)s; border: none; border-bottom: 1px solid %(border)s; }
     QFrame#roombar QLabel { background: transparent; }
     QToolButton#quotechip { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 9px; padding: 3px 9px; color: %(text)s; }
@@ -9521,7 +10239,8 @@ class App(QMainWindow):
         nbl.addWidget(self.update_btn)
         groups = (
             ("الأدوات",
-             (("لوحة", "مساحة جانبية للكود والصفحات والمستندات مع معاينة مباشرة وتعديل بالطلب", self.open_canvas),
+             (("برمجة", "افتح مجلد مشروع: خبيلان يقرأ الكود ويعدّله ويشغّل الاختبارات فيه (الأوامر تحتاج موافقتك، وكل تعديل ينقدر يتراجع عنه)", self.new_coding_chat),
+              ("لوحة", "مساحة جانبية للكود والصفحات والمستندات مع معاينة مباشرة وتعديل بالطلب", self.open_canvas),
               ("مهام", "مهام تشتغل لوحدها بجدول أو عند ظهور ملف جديد", self.open_tasks),
               ("مهمة سريعة", "اكتب طلب واحد وشغّله الحين بالخلفية داخل هذي المحادثة وتكمل شغلك (بدون حفظ أو جدول)", self.new_bg_task),
               ("سجل", "كل اللي سواه خبيلان على جهازك", self.open_activity),
@@ -9663,6 +10382,28 @@ class App(QMainWindow):
         self.files_layout.setContentsMargins(24, 4, 24, 4)
         self.files_bar.setVisible(False)
         ml.addWidget(self.files_bar)
+        self.todo_bar = QFrame()  # the model's todo list for the chat on screen (todo_write)
+        self.todo_bar.setObjectName("todobar")
+        tbl = QVBoxLayout(self.todo_bar)
+        tbl.setContentsMargins(14, 8, 14, 8)
+        tbl.setSpacing(4)
+        trow = QHBoxLayout()
+        self.todo_head = QLabel()
+        self.todo_head.setObjectName("todohead")
+        trow.addWidget(self.todo_head, 1)
+        self.todo_toggle = QPushButton("عرض الكل")
+        self.todo_toggle.setObjectName("flat")
+        self.todo_toggle.setCursor(Qt.PointingHandCursor)
+        self.todo_toggle.clicked.connect(self._toggle_todo)
+        trow.addWidget(self.todo_toggle)
+        tbl.addLayout(trow)
+        self.todo_body = QLabel()
+        self.todo_body.setTextFormat(Qt.RichText)
+        self.todo_body.setWordWrap(True)
+        tbl.addWidget(self.todo_body)
+        self.todo_bar.setVisible(False)
+        self._todo_open = False
+        ml.addWidget(self.todo_bar)
 
         self.reply_btn = QPushButton("رد على المحدد", self.view.viewport())  # floats over the selected text
         self.reply_btn.setObjectName("banner")
@@ -11110,6 +11851,7 @@ class App(QMainWindow):
                     "room": c.get("room"),
                     "journal": (c.get("journal") or [])[-300:],
                     "archived": bool(c.get("archived")),
+                    "todos": (c.get("todos") or [])[:40],
                     "msgs": [strip_for_save(m) for m in c["msgs"]],
                 }
             )
@@ -11198,6 +11940,7 @@ class App(QMainWindow):
         self.show_files("")
         self.sync_run_ui()
         self.update_room_bar()
+        self.update_todo_bar()
         if not self.current:
             self.refresh_files_panel()
             return
@@ -11538,6 +12281,8 @@ class App(QMainWindow):
                         mark.setForeground(ok_c)
                         cc.insertText("تم  ", mark)
                         cc.insertText(ic + txt, bot_f)
+                        if s_.get("diff"):
+                            self._insert_diff(cc, s_["diff"], "%s:d%d" % (sec_id, items.index(s_)), depth, blk, sized, chip_f)
                     else:
                         err = str(s_.get("err", "")).strip()
                         if err.startswith("Error:"):
@@ -11579,6 +12324,34 @@ class App(QMainWindow):
         fb.setAlignment(Qt.AlignLeft)
         cc.insertBlock(fb, QTextCharFormat())
         cc.insertText(CHIP_PAD + "طي التفكير كله" + CHIP_PAD, chip_f("act:" + act_id, True))
+
+    def _insert_diff(self, cc, diff, did, depth, blk, sized, chip_f):
+        """Under a file change: a «التغييرات +3 −1» chip; open it to see the change line by line (green added, red removed)."""
+        plus = sum(1 for x in diff.splitlines() if x.startswith("+") and not x.startswith("+++"))
+        minus = sum(1 for x in diff.splitlines() if x.startswith("-") and not x.startswith("---"))
+        is_open = did in self.open_secs
+        cc.insertText("   ", sized(self.fmt["dim"]))
+        cc.insertText(CHIP_PAD + "التغييرات  +%d  −%d  %s" % (plus, minus, "˅" if is_open else "‹") + CHIP_PAD, chip_f("sec:" + did, False))
+        if not is_open:
+            return
+        mono = QTextCharFormat(sized(self.fmt["bot"], False, -1))
+        mono.setFontFamilies(["Consolas", "DejaVu Sans Mono", "Courier New", "monospace"])
+        add_bg, del_bg = QColor(46, 160, 67, 60), QColor(229, 83, 75, 60)
+        bf = blk(depth + 2, 4)
+        bf.setLayoutDirection(Qt.LeftToRight)
+        bf.setAlignment(Qt.AlignLeft)
+        for i, ln in enumerate(diff.splitlines()[:300]):
+            b = QTextBlockFormat(bf)
+            b.setTopMargin(4 if i == 0 else 0)
+            if ln.startswith("+") and not ln.startswith("+++"):
+                b.setBackground(add_bg)
+            elif ln.startswith("-") and not ln.startswith("---"):
+                b.setBackground(del_bg)
+            cc.insertBlock(b, QTextCharFormat())
+            f = QTextCharFormat(mono)
+            if ln.startswith("@@") or ln.startswith("+++") or ln.startswith("---"):
+                f.setForeground(QColor(THEMES[self.theme]["dim"]))
+            cc.insertText(ln[:400] or " ", f)
 
     @staticmethod
     def _airy(c):
@@ -12764,6 +13537,7 @@ class App(QMainWindow):
                 prompt += "\n\nالملفات الجديدة اللي ظهرت:\n" + "\n".join(files)
             system = (SYSTEM_PROMPT + "\n" + memory_prompt() + (tools_prompt(runner) if roots else "") +
                       ("\n" + folder_notes_prompt(roots) if roots else "") +
+                      ("\n\n" + project_rules_prompt(roots) if roots else "") +
                       ("\nCHAIN: another task will run after you and receive your final report as its input. If there is truly nothing to pass on (nothing new, nothing found), answer exactly [لا شي] and nothing else." if task.get("next") else "") +
                       "\nBACKGROUND TASK: you run unattended inside the user's open conversation (earlier messages are the context); nobody can answer questions. Do the task with the tools you have, then finish "
                       "with a concise report in Arabic (Saudi dialect) of what you did or found. If something is not allowed, say so in the report.")
@@ -12933,6 +13707,34 @@ class App(QMainWindow):
         if self.current is None:
             self.apply_project_defaults()
 
+    def new_coding_chat(self):
+        """A chat ready for coding in one folder: read + edit there (every edit can be undone), commands after your approval."""
+        folder = QFileDialog.getExistingDirectory(self, "اختر مجلد المشروع", self.default_dir())
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        why = system_path_reason(folder)
+        if why:
+            QMessageBox.warning(self, "برمجة", "هذا المجلد من ملفات النظام (%s)، ما أشتغل فيه." % why)
+            return
+        self._stash_draft()
+        st = restrictive_settings(self.def_model, self.def_think)
+        st.update(allowed_dirs=[folder], writable_dirs=[folder], tools_enabled=True, write_enabled=True, confirm_edits=False,
+                  shell_mode="ask", delete_enabled=False)
+        c = {"id": uuid.uuid4().hex, "title": "برمجة: " + (os.path.basename(folder) or folder), "updated": time.time(), "msgs": [],
+             "settings": st, "project": self.selected_project_id()}
+        self.chats.append(c)
+        self.current = c
+        self.apply_settings(self.chat_settings(c))
+        self.persist()
+        self.refresh_list()
+        self.render_chat()
+        self._restore_draft()
+        self.inp.setFocus()
+        g = git_root_of(folder)
+        self.statusBar().showMessage("جاهز للبرمجة في %s%s: يقرأ ويعدّل (تقدر تتراجع عن أي تعديل)، والأوامر تحتاج موافقتك. غيّرها من «إعدادات المحادثة»."
+                                     % (folder, " (مستودع git)" if g else ""), 15000)
+
     def apply_project_defaults(self):
         proj = self.get_project(self.selected_project_id())
         base = restrictive_settings(self.def_model, self.def_think)
@@ -13054,6 +13856,38 @@ class App(QMainWindow):
             if dlg is not None and dlg.room is not None and dlg.room["id"] == rid and dlg._running():
                 return dlg
         return None
+
+    def _toggle_todo(self):
+        self._todo_open = not self._todo_open
+        self.update_todo_bar()
+
+    def update_todo_bar(self):
+        """The todo list of the chat on screen: progress, the step in progress, and (opened) every step."""
+        from html import escape
+        c = self.current
+        items = (c.get("todos") or []) if c else []
+        running = bool(c and c["id"] in self.runs)
+        if not items or (not running and all(x.get("status") == "completed" for x in items)):
+            self.todo_bar.setVisible(False)
+            return
+        col = THEMES[self.theme]
+        done = sum(1 for x in items if x.get("status") == "completed")
+        cur = next((x for x in items if x.get("status") == "in_progress"), None)
+        self.todo_head.setText("قائمة المهام · %d من %d خلصت%s" % (done, len(items), ("  ·  الحين: " + _cut(cur["content"], 70)) if cur else ""))
+        self.todo_toggle.setText("إخفاء" if self._todo_open else "عرض الكل")
+        if self._todo_open:
+            rows = []
+            for x in items:
+                st, t = x.get("status"), escape(x.get("content", ""))
+                if st == "completed":
+                    rows.append('<div style="color:%s"><s>%s</s>  <span style="color:%s">(خلص)</span></div>' % (col["dim"], t, col["accent"]))
+                elif st == "in_progress":
+                    rows.append('<div><b style="color:%s">%s</b>  <span style="color:%s">(الحين)</span></div>' % (col["accent"], t, col["accent"]))
+                else:
+                    rows.append('<div>%s</div>' % t)
+            self.todo_body.setText('<div dir="rtl">%s</div>' % "".join(rows))
+        self.todo_body.setVisible(self._todo_open)
+        self.todo_bar.setVisible(True)
 
     def update_room_bar(self):
         c = self.current
@@ -13832,12 +14666,16 @@ class App(QMainWindow):
             runner.undo_dir = os.path.join(self.chat_dir(), "undo")
             runner.work_dir = os.path.join(self.chat_dir(), "work")
             runner.followup = lambda mins_, note_, cid_=cid, ch_=self.current: self.add_followup(cid_, ch_, mins_, note_)
+            runner.todo = lambda items_, r_=run: self.q.put(("todo", items_, r_))
         if runner is not None:
             runner.llm = self.make_llm(key, lambda u: self.q.put(("usage", (MODELS[0], u, time.time()), run)))
         system = SYSTEM_PROMPT + "\n" + memory_prompt() + (tools_prompt(runner) if runner else "")
         system += skills_prompt(getattr(self, "chat_skills", []), offers=self.cfg.get("skill_offers", True) is not False)
         if roots:
             system += "\n" + folder_notes_prompt(roots)
+            rules = project_rules_prompt(roots)
+            if rules:
+                system += "\n\n" + rules
         proj = self.get_project(self.current.get("project"))
         if proj and proj.get("instructions", "").strip():
             system += "\nPROJECT «%s» — instructions from the user for this project:\n%s" % (proj["name"], proj["instructions"].strip()[:6000])
@@ -13905,6 +14743,13 @@ class App(QMainWindow):
     def worker(self, key, model, think, messages, runner, run):
         put = lambda k, v=None: self.q.put((k, v, run))
         use_tools = bool(runner and runner.tools())
+        if runner is not None and runner.roots and messages and messages[0].get("role") == "system":
+            try:  # git runs here, off the UI thread (a big repository can take a moment)
+                gtxt = git_context_prompt(runner.roots)
+                if gtxt:
+                    messages[0]["content"] += "\n\n" + gtxt
+            except Exception:
+                pass
         retried = False
         rounds = 0
         seen = {}
@@ -14009,8 +14854,11 @@ class App(QMainWindow):
                         result = ("Error: you already made this exact call %d times with the same result. "
                                   "Stop repeating it; use what you have, try a different approach, or finish and report." % (seen[sig] - 1))
                     else:
+                        runner.last_diff = ""
                         result = runner.run(c["name"], c["args"])
                     failed = result.startswith("Error")
+                    diff_ = "" if failed else (getattr(runner, "last_diff", "") or "")
+                    runner.last_diff = ""
                     try:
                         log_activity(run.act_title, c["name"], runner.describe(c["name"], c["args"]), not failed)
                         if c["name"] == "browser_open" and not failed:
@@ -14027,6 +14875,7 @@ class App(QMainWindow):
                             "text": runner.describe(c["name"], c["args"]),
                             "ok": not failed,
                             "err": result[:300] if failed else "",
+                            **({"diff": diff_[:12000]} if diff_ else {}),
                         },
                     )
                     messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
@@ -14345,6 +15194,11 @@ class App(QMainWindow):
                         del j_[:len(j_) - 300]
                     if jc_ is self.current:
                         self.undo_btn.setVisible(True)
+            elif kind == "todo":
+                if R is not None:
+                    R.chat["todos"] = val
+                    if R.chat is self.current:
+                        self.update_todo_bar()
             elif kind == "followup_add":
                 self.cfg.setdefault("followups", []).append(val)
                 self.save_cfg()
@@ -14481,7 +15335,7 @@ class App(QMainWindow):
         if not force and now - R.last_ckpt < 4:
             return
         R.last_ckpt = now
-        steps = [dict(x, text=str(x.get("text", ""))[:1500], err=str(x.get("err", ""))[:300]) for x in L["steps"][-80:]]
+        steps = [dict(x, text=str(x.get("text", ""))[:1500], err=str(x.get("err", ""))[:300], diff="") for x in L["steps"][-80:]]
         if getattr(self, "_ckpts", None) is None:
             self._ckpts = {}
         self._ckpts[R.chat["id"]] = {
@@ -14634,6 +15488,8 @@ class App(QMainWindow):
             self.notify_reply(R.chat, is_cur)
         if is_cur:
             self.sync_run_ui()
+            self.update_todo_bar()
+            self.refresh_list()  # the row loses its «(يفكر)» mark (nothing animates the list any more)
             self.inp.setFocus()
         elif not failed:
             R.chat["unread"] = True
