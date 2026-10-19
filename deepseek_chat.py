@@ -1222,6 +1222,32 @@ SHELL_TOOLS = [
     }
 ]
 
+TERMINAL_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "open_terminal",
+            "description": (
+                "Open the user's OWN terminal (PowerShell on Windows, Terminal on macOS, the installed terminal on Linux) VISIBLY and run a "
+                "command in it, so the user watches it run. Write the command in the syntax of THIS computer's shell. Use this (instead of "
+                "run_command) when the user wants to see the command in a real terminal, when it needs an interactive terminal, or when it "
+                "needs administrator/root rights (set admin=true; the OPERATING SYSTEM asks the user to allow it — UAC on Windows, the "
+                "password prompt on macOS/Linux). If the terminal cannot be opened you get a clear reason back: tell the user that reason and "
+                "give them the exact command to run themselves."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The exact command line, in this computer's shell syntax"},
+                    "explanation": {"type": "string", "description": "Short plain explanation of what it does and why (shown to the user)"},
+                    "admin": {"type": "boolean", "description": "Run it elevated (administrator/root). The OS itself asks the user to allow it. Default false"},
+                    "cwd": {"type": "string", "description": "Optional working directory (absolute path)"},
+                },
+                "required": ["command", "explanation"],
+            },
+        },
+    },
+]
 BG_TOOLS = [
     {
         "type": "function",
@@ -1540,6 +1566,17 @@ def tools_prompt(runner):
         )
     if runner.allow_computer:
         parts.append("COMPUTER: open_program opens an app/file/folder; open_in_chrome opens a URL or runs a Google search in the user's own Chrome.")
+    if runner.terminal_ok:
+        shell = "PowerShell" if IS_WIN else ("the macOS Terminal" if IS_MAC else "the Linux terminal")
+        parts.append(
+            "TERMINAL: open_terminal(command, explanation, admin, cwd) opens %s in a VISIBLE window and runs your command there, so the user "
+            "watches it. Write the command in THIS computer's shell syntax. run_command runs a command silently and gives you the output; "
+            "open_terminal shows it to the user but you do NOT see the output, so afterwards ask the user how it went. Use open_terminal when "
+            "the user asks to see it in a real terminal, when it is interactive, or when it needs administrator/root rights (admin=true — the "
+            "operating system itself asks the user to allow it). %s If a terminal cannot be opened you get the reason; pass it on to the user "
+            "with the exact command so they can run it themselves." % (
+                shell, ("The user has pre-approved this, so it opens without asking each time." if runner.terminal_preapprove
+                        else "The user approves each time before the terminal opens.")))
     if runner.browser is not None:
         parts.append(
             "BROWSER: you have a built-in browser. browser_open (open a URL or search), browser_read (get the page title, URL and "
@@ -2208,7 +2245,7 @@ PLAN_TOOLS = [
         },
     }
 ]
-MUTATING_TOOLS = {"write_file", "edit_file", "make_dir", "move_path", "delete_path", "run_command", "open_program", "run_python", "pip_install", "start_background"}
+MUTATING_TOOLS = {"write_file", "edit_file", "make_dir", "move_path", "delete_path", "run_command", "open_program", "run_python", "pip_install", "start_background", "open_terminal"}
 UNDO_MAX_FILE = 20 * 1024 * 1024
 UNDO_MAX_DIR = 50 * 1024 * 1024
 
@@ -2422,6 +2459,8 @@ class ToolRunner:
         self.browser = browser  # callable(action, **kwargs) -> str, or None
         self.followup = None  # callable(minutes, note) -> str, set by the app: lets the model wake itself up later
         self.todo = None  # callable(list of {content, status}) -> None, set by the app: shows the model's todo list live
+        self.terminal_ok = False       # the user allowed opening their own terminal and running commands in it
+        self.terminal_preapprove = False  # pre-approval: open and run without asking each time (the window is visible; admin still prompts via the OS)
         self.last_diff = ""  # unified diff of the last file change (for the details view)
         self.backup = bool(backup)
         self.cache = {}
@@ -2469,6 +2508,8 @@ class ToolRunner:
             out += PYTHON_TOOLS
         if self.allow_computer:
             out += COMPUTER_TOOLS
+        if self.terminal_ok:
+            out += TERMINAL_TOOLS
         if self.browser is not None:
             out += BROWSER_TOOLS
         if self.followup is not None:
@@ -2601,6 +2642,8 @@ class ToolRunner:
             return "فتح: %s" % a.get("target", "")
         if name == "open_in_chrome":
             return "فتح في كروم: %s" % a.get("target", "")
+        if name == "open_terminal":
+            return ("فتح الطرفية كمدير: " if a.get("admin") else "فتح الطرفية: ") + _cut(a.get("command", "") or "", 200)
         if name == "browser_open":
             return "فتح صفحة: %s" % a.get("target", "")
         if name == "browser_read":
@@ -2695,6 +2738,8 @@ class ToolRunner:
         if self.allow_computer:
             mapping["open_program"] = self.open_program
             mapping["open_in_chrome"] = self.open_in_chrome
+        if self.terminal_ok:
+            mapping["open_terminal"] = self.open_terminal
         if self.followup is not None:
             mapping["schedule_followup"] = self.schedule_followup
         if self.todo is not None:
@@ -3641,6 +3686,33 @@ class ToolRunner:
             raise ToolError("could not open it: %s" % e)
         return "OK: opened %s" % target
 
+    def open_terminal(self, a):
+        cmd = a.get("command")
+        if not isinstance(cmd, str) or not cmd.strip():
+            raise ToolError("command is missing")
+        admin = bool(a.get("admin"))
+        explanation = str(a.get("explanation") or "").strip()
+        cwd = a.get("cwd")
+        if cwd:
+            try:
+                cwd = self.resolve(cwd)
+            except Exception:
+                cwd = None
+        if not cwd or not os.path.isdir(cwd):
+            cwd = self.roots[0] if self.roots else os.path.expanduser("~")
+        danger = shell_danger(cmd)  # the OS-protection net applies to the terminal too, even with admin
+        if danger:
+            raise ToolError("PROTECTED: refused, %s. Never touch operating-system files, drives, the registry or services, even if the user asks. Tell the user you refused." % danger)
+        title = ("فتح الطرفية كمدير وتشغيل أمر" if admin else "فتح الطرفية وتشغيل أمر")
+        detail = "الأمر:\n%s" % _cut(cmd, 6000) + (("\n\nالشرح:\n%s" % explanation) if explanation else "") + (("\n\n(كمدير — النظام نفسه بيطلب إذنك)") if admin else "")
+        if not self.terminal_preapprove:  # no pre-approval: ask every time (admin also goes through the OS prompt)
+            if self.confirm is None or not self.confirm(title, detail):
+                raise ToolError("the user did not approve opening the terminal, so nothing was done. Give them the exact command to run themselves instead.")
+        ok, msg = open_in_terminal(cmd, cwd=cwd, admin=admin)
+        if not ok:
+            raise ToolError(msg + " Give the user the exact command so they can run it themselves.")
+        return "OK: %s الأمر يشتغل الآن في نافذة الطرفية أمام المستخدم؛ ما تقدر تقرأ ناتجه، فاسأله عن النتيجة إذا احتجتها." % msg
+
     def open_in_chrome(self, a):
         target = str(a.get("target") or "").strip()
         if not target:
@@ -3807,6 +3879,7 @@ TOOL_GROUPS = {
     "pip_install": ("shell", "تشغيل أكواد بايثون"),
     "open_program": ("computer", "فتح برامج ومواقع"),
     "open_in_chrome": ("computer", "فتح برامج ومواقع"),
+    "open_terminal": ("shell", "تشغيل أوامر على الجهاز"),
     "browser_open": ("browser", "التصفّح"),
     "browser_read": ("browser", "التصفّح"),
     "browser_click": ("browser", "التصفّح"),
@@ -3865,7 +3938,7 @@ _SUMMARY_KEYS = {
     "write_file": "write", "edit_file": "write", "save_notes": "write", "make_dir": "mkdir",
     "move_path": "delete", "delete_path": "delete", "run_command": "cmd", "run_python": "py", "pip_install": "pip",
     "browser_open": "browse", "browser_read": "browse_x", "browser_click": "browse_x", "browser_type": "browse_x", "browser_back": "browse_x",
-    "open_program": "open", "open_in_chrome": "open", "submit_plan": "plan", "schedule_followup": "followup", "todo_write": "plan", "start_background": "cmd", "read_background": "cmd", "stop_background": "cmd",
+    "open_program": "open", "open_in_chrome": "open", "open_terminal": "cmd", "submit_plan": "plan", "schedule_followup": "followup", "todo_write": "plan", "start_background": "cmd", "read_background": "cmd", "stop_background": "cmd",
 }
 _SUMMARY_TEXT = {
     "read": ("قرأ ملف", "قرأ %d ملفات"), "analyze": ("حلّل ملف", "حلّل %d ملفات"),
@@ -4032,7 +4105,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.32.0"
+APP_VERSION = "2.33.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4079,10 +4152,124 @@ def open_path(path):
         return False
 
 
+# ---------- opening the user's own terminal (visible, so they watch what runs) ----------
+TERM_NAME = "PowerShell" if IS_WIN else ("Terminal" if IS_MAC else "الطرفية")
+
+
+def _applescript_quote(s):
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _ps_single(s):
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def _term_script(command, cwd):
+    """Write the command to a temp script the terminal runs then keeps its window open, so there are no quoting problems.
+    Old scripts (older than a day) are cleaned up."""
+    import shlex
+    d = os.path.join(DATA_DIR, "term")
+    os.makedirs(d, exist_ok=True)
+    now = time.time()
+    for f in os.listdir(d):
+        fp = os.path.join(d, f)
+        try:
+            if now - os.path.getmtime(fp) > 86400:
+                os.remove(fp)
+        except OSError:
+            pass
+    if IS_WIN:
+        path = os.path.join(d, "t_%s.ps1" % uuid.uuid4().hex[:8])
+        with open(path, "w", encoding="utf-8-sig", newline="\r\n") as f:
+            f.write("$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n")
+            if cwd:
+                f.write("Set-Location -LiteralPath %s\n" % _ps_single(cwd))
+            f.write(command + "\n")
+        return path
+    path = os.path.join(d, "t_%s.sh" % uuid.uuid4().hex[:8])
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("#!/bin/bash\n")
+        if cwd:
+            f.write("cd %s || exit 1\n" % shlex.quote(cwd))
+        f.write(command + "\n")
+    try:
+        os.chmod(path, 0o755)
+    except OSError:
+        pass
+    return path
+
+
+def _linux_terminal(inner):
+    """argv for the first installed terminal emulator that runs `inner` in bash, or None."""
+    import shlex
+    cands = [
+        ["x-terminal-emulator", "-e", "bash", "-c", inner],
+        ["gnome-terminal", "--", "bash", "-c", inner],
+        ["konsole", "-e", "bash", "-c", inner],
+        ["xfce4-terminal", "-e", "bash -c %s" % shlex.quote(inner)],
+        ["mate-terminal", "--", "bash", "-c", inner],
+        ["tilix", "-e", "bash", "-c", inner],
+        ["kitty", "bash", "-c", inner],
+        ["alacritty", "-e", "bash", "-c", inner],
+        ["xterm", "-e", "bash", "-c", inner],
+    ]
+    for argv in cands:
+        exe = shutil.which(argv[0])
+        if exe:
+            return [exe] + argv[1:]
+    return None
+
+
+def open_in_terminal(command, cwd=None, admin=False):
+    """Open the user's own terminal — PowerShell on Windows, Terminal on macOS, the installed terminal on Linux — VISIBLE to the user,
+    and run `command` in it. Elevation (admin) goes through the operating system's own prompt (UAC / password), never a bypass.
+    Returns (ok, message). The caller runs shell_danger(command) first; this only opens a window the user can watch and stop."""
+    cwd = cwd if (cwd and os.path.isdir(cwd)) else None
+    try:
+        script = _term_script(command, cwd)
+    except Exception as e:
+        return False, "ما قدرت أجهّز الأمر للطرفية: %s" % e
+    try:
+        if IS_WIN:
+            inner = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-File", script]
+            wt = shutil.which("wt")
+            if admin:  # Start-Process -Verb RunAs shows the normal Windows UAC dialog; the user allows it there
+                target = "wt.exe" if wt else "powershell.exe"
+                arglist = ",".join(_ps_single(x) for x in (["-w", "new", "powershell"] if wt else []) + ["-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-File", script])
+                subprocess.Popen(["powershell", "-NoProfile", "-Command", "Start-Process %s -Verb RunAs -ArgumentList %s" % (target, arglist)],
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                return True, "فتحت PowerShell كمدير (ويندوز طلب منك السماح عبر نافذته)."
+            if wt:
+                subprocess.Popen([wt, "-w", "new"] + inner)
+            else:
+                subprocess.Popen(["powershell", "-NoProfile", "-Command", "Start-Process %s -ArgumentList %s" %
+                                  ("powershell", ",".join(_ps_single(x) for x in inner[1:]))],
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            return True, "فتحت PowerShell وشغّلت الأمر فيه."
+        if IS_MAC:
+            import shlex
+            run = ("sudo bash %s" % shlex.quote(script)) if admin else ("bash %s" % shlex.quote(script))
+            osa = 'tell application "Terminal"\nactivate\ndo script %s\nend tell' % _applescript_quote(run)
+            subprocess.Popen(["osascript", "-e", osa])
+            return True, "فتحت Terminal وشغّلت الأمر فيه." + (" (sudo راح يطلب كلمة مرورك في النافذة)" if admin else "")
+        import shlex
+        run = ("sudo bash %s" % shlex.quote(script)) if admin else ("bash %s" % shlex.quote(script))
+        inner = "%s; ec=$?; echo; echo \"[انتهى، كود الخروج $ec — اضغط Enter للإغلاق]\"; read -r _" % run
+        argv = _linux_terminal(inner)
+        if argv is None:
+            return False, ("ما لقيت برنامج طرفية على نظام لينكس هذا (جربت gnome-terminal و konsole و xterm وغيرهم). "
+                           "ثبّت واحد، أو انسخ الأمر وشغّله بنفسك.")
+        subprocess.Popen(argv, start_new_session=True)
+        return True, "فتحت الطرفية وشغّلت الأمر فيها." + (" (sudo راح يطلب كلمة مرورك)" if admin else "")
+    except Exception as e:
+        return False, "ما قدرت أفتح الطرفية: %s" % e
+
+
 # ---------- per-chat settings ----------
 CHAT_SETTING_KEYS = (
     "allowed_dirs", "writable_dirs", "tools_enabled", "write_enabled", "delete_enabled", "confirm_edits",
     "backup_enabled", "shell_mode", "computer_enabled", "browser_enabled", "model", "thinking", "plan_first",
+    "terminal_ok", "terminal_preapprove",
 )
 
 
@@ -4092,7 +4279,7 @@ def restrictive_settings(model="deepseek-flash", thinking="high"):
         "allowed_dirs": [], "writable_dirs": [], "tools_enabled": False, "write_enabled": False,
         "delete_enabled": False, "confirm_edits": True, "backup_enabled": True, "shell_mode": "off",
         "computer_enabled": False, "browser_enabled": False, "model": model, "thinking": thinking, "plan_first": False,
-        "skills": [],
+        "terminal_ok": False, "terminal_preapprove": False, "skills": [],
     }
 
 
@@ -4104,8 +4291,10 @@ def clean_settings(s, fallback):
     dirs = [d for d in (s.get("allowed_dirs") or []) if isinstance(d, str)]
     out["allowed_dirs"] = dirs
     out["writable_dirs"] = [d for d in (s.get("writable_dirs") or []) if isinstance(d, str) and d in dirs]
-    for k in ("tools_enabled", "write_enabled", "delete_enabled", "computer_enabled", "browser_enabled", "plan_first"):
+    for k in ("tools_enabled", "write_enabled", "delete_enabled", "computer_enabled", "browser_enabled", "plan_first", "terminal_ok", "terminal_preapprove"):
         out[k] = bool(s.get(k, out.get(k, False)))
+    if not out["terminal_ok"]:
+        out["terminal_preapprove"] = False
     out["confirm_edits"] = s.get("confirm_edits", True) is not False
     out["backup_enabled"] = s.get("backup_enabled", True) is not False
     sm = s.get("shell_mode", "off")
@@ -5978,6 +6167,18 @@ class DeviceFilesDialog(QDialog):
         note2 = QLabel("ملفات النظام (ويندوز، Program Files، الأقراص...) محمية دائماً ولا يمسها الموديل حتى مع الحرية الكاملة.")
         note2.setWordWrap(True)
         lay.addWidget(note2)
+        term_lbl = QLabel("الطرفية (PowerShell / Terminal حسب نظامك):")
+        term_lbl.setObjectName("h2")
+        lay.addWidget(term_lbl)
+        self.terminal_box = QCheckBox("يفتح الطرفية ويكتب فيها الأوامر (نافذة تشوفها، ويقدر يطلب صلاحية مدير والنظام يستأذنك)")
+        self.terminal_box.setChecked(bool(settings.get("terminal_ok")))
+        lay.addWidget(self.terminal_box)
+        self.terminal_pre_box = QCheckBox("موافقة مسبقة: يفتح ويشغّل بدون ما يسألني كل مرة (أوامر المدير يبقى النظام يستأذنك لها)")
+        self.terminal_pre_box.setChecked(bool(settings.get("terminal_preapprove")))
+        self.terminal_pre_box.setEnabled(self.terminal_box.isChecked())
+        self.terminal_box.toggled.connect(self.terminal_pre_box.setEnabled)
+        self.terminal_box.toggled.connect(lambda on: None if on else self.terminal_pre_box.setChecked(False))
+        lay.addWidget(self.terminal_pre_box)
         self.write_box.toggled.connect(self.on_write_toggled)
 
         lay.addWidget(QLabel("المجلدات المسموحة لهذي المحادثة (تعديل = يقدر يعدّل داخلها، قراءة = قراءة فقط) — مرّر الماوس لرؤية المسار:"))
@@ -6065,11 +6266,11 @@ class DeviceFilesDialog(QDialog):
         if not k:
             return
         P = {
-            #        read   write  delete backup computer browser  approval shell
-            "none": (False, False, False, True, False, False, 0, 0),
-            "read": (True, False, False, True, False, False, 0, 0),
-            "dev": (True, True, False, True, False, False, 0, 1),
-            "free": (True, True, False, True, True, True, 1, 2),
+            #        read   write  delete backup computer browser  approval shell term  preapprove
+            "none": (False, False, False, True, False, False, 0, 0, False, False),
+            "read": (True, False, False, True, False, False, 0, 0, False, False),
+            "dev": (True, True, False, True, False, False, 0, 1, True, False),
+            "free": (True, True, False, True, True, True, 1, 2, True, True),
         }[k]
         self.enable_box.setChecked(P[0])
         self.write_box.setChecked(P[1])
@@ -6080,6 +6281,8 @@ class DeviceFilesDialog(QDialog):
         self.plan_box.setChecked(P[0] and P[1] and k == "dev")
         self.approval_box.setCurrentIndex(P[6])
         self.shell_box.setCurrentIndex(P[7])
+        self.terminal_box.setChecked(P[8])
+        self.terminal_pre_box.setChecked(P[9])
 
     def add_path(self, path, writable):
         from PySide6.QtWidgets import QListWidgetItem
@@ -6154,6 +6357,8 @@ class DeviceFilesDialog(QDialog):
             "computer_enabled": self.computer_box.isChecked(),
             "browser_enabled": self.browser_box.isChecked(),
             "plan_first": self.plan_box.isChecked(),
+            "terminal_ok": self.terminal_box.isChecked(),
+            "terminal_preapprove": self.terminal_box.isChecked() and self.terminal_pre_box.isChecked(),
             "allowed_dirs": dirs,
             "writable_dirs": writable,
             "skills": self.checked_skills(),
@@ -11059,6 +11264,8 @@ class App(QMainWindow):
         self.shell_mode = s["shell_mode"]
         self.computer_enabled = s["computer_enabled"]
         self.browser_enabled = s["browser_enabled"]
+        self.terminal_ok = s.get("terminal_ok", False)
+        self.terminal_preapprove = s.get("terminal_preapprove", False)
         self.plan_first = s.get("plan_first", False)
         self.chat_skills = list(s.get("skills") or [])
         return s
@@ -11070,6 +11277,7 @@ class App(QMainWindow):
             "delete_enabled": self.delete_enabled, "confirm_edits": self.confirm_edits,
             "backup_enabled": self.backup_enabled, "shell_mode": self.shell_mode,
             "computer_enabled": self.computer_enabled, "browser_enabled": self.browser_enabled,
+            "terminal_ok": bool(getattr(self, "terminal_ok", False)), "terminal_preapprove": bool(getattr(self, "terminal_preapprove", False)),
             "model": self.model_box.currentText(), "thinking": self.think_box.currentText(),
             "plan_first": bool(getattr(self, "plan_first", False)),
             "skills": list(getattr(self, "chat_skills", []) or []),
@@ -11706,6 +11914,28 @@ class App(QMainWindow):
         """Run a command block from a reply on this computer, after asking and after the OS-protection check."""
         self.run_code(self.copy_store.get(cid, ""), py)
 
+    def terminal_snippet(self, cid):
+        """The «بالطرفية» button under a command block: open the user's own terminal and run it there (pressing it is the approval)."""
+        code = strip_prompts(self.copy_store.get(cid, ""))
+        if not code.strip():
+            return
+        danger = shell_danger(code)
+        if danger:
+            QMessageBox.warning(self, "5belan", "رفضت تشغيله: %s.\nالبرنامج ما يلمس ملفات النظام أبداً." % danger)
+            return
+        admin = False
+        if QApplication.keyboardModifiers() & Qt.ShiftModifier:  # Shift+click asks the OS to open it as administrator/root
+            admin = True
+        cwd = None
+        for d in (self.writable_dirs or []) + (self.allowed_dirs or []):
+            if os.path.isdir(d):
+                cwd = d
+                break
+        ok, msg = open_in_terminal(code, cwd=cwd, admin=admin)
+        self.statusBar().showMessage(msg if ok else ("ما قدرت أفتح الطرفية: " + msg), 8000)
+        if not ok:
+            QMessageBox.information(self, "الطرفية", msg + "\n\nتقدر تنسخ الأمر وتشغّله بنفسك من زر «نسخ».")
+
     def run_code(self, code, py=False):
         """The «تشغيل» button under a reply's command/code block: it runs right away (pressing it is the approval); the OS-protection check still applies."""
         if not py:
@@ -11770,6 +12000,8 @@ class App(QMainWindow):
             parts.append("أوامر")
         if self.computer_enabled:
             parts.append("تحكم")
+        if getattr(self, "terminal_ok", False):
+            parts.append("طرفية" + (" (موافقة مسبقة)" if getattr(self, "terminal_preapprove", False) else ""))
         if self.browser_enabled and self.web_ok:
             parts.append("متصفح")
         self.access_btn.setText("الصلاحيات " + "، ".join(parts) if parts else "بدون صلاحيات")
@@ -12418,6 +12650,11 @@ class App(QMainWindow):
             r = QTextCharFormat(a)
             r.setAnchorHref("run:" + cid)
             c.insertText("تشغيل", r)
+            c.insertText("      ", h)
+            rt = QTextCharFormat(a)
+            rt.setAnchorHref("term:" + cid)
+            rt.setToolTip("يفتح %s ويشغّل الأمر فيه (Shift+ضغط = كمدير، والنظام يستأذنك)" % TERM_NAME)
+            c.insertText("بالطرفية", rt)
         elif fam:
             c.insertText("      (أمر لنظام آخر — انسخه فقط)", h)
         cf = QTextCharFormat()
@@ -12648,6 +12885,9 @@ class App(QMainWindow):
             return
         if s.startswith("runpy:"):
             self.run_snippet(s[6:], py=True)
+            return
+        if s.startswith("term:"):
+            self.terminal_snippet(s[5:])
             return
         if s.startswith("canvas:"):
             _cid, _, lg_ = s[7:].rpartition(":")
@@ -14667,6 +14907,8 @@ class App(QMainWindow):
             runner.work_dir = os.path.join(self.chat_dir(), "work")
             runner.followup = lambda mins_, note_, cid_=cid, ch_=self.current: self.add_followup(cid_, ch_, mins_, note_)
             runner.todo = lambda items_, r_=run: self.q.put(("todo", items_, r_))
+            runner.terminal_ok = bool(getattr(self, "terminal_ok", False))
+            runner.terminal_preapprove = bool(getattr(self, "terminal_preapprove", False))
         if runner is not None:
             runner.llm = self.make_llm(key, lambda u: self.q.put(("usage", (MODELS[0], u, time.time()), run)))
         system = SYSTEM_PROMPT + "\n" + memory_prompt() + (tools_prompt(runner) if runner else "")
