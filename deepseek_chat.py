@@ -2993,7 +2993,9 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QFontDatabase,
+    QFontMetrics,
     QImage,
+    QPainterPath,
     QPen,
     QKeySequence,
     QIcon,
@@ -3315,7 +3317,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.31.0"
+APP_VERSION = "2.31.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4120,6 +4122,105 @@ def shell_family(lang):
     if l in SHELL_LANGS_UNIX:
         return "unix"
     return None
+
+
+FILE_KINDS = (  # (extensions, key, label shown to the person, colour of its tile)
+    ({".pdf"}, "pdf", "ملف PDF", "#d9534f"),
+    ({".doc", ".docx", ".dotx", ".odt", ".rtf"}, "word", "مستند Word", "#3b7dd8"),
+    ({".xls", ".xlsx", ".xlsm", ".csv", ".tsv", ".ods"}, "sheet", "جدول بيانات", "#2f9e6a"),
+    ({".ppt", ".pptx", ".key", ".odp"}, "slides", "عرض تقديمي", "#e0803a"),
+    ({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"}, "image", "صورة", "#9b6bd6"),
+    ({".py", ".js", ".ts", ".html", ".htm", ".css", ".json", ".xml", ".sql", ".sh", ".bat", ".ps1", ".java", ".c", ".cpp", ".cs", ".go", ".rs", ".php", ".yml", ".yaml"}, "code", "ملف كود", "#4a8f9c"),
+    ({".md", ".txt", ".log"}, "text", "ملف نصي", "#8a94a3"),
+    ({".zip", ".rar", ".7z", ".tar", ".gz"}, "zip", "ملف مضغوط", "#b58a2e"),
+)
+
+
+def file_kind(name):
+    ext = os.path.splitext(str(name))[1].lower()
+    for exts, key, label, col in FILE_KINDS:
+        if ext in exts:
+            return key, label, col
+    return "other", "ملف", "#8a94a3"
+
+
+def human_size(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return ""
+    if n < 1024:
+        return "%d بايت" % n
+    if n < 1024 * 1024:
+        return "%d ك.ب" % round(n / 1024)
+    return ("%.1f م.ب" % (n / (1024 * 1024))).replace(".0 ", " ")
+
+
+def human_when(ts):
+    """«الحين» / «قبل 5 دقايق» / «قبل ساعتين» / «أمس» / «قبل 4 أيام» / a date."""
+    try:
+        sec = time.time() - float(ts)
+    except (TypeError, ValueError):
+        return ""
+    if sec < 0:
+        sec = 0
+    if sec < 60:
+        return "الحين"
+    m = int(sec // 60)
+    if m < 60:
+        return "قبل دقيقة" if m == 1 else ("قبل دقيقتين" if m == 2 else ("قبل %d دقايق" % m if m <= 10 else "قبل %d دقيقة" % m))
+    h = m // 60
+    if h < 24:
+        return "قبل ساعة" if h == 1 else ("قبل ساعتين" if h == 2 else ("قبل %d ساعات" % h if h <= 10 else "قبل %d ساعة" % h))
+    dd = h // 24
+    if dd == 1:
+        return "أمس"
+    if dd < 7:
+        return "قبل %d أيام" % dd
+    return time.strftime("%Y/%m/%d", time.localtime(float(ts)))
+
+
+def file_tile(name, size=48, path=None):
+    """The picture in front of a file: its own thumbnail for images, otherwise a soft tile in the colour of its type with the extension."""
+    key, _label, col = file_kind(name)
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
+    rect = QRectF(0.5, 0.5, size - 1, size - 1)
+    clip = QPainterPath()
+    clip.addRoundedRect(rect, size * 0.24, size * 0.24)
+    thumb = None
+    if key == "image" and path and os.path.exists(path) and not str(path).lower().endswith(".svg"):
+        img = QPixmap(path)
+        if not img.isNull():
+            thumb = img.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    if thumb is not None:
+        p.setClipPath(clip)
+        p.drawPixmap(int((size - thumb.width()) / 2), int((size - thumb.height()) / 2), thumb)
+        p.setClipping(False)
+        p.setPen(QPen(QColor(0, 0, 0, 40), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(clip)
+    else:
+        c = QColor(col)
+        fill = QColor(c)
+        fill.setAlpha(46)
+        edge = QColor(c)
+        edge.setAlpha(120)
+        p.setPen(QPen(edge, 1))
+        p.setBrush(fill)
+        p.drawPath(clip)
+        f = QFont(FONT["family"])
+        f.setBold(True)
+        ext = os.path.splitext(str(name))[1].lstrip(".").upper()[:4] or "FILE"
+        f.setPixelSize(int(size * (0.30 if len(ext) <= 3 else 0.24)))
+        p.setFont(f)
+        p.setPen(c)
+        p.drawText(rect, Qt.AlignCenter, ext)
+    p.end()
+    return pm
 
 
 class RunOutputDialog(QDialog):
@@ -8806,10 +8907,23 @@ def make_qss(c):
     QPlainTextEdit { background: transparent; color: %(text)s; border: none; padding: 4px; }
     QFrame#composer { background: %(input)s; border: 1px solid %(border)s; border-radius: 22px; }
     QFrame#composer QWidget { background: transparent; }
-    QFrame#chipbox { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 10px; }
+    QFrame#chipbox { background: %(bubble)s; border: 1px solid %(border)s; border-radius: 14px; }
     QFrame#chipbox QLabel, QFrame#chipbox QToolButton { background: transparent; }
-    QFrame#filecard { background: %(panel)s; border: 1px solid %(border)s; border-radius: 12px; }
+    QFrame#filecard { background: %(panel)s; border: 1px solid %(border)s; border-radius: 14px; }
+    QFrame#filecard:hover { border: 1px solid %(accent)s; background: %(hover)s; }
     QFrame#filecard QLabel { background: transparent; }
+    QLabel#filename { font-size: 14px; font-weight: bold; }
+    QLabel#filesrc { color: %(accent)s; font-size: 11px; }
+    QLabel#fileshead { font-size: 16px; font-weight: bold; padding: 2px 2px 4px 2px; }
+    QLabel#emptytitle { font-size: 15px; font-weight: bold; }
+    QFrame#filesempty { background: transparent; border: 1px dashed %(border)s; border-radius: 14px; }
+    QPushButton#openbtn { background: %(accent)s; color: #ffffff; border: none; border-radius: 10px; padding: 5px 18px; font-weight: bold; }
+    QPushButton#openbtn:hover { background: %(accent)s; }
+    QToolButton#morebtn { background: transparent; border: 1px solid %(border)s; border-radius: 10px; padding: 4px 12px; color: %(dim)s; }
+    QToolButton#morebtn:hover { border: 1px solid %(accent)s; color: %(text)s; }
+    QToolButton#morebtn::menu-indicator { image: none; width: 0px; }
+    QToolButton#chipx { background: %(border)s; border: none; border-radius: 11px; color: %(text)s; font-size: 14px; }
+    QToolButton#chipx:hover { background: %(err)s; color: #ffffff; }
     QLineEdit { background: %(input)s; color: %(text)s; border: 1px solid %(border)s;
         border-radius: 10px; padding: 7px 10px; selection-background-color: %(accent)s; selection-color: white; }
     QLineEdit:focus { border: 1px solid %(accent)s; }
@@ -9619,15 +9733,26 @@ class App(QMainWindow):
         self.files_panel = QWidget()
         self.files_panel.setObjectName("filespanel")
         fpl = QVBoxLayout(self.files_panel)
-        fpl.setContentsMargins(10, 12, 10, 10)
+        fpl.setContentsMargins(12, 14, 12, 10)
+        fpl.setSpacing(8)
+        self.files_head = QLabel("الملفات")
+        self.files_head.setObjectName("fileshead")
+        fpl.addWidget(self.files_head)
+        self.files_search = QLineEdit()
+        self.files_search.setPlaceholderText("دوّر في الملفات…")
+        self.files_search.setClearButtonEnabled(True)
+        self.files_search.setVisible(False)
+        self.files_search.textChanged.connect(lambda _t: self.refresh_files_panel())
+        fpl.addWidget(self.files_search)
         sa = QScrollArea()
         sa.setWidgetResizable(True)
         sa.setFrameShape(QFrame.NoFrame)
         inner = QWidget()
-        inner.setStyleSheet("background: transparent;")
+        inner.setObjectName("filesinner")
+        inner.setStyleSheet("QWidget#filesinner { background: transparent; }")  # only this widget: a bare rule would also clear the buttons' colours
         self.files_list = QVBoxLayout(inner)
         self.files_list.setContentsMargins(0, 0, 0, 0)
-        self.files_list.setSpacing(8)
+        self.files_list.setSpacing(10)
         self.files_list.addStretch(1)
         sa.setWidget(inner)
         fpl.addWidget(sa, 1)
@@ -9915,8 +10040,12 @@ class App(QMainWindow):
             self.dock.setSizes([max(300, int(f.want_width * dw / max(want, 1))) if not f.isHidden() else 0 for f in frames])
 
     def refresh_files_panel(self):
+        """The attachments panel: what 5belan prepared for you in this chat, newest first, as friendly cards (type tile, name, a short
+        description, one clear «افتح» button and a menu for the rest). Search box on top, a kind and encouraging empty state."""
         entries = self.gather_files()
-        sig = tuple((e["src"], e["name"], e["mi"]) for e in entries)
+        q = (self.files_search.text().strip().lower() if hasattr(self, "files_search") else "")
+        shown = [e for e in entries if not q or q in e["name"].lower()]
+        sig = (tuple((e["src"], e["name"], e["mi"]) for e in shown), q, len(entries))
         self.files_btn.setText("المرفقات (%d)" % len(entries) if entries else "المرفقات")
         if sig == getattr(self, "_files_sig", None):
             return
@@ -9927,66 +10056,33 @@ class App(QMainWindow):
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
-        icons = {".docx": "📄", ".pdf": "📕", ".xlsx": "📊", ".csv": "📊", ".png": "🖼", ".svg": "🖼", ".jpg": "🖼",
-                 ".jpeg": "🖼", ".html": "🌐", ".md": "📝", ".txt": "📝", ".py": "🐍", ".json": "🧾"}
-        seq = []
-        for gname, want_user, empty in (("أرسلها خبيلان", False, "ما أرسل ملفات بعد."),):
-            grp = [e for e in entries if (e["src"] == "user") == want_user]
-            seq.append(("h", "%s (%d)" % (gname, len(grp))))
-            seq += [("e", e) for e in grp] if grp else [("n", empty)]
+        if hasattr(self, "files_head"):
+            if entries:
+                self.files_head.setText("%s في هذي المحادثة" % ("ملف واحد" if len(entries) == 1 else ("ملفين" if len(entries) == 2 else "%d ملفات" % len(entries))))
+            else:
+                self.files_head.setText("الملفات")
+            self.files_search.setVisible(len(entries) > 5)
         pos = 0
-        for kind, val in seq:
-            if kind != "e":
-                lab = QLabel(val)
-                lab.setObjectName("h2" if kind == "h" else "chip")
-                lab.setWordWrap(True)
-                self.files_list.insertWidget(pos, lab)
-                pos += 1
-                continue
-            e = val
-            card = QFrame()
-            card.setObjectName("filecard")
-            v = QVBoxLayout(card)
-            v.setContentsMargins(8, 8, 8, 8)
-            v.setSpacing(6)
-            top = QHBoxLayout()
-            ext = os.path.splitext(e["name"])[1].lower()
-            th = QPushButton()
-            th.setObjectName("flat")
-            th.setFixedSize(60, 60)
-            th.setToolTip("معاينة")
-            if e["src"] in ("user", "work") and ext in IMAGE_MIME and os.path.exists(e["path"]):
-                pm = QPixmap(e["path"])
-                if not pm.isNull():
-                    th.setIcon(QIcon(pm.scaled(56, 56, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
-                    th.setIconSize(QSize(56, 56))
-            if th.icon().isNull():
-                th.setText(ext.lstrip(".").upper()[:4] or "ملف")
-                th.setStyleSheet("font-size: 13px; font-weight: bold;")
-            th.clicked.connect(lambda _=False, ee=e: self.preview_entry(ee))
-            top.addWidget(th)
-            info = QVBoxLayout()
-            nm = QLabel(e["name"] if len(e["name"]) <= 26 else e["name"][:23] + "...")
-            nm.setLayoutDirection(Qt.LeftToRight)
-            nm.setToolTip(e["name"])
-            meta = QLabel("مرفقك" if e["src"] == "user" else ("ناتج الكود" if e["src"] == "work" else "من خبيلان"))
-            meta.setObjectName("chip")
-            info.addWidget(nm)
-            info.addWidget(meta)
-            top.addLayout(info, 1)
-            v.addLayout(top)
-            row = QHBoxLayout()
-            row.setSpacing(4)
-            for text, fn, tip in (("معاينة", self.preview_entry, "معاينة"), ("فتح", self.open_entry, "فتح الملف"),
-                                  ("المجلد", self.folder_entry, "إظهار في المجلد"), ("حفظ", self.save_entry, "حفظ باسم…")):
-                b = QPushButton(text)
-                b.setToolTip(tip)
-                b.setMinimumWidth(44)
-                b.clicked.connect(lambda _=False, f=fn, ee=e: f(ee))
-                row.addWidget(b)
-            row.addStretch(1)
-            v.addLayout(row)
-            self.files_list.insertWidget(pos, card)
+        if not entries or not shown:
+            box = QFrame()
+            box.setObjectName("filesempty")
+            bl = QVBoxLayout(box)
+            bl.setContentsMargins(16, 28, 16, 28)
+            bl.setSpacing(8)
+            t1 = QLabel("ما لقيت ملف بهذا الاسم" if entries else "لسه ما فيه ملفات هنا")
+            t1.setObjectName("emptytitle")
+            t1.setAlignment(Qt.AlignCenter)
+            t2 = QLabel("جرّب كلمة ثانية في البحث." if entries else
+                        "لما تطلب من خبيلان تقرير أو جدول أو صورة أو أي ملف، بتلقاه هنا جاهز تفتحه أو تحفظه.")
+            t2.setObjectName("chip")
+            t2.setWordWrap(True)
+            t2.setAlignment(Qt.AlignCenter)
+            bl.addWidget(t1)
+            bl.addWidget(t2)
+            self.files_list.insertWidget(0, box)
+            return
+        for e in shown:
+            self.files_list.insertWidget(pos, self._file_card(e))
             pos += 1
         if entries and not getattr(self, "_panel_user_off", False) and self.files_dock.isHidden():
             self.files_dock.setVisible(True)
@@ -9994,6 +10090,91 @@ class App(QMainWindow):
             self.files_btn.setChecked(True)
             self.files_btn.blockSignals(False)
             self.relayout()
+
+    def _entry_facts(self, e):
+        """(size in bytes or None, timestamp or None, where it came from) of an attachment entry."""
+        if e["src"] == "work":
+            try:
+                return os.path.getsize(e["path"]), os.path.getmtime(e["path"]), "طلع من الكود اللي شغّله"
+            except OSError:
+                return None, e.get("mi"), "طلع من الكود اللي شغّله"
+        size = len(str(e.get("body", "")).encode("utf-8", "ignore")) if e.get("kind") != "chart" else None
+        ts = None
+        try:
+            ts = ((self.current["msgs"][e["mi"]].get("cost") or {}).get("t"))
+        except Exception:
+            pass
+        return size, ts, "جهّزه لك خبيلان"
+
+    def _file_card(self, e):
+        key, label, _col = file_kind(e["name"])
+        size, ts, origin = self._entry_facts(e)
+        card = QFrame()
+        card.setObjectName("filecard")
+        card.setCursor(Qt.PointingHandCursor)
+        card.setToolTip("اضغط مرتين للمعاينة")
+        card.mouseDoubleClickEvent = lambda ev, ee=e: self.preview_entry(ee)
+        h = QHBoxLayout(card)
+        h.setContentsMargins(10, 10, 10, 10)
+        h.setSpacing(10)
+        tile = QLabel()
+        tile.setFixedSize(48, 48)
+        tile.setPixmap(file_tile(e["name"], 48, e.get("path")))
+        h.addWidget(tile, 0, Qt.AlignTop)
+        info = QVBoxLayout()
+        info.setSpacing(2)
+        name = QLabel()
+        name.setObjectName("filename")
+        name.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        name.setToolTip(e["name"])
+        name.setText(QFontMetrics(name.font()).elidedText(e["name"], Qt.ElideMiddle, 170))
+        info.addWidget(name)
+        bits = [label]
+        if size:
+            bits.append(human_size(size))
+        w_ = human_when(ts)
+        if w_:
+            bits.append(w_)
+        meta = QLabel(" · ".join(bits))
+        meta.setObjectName("chip")
+        meta.setWordWrap(True)
+        info.addWidget(meta)
+        src = QLabel(origin)
+        src.setObjectName("filesrc")
+        info.addWidget(src)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.setContentsMargins(0, 6, 0, 0)
+        open_b = QPushButton("افتح")
+        open_b.setObjectName("openbtn")
+        open_b.setCursor(Qt.PointingHandCursor)
+        open_b.setToolTip("معاينة الملف")
+        open_b.clicked.connect(lambda _=False, ee=e: self.preview_entry(ee))
+        more = QToolButton()
+        more.setObjectName("morebtn")
+        more.setText("المزيد  ˅")
+        more.setCursor(Qt.PointingHandCursor)
+        more.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(more)
+        menu.setLayoutDirection(Qt.RightToLeft)
+        for text, fn in (("فتح بالبرنامج المناسب", self.open_entry), ("إظهار في المجلد", self.folder_entry), ("حفظ نسخة…", self.save_entry), ("نسخ المسار", self.copy_entry_path)):
+            menu.addAction(text, lambda f=fn, ee=e: f(ee))
+        more.setMenu(menu)
+        row.addWidget(open_b)
+        row.addWidget(more)
+        row.addStretch(1)
+        info.addLayout(row)
+        h.addLayout(info, 1)
+        return card
+
+    def copy_entry_path(self, e):
+        try:
+            p = self.entry_path(e)
+        except Exception as ex:
+            QMessageBox.warning(self, "5belan", "تعذّر تجهيز الملف: %s" % ex)
+            return
+        if p:
+            self._copy(p)
 
     def _bot_assets(self, e):
         m = self.current["msgs"][e["mi"]]
@@ -13350,24 +13531,34 @@ class App(QMainWindow):
             box = QFrame()
             box.setObjectName("chipbox")
             h = QHBoxLayout(box)
-            h.setContentsMargins(6, 4, 6, 4)
-            h.setSpacing(6)
-            if os.path.splitext(p)[1].lower() in IMAGE_MIME:
-                pm = QPixmap(p)
-                if not pm.isNull():
-                    th = QLabel()
-                    th.setPixmap(pm.scaled(36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                    h.addWidget(th)
-            else:
-                h.addWidget(QLabel("ملف"))
+            h.setContentsMargins(6, 6, 8, 6)
+            h.setSpacing(8)
             nm = os.path.basename(p)
-            lab = QLabel(nm if len(nm) <= 24 else nm[:21] + "...")
+            tile = QLabel()
+            tile.setFixedSize(34, 34)
+            tile.setPixmap(file_tile(nm, 34, p))
+            h.addWidget(tile)
+            col = QVBoxLayout()
+            col.setSpacing(0)
+            lab = QLabel(QFontMetrics(self.font()).elidedText(nm, Qt.ElideMiddle, 150))
             lab.setLayoutDirection(Qt.LeftToRight)
+            lab.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             lab.setToolTip(p)
-            h.addWidget(lab)
+            col.addWidget(lab)
+            try:
+                sz = human_size(os.path.getsize(p))
+            except OSError:
+                sz = ""
+            sub = QLabel(" · ".join(x for x in (file_kind(nm)[1], sz) if x))
+            sub.setObjectName("chip")
+            col.addWidget(sub)
+            h.addLayout(col)
             x = QToolButton()
-            x.setText("إزالة")
-            x.setObjectName("flat")
+            x.setText("×")
+            x.setObjectName("chipx")
+            x.setToolTip("شيل هذا المرفق")
+            x.setCursor(Qt.PointingHandCursor)
+            x.setFixedSize(22, 22)
             x.clicked.connect(lambda _=False, pp=p: self.remove_attachment(pp))
             h.addWidget(x)
             self.chips_layout.addWidget(box)
