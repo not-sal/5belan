@@ -320,7 +320,7 @@ def setup_crash_tools():
         try:
             text = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
             with open(os.path.join(BASE_DIR, "error.log"), "a", encoding="utf-8") as f:
-                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " (thread)\n" + text + "\n")
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " v%s (thread)\n" % APP_VERSION + text + "\n")
         except Exception:
             pass
 
@@ -3317,7 +3317,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.31.1"
+APP_VERSION = "2.31.2"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5501,6 +5501,49 @@ def undo_label(e):
     return "%s   %s" % (when, txt)
 
 
+_LOG_HEAD_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(.*)$")
+
+
+def _report_errors():
+    """The errors of THIS version only (each entry carries the version since 2.31.2); older ones are only mentioned, so a report
+    never shows a bug that a later version already fixed as if it were new."""
+    try:
+        with open(ERROR_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            txt = f.read()[-60000:]
+    except Exception:
+        return "(no error.log)"
+    entries, cur = [], None
+    for ln in txt.splitlines():
+        mt = _LOG_HEAD_RE.match(ln)
+        if mt:
+            cur = [mt.group(1), mt.group(2), []]
+            entries.append(cur)
+        elif cur is not None:
+            cur[2].append(ln)
+    mine = [e for e in entries if ("v%s" % APP_VERSION) in e[1].split()]
+    if mine:
+        return "\n\n".join("%s%s\n%s" % (e[0], e[1], "\n".join(e[2]).strip()) for e in mine)[-3500:]
+    out = "(ما فيه أخطاء مسجّلة من هذا الإصدار %s)" % APP_VERSION
+    if entries:
+        out += "\nآخر خطأ قديم: %s (من إصدار أقدم، غالباً انحل)" % entries[-1][0]
+    return out
+
+
+def _report_native_crash():
+    """The last native crash trace that faulthandler wrote to crash.log (the program died inside Qt/Windows), if any."""
+    try:
+        with open(CRASH_LOG, "r", encoding="utf-8", errors="replace") as f:
+            txt = f.read()[-40000:]
+    except Exception:
+        return ""
+    blocks = txt.split("=== start ")
+    for b in reversed(blocks):
+        if "Fatal Python error" in b or "Windows fatal exception" in b or "Current thread" in b:
+            ls = [x for x in b.splitlines() if x.strip()]
+            return "=== start " + "\n".join(ls[:45])
+    return ""
+
+
 def build_problem_report(tb=""):
     import platform
 
@@ -5512,12 +5555,11 @@ def build_problem_report(tb=""):
     except Exception:
         pass
     if not tb:
-        try:
-            with open(ERROR_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-                tb = f.read()[-3500:]
-        except Exception:
-            tb = "(no error.log)"
+        tb = _report_errors()
     lines += ["", "--- error ---", tb.strip() or "(none)"]
+    crash = _report_native_crash()
+    if crash:
+        lines += ["", "--- native crash (crash.log) ---", crash]
     try:
         with open(EVENTS_LOG, "r", encoding="utf-8", errors="replace") as f:
             lines += ["", "--- last events ---"] + f.read().splitlines()[-25:]
@@ -14668,7 +14710,7 @@ def main():
         text = "".join(traceback.format_exception(exc_type, exc, tb))
         try:
             with open(os.path.join(BASE_DIR, "error.log"), "a", encoding="utf-8") as f:
-                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + text + "\n")
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " v%s\n" % APP_VERSION + text + "\n")
         except Exception:
             pass
         try:
