@@ -11914,8 +11914,9 @@ class App(QMainWindow):
         """Run a command block from a reply on this computer, after asking and after the OS-protection check."""
         self.run_code(self.copy_store.get(cid, ""), py)
 
-    def terminal_snippet(self, cid):
-        """The «بالطرفية» button under a command block: open the user's own terminal and run it there (pressing it is the approval)."""
+    def terminal_snippet(self, cid, admin=False):
+        """The «بالطرفية» / «كمدير» buttons under a command block: open the user's own terminal and run it there (pressing is the approval).
+        admin=True opens it elevated, and the operating system itself asks the user to allow it."""
         code = strip_prompts(self.copy_store.get(cid, ""))
         if not code.strip():
             return
@@ -11923,9 +11924,6 @@ class App(QMainWindow):
         if danger:
             QMessageBox.warning(self, "5belan", "رفضت تشغيله: %s.\nالبرنامج ما يلمس ملفات النظام أبداً." % danger)
             return
-        admin = False
-        if QApplication.keyboardModifiers() & Qt.ShiftModifier:  # Shift+click asks the OS to open it as administrator/root
-            admin = True
         cwd = None
         for d in (self.writable_dirs or []) + (self.allowed_dirs or []):
             if os.path.isdir(d):
@@ -12653,8 +12651,13 @@ class App(QMainWindow):
             c.insertText("      ", h)
             rt = QTextCharFormat(a)
             rt.setAnchorHref("term:" + cid)
-            rt.setToolTip("يفتح %s ويشغّل الأمر فيه (Shift+ضغط = كمدير، والنظام يستأذنك)" % TERM_NAME)
+            rt.setToolTip("يفتح %s ويشغّل الأمر فيه" % TERM_NAME)
             c.insertText("بالطرفية", rt)
+            c.insertText("      ", h)
+            ra = QTextCharFormat(a)
+            ra.setAnchorHref("termadmin:" + cid)
+            ra.setToolTip("يفتح %s كمدير ويشغّل الأمر فيه (النظام نفسه يستأذنك)" % TERM_NAME)
+            c.insertText("كمدير", ra)
         elif fam:
             c.insertText("      (أمر لنظام آخر — انسخه فقط)", h)
         cf = QTextCharFormat()
@@ -12888,6 +12891,9 @@ class App(QMainWindow):
             return
         if s.startswith("term:"):
             self.terminal_snippet(s[5:])
+            return
+        if s.startswith("termadmin:"):
+            self.terminal_snippet(s[len("termadmin:"):], admin=True)
             return
         if s.startswith("canvas:"):
             _cid, _, lg_ = s[7:].rpartition(":")
