@@ -4130,7 +4130,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.34.1"
+APP_VERSION = "2.34.2"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4456,6 +4456,36 @@ class PasteEdit(QPlainTextEdit):
     text_requested = Signal(str)      # long pasted text
 
     LONG_TEXT = 6000
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self._fixing = False
+        self.textChanged.connect(self.fix_direction)
+        self.fix_direction()
+
+    def fix_direction(self):
+        """The box sits on the side of its first letter: Arabic (or nothing typed yet) on the right, English on the left.
+        QPlainTextEdit ignores per-paragraph alignment, so this is one setting for the whole box; Qt's automatic direction
+        orders the words but keeps the text on the left whatever the language."""
+        if self._fixing:
+            return
+        self._fixing = True
+        try:
+            arabic = True  # empty or only digits/punctuation: the interface is Arabic, so the right side
+            for ch in self.toPlainText():
+                if "֐" <= ch <= "ࣿ" or "יִ" <= ch <= "﷿" or "ﹰ" <= ch <= "﻿":
+                    break
+                if ch.isalpha():
+                    arabic = False
+                    break
+            want = (Qt.AlignRight if arabic else Qt.AlignLeft) | Qt.AlignAbsolute
+            doc = self.document()
+            opt = QTextOption(doc.defaultTextOption())
+            if opt.alignment() != want:
+                opt.setAlignment(want)
+                doc.setDefaultTextOption(opt)
+        finally:
+            self._fixing = False
 
     def canInsertFromMimeData(self, source):
         return source.hasImage() or source.hasUrls() or super().canInsertFromMimeData(source)
@@ -10753,6 +10783,7 @@ class App(QMainWindow):
         self.inp.setFixedHeight(46)
         self.inp.setLayoutDirection(Qt.RightToLeft)
         self.inp.document().setDefaultTextOption(auto_direction_option())  # Arabic starts from the right, English from the left
+        self.inp.fix_direction()  # the line above reset the alignment: an empty box starts on the right
         self.inp.installEventFilter(self)
         self.inp.textChanged.connect(self.grow_input)
         self.inp.textChanged.connect(lambda: QTimer.singleShot(0, self._room_slash_hint) if self.inp.toPlainText() == "/" else None)
