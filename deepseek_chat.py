@@ -4130,7 +4130,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.34.0"
+APP_VERSION = "2.34.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -10973,16 +10973,37 @@ class App(QMainWindow):
             sel = sel[:1500] + "…"
         pts = self.view.selection_points()
         q = next((x for x in self.quotes if x["q"] == sel), None)
-        if q is None:
-            q = {"q": sel, "c": ""}
-            self.quotes.append(q)
-        self.view.clear_selection()
-        self.refresh_quotes()
-        if pts is not None and id(q) not in self._quote_cards:
-            self.add_quote_card(q, pts[0], pts[1])
-            self._quote_cards[id(q)]["edit"].setFocus()
-        else:
+        if q is not None:  # already attached: just open it for editing
+            self.view.clear_selection()
+            self.refresh_quotes()
             self.inp.setFocus()
+            return
+        q = {"q": sel, "c": ""}
+        self.view.clear_selection()
+        if pts is None:  # no visual selection (select-all): nothing to anchor a card to, attach it straight away
+            self.quotes.append(q)
+            self.refresh_quotes()
+            self.inp.setFocus()
+            return
+        self.add_quote_card(q, pts[0], pts[1])
+        self._quote_cards[id(q)]["edit"].setFocus()
+
+    def commit_quote(self, q):
+        """The «أضف للرسالة» button of the card: the quote (with its comment) moves down next to the message box."""
+        if q not in self.quotes:
+            self.quotes.append(q)
+        self.drop_quote_card(q)
+        self.refresh_quotes()
+        self.inp.setFocus()
+
+    def drop_quote_card(self, q):
+        rec = self._quote_cards.pop(id(q), None)
+        if rec is not None:
+            rec["frame"].hide()
+            rec["frame"].setParent(None)
+            rec["frame"].deleteLater()
+        self.view.marks = [m for m in self.view.marks if m["q"] is not q]
+        self.view.viewport().update()
 
     def add_quote_card(self, q, a, b):
         """The quote card sits right over the text that was shaded (it replaces the «رد على المحدد» button) with a line for your comment."""
@@ -11000,7 +11021,7 @@ class App(QMainWindow):
         x.setObjectName("flat")
         x.setCursor(Qt.PointingHandCursor)
         x.setToolTip("إلغاء الاقتباس")
-        x.clicked.connect(lambda _=False, qq=q: self.remove_quote(qq))
+        x.clicked.connect(lambda _=False, qq=q: (self.drop_quote_card(qq), self.remove_quote(qq)))
         top.addWidget(x)
         v.addLayout(top)
         t = q["q"].replace("\n", " ").strip()
@@ -11008,10 +11029,16 @@ class App(QMainWindow):
         body.setWordWrap(True)
         v.addWidget(body)
         ed = QLineEdit(q.get("c", ""))
-        ed.setPlaceholderText("ردّك على هذا الجزء (اختياري)، وبعدها اكتب رسالتك واضغط إرسال")
+        ed.setPlaceholderText("ردّك على هذا الجزء (اختياري)…")
         ed.textChanged.connect(lambda t_, qq=q: qq.__setitem__("c", t_))
-        ed.returnPressed.connect(lambda: self.inp.setFocus())
+        ed.returnPressed.connect(lambda qq=q: self.commit_quote(qq))
         v.addWidget(ed)
+        add_b = QPushButton("أضف الاقتباس للرسالة")
+        add_b.setObjectName("banner")
+        add_b.setCursor(Qt.PointingHandCursor)
+        add_b.setToolTip("ينضاف الاقتباس (مع تعليقك) تحت عند بوكس الكتابة، وتكمل رسالتك وترسل")
+        add_b.clicked.connect(lambda _=False, qq=q: self.commit_quote(qq))
+        v.addWidget(add_b)
         fr.setFixedWidth(min(430, max(240, self.view.viewport().width() - 24)))
         fr.adjustSize()
         fr.show()
@@ -11066,7 +11093,6 @@ class App(QMainWindow):
 
     def refresh_quotes(self):
         """Each quoted part is a small chip above the input; hover shows it, click opens a mini card with the comment box."""
-        self.clear_quote_cards(self.quotes)
         while self.quotes_layout.count():
             it = self.quotes_layout.takeAt(0)
             w = it.widget()
