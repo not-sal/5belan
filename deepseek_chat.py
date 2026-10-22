@@ -407,6 +407,170 @@ def read_document(path):
     return text
 
 
+# ---------------------------------------------------------------- any file for the room: archives are opened, binaries described
+ARCHIVE_EXTS = (".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".tbz2", ".txz", ".cab", ".iso", ".jar", ".apk")
+EXTRACT_MAX_FILES = 600
+EXTRACT_MAX_BYTES = 400 * 1024 * 1024
+
+
+def _inside(dest, target):
+    d, t = os.path.abspath(dest), os.path.abspath(target)
+    return t == d or t.startswith(d + os.sep)
+
+
+def _tool(names, extra_paths=()):
+    for n in names:
+        w = shutil.which(n)
+        if w:
+            return w
+    for pth in extra_paths:
+        if os.path.isfile(pth):
+            return pth
+    return None
+
+
+def _run_hidden(cmd, timeout=240):
+    kw = {"creationflags": 0x08000000} if IS_WIN else {}
+    return subprocess.run(cmd, capture_output=True, timeout=timeout, **kw)
+
+
+def extract_archive(path, dest):
+    """Unpack an archive into dest. zip/tar/gz with Python itself (paths are checked so nothing lands outside dest);
+    rar, 7z and the rest with 7-Zip, UnRAR/WinRAR or the system tar, whichever is installed."""
+    low = path.lower()
+    count = [0, 0]
+
+    def room(size):
+        count[0] += 1
+        count[1] += size
+        if count[0] > EXTRACT_MAX_FILES:
+            raise RuntimeError("الملف المضغوط فيه ملفات كثيرة (الحد %d)" % EXTRACT_MAX_FILES)
+        if count[1] > EXTRACT_MAX_BYTES:
+            raise RuntimeError("حجمه بعد الفك كبير (الحد %d ميغا)" % (EXTRACT_MAX_BYTES // 1048576))
+
+    if low.endswith(".zip") or (zipfile.is_zipfile(path) and not low.endswith((".apk", ".jar"))):
+        try:
+            with zipfile.ZipFile(path) as z:
+                for info in z.infolist():
+                    if info.is_dir():
+                        continue
+                    room(info.file_size)
+                    target = os.path.normpath(os.path.join(dest, info.filename))
+                    if not _inside(dest, target):
+                        continue
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with z.open(info) as src, open(target, "wb") as out:
+                        shutil.copyfileobj(src, out)
+            return
+        except RuntimeError as e:
+            if "password" in str(e).lower() or "encrypted" in str(e).lower():
+                raise RuntimeError("الملف المضغوط محمي بكلمة سر")
+            raise
+        except zipfile.BadZipFile:
+            pass  # not really a zip: try the tools below
+    import tarfile
+    if low.endswith((".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")) and tarfile.is_tarfile(path):
+        with tarfile.open(path) as tf:
+            for m in tf:
+                if not m.isfile():
+                    continue
+                room(m.size)
+                target = os.path.normpath(os.path.join(dest, m.name))
+                if not _inside(dest, target):
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with tf.extractfile(m) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+        return
+    if low.endswith(".gz"):
+        import gzip
+        with gzip.open(path, "rb") as src, open(os.path.join(dest, os.path.basename(path)[:-3] or "file"), "wb") as out:
+            shutil.copyfileobj(src, out, 1024 * 1024)
+        return
+    pf = [os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")]
+    z7 = _tool(["7z", "7za", "7zz"], [os.path.join(b, "7-Zip", "7z.exe") for b in pf])
+    unrar = _tool(["unrar", "UnRAR"], [os.path.join(b, "WinRAR", "UnRAR.exe") for b in pf])
+    bsd = _tool([], [os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "tar.exe")]) if IS_WIN else None
+    cmds = []
+    if z7:
+        cmds.append([z7, "x", "-y", "-bso0", "-bsp0", "-o" + dest, path])
+    if unrar and low.endswith(".rar"):
+        cmds.append([unrar, "x", "-y", "-idq", path, dest + os.sep])
+    if bsd:
+        cmds.append([bsd, "-xf", path, "-C", dest])
+    if not cmds and not IS_WIN and shutil.which("bsdtar"):
+        cmds.append(["bsdtar", "-xf", path, "-C", dest])
+    if not cmds:
+        raise RuntimeError("ما لقيت برنامج يفك هذا النوع (ثبّت 7-Zip أو WinRAR)")
+    last = ""
+    for c in cmds:
+        try:
+            r = _run_hidden(c)
+        except Exception as e:
+            last = str(e)
+            continue
+        got = [os.path.join(rt, f) for rt, _d, fs in os.walk(dest) for f in fs]
+        if got:
+            if len(got) > EXTRACT_MAX_FILES or sum(os.path.getsize(g) for g in got) > EXTRACT_MAX_BYTES:
+                raise RuntimeError("الملف المضغوط كبير بعد الفك (الحد %d ملف و%d ميغا)" % (EXTRACT_MAX_FILES, EXTRACT_MAX_BYTES // 1048576))
+            return
+        last = (r.stderr or r.stdout or b"").decode("utf-8", "replace")[:120]
+    raise RuntimeError("ما قدرت أفكه%s" % ((": " + last.strip()) if last.strip() else " (ممكن محمي بكلمة سر أو تالف)"))
+
+
+def read_archive(path, total_chars=280000, per_file=30000):
+    """An archive as text for the model: what is inside (names and sizes), then the text of every readable file in it."""
+    tmp = tempfile.mkdtemp(prefix="belan_arc_")
+    try:
+        extract_archive(path, tmp)
+        files = []
+        for root, _d, fns in os.walk(tmp):
+            for fn in fns:
+                fp = os.path.join(root, fn)
+                files.append((os.path.relpath(fp, tmp).replace("\\", "/"), os.path.getsize(fp), fp))
+        files.sort(key=lambda x: x[0].lower())
+        out = ["[ملف مضغوط: %s — %d ملف، %s]" % (os.path.basename(path), len(files), human_size(sum(f[1] for f in files))), "المحتويات:"]
+        for rel, sz, _fp in files[:300]:
+            out.append("- %s (%s)" % (rel, human_size(sz)))
+        if len(files) > 300:
+            out.append("... و%d ملف ثاني ما انذكر" % (len(files) - 300))
+        budget = total_chars - sum(len(x) for x in out)
+        unread = []
+        for rel, sz, fp in files:
+            ext = os.path.splitext(rel)[1].lower()
+            if ext in IMAGE_MIME or ext in ARCHIVE_EXTS or sz > 30 * 1048576:
+                unread.append(rel)
+                continue
+            if budget < 600:
+                unread.append(rel)
+                continue
+            try:
+                txt = read_document(fp).strip()
+            except Exception:
+                unread.append(rel)
+                continue
+            if not txt:
+                continue
+            txt = txt[:max(200, min(per_file, budget - 100))]
+            out.append("\n=== %s ===\n%s" % (rel, txt))
+            budget -= len(txt) + len(rel) + 12
+        if unread:
+            out.append("\n(ما انقرأ محتواها كنص: %s%s)" % ("، ".join(unread[:25]), " ..." if len(unread) > 25 else ""))
+        return "\n".join(out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def describe_binary(path):
+    """A file that is not text or a document: the model still gets its name, size and the readable strings found inside."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        data = f.read(2 * 1048576)
+    runs = re.findall(rb"[\x20-\x7e]{6,}", data)[:60]
+    strs = "\n".join(r.decode("ascii", "replace")[:120] for r in runs)[:3000]
+    return "[ملف ثنائي: %s (%s). ما أقدر أقرأ محتواه كنص%s]" % (os.path.basename(path), human_size(size), ("، هذي أول النصوص اللي لقيتها فيه:\n" + strs) if strs else "")
+
+
 # ---------------------------------------------------------------- browser (PDF / SVG -> PNG)
 def find_browser():
     cands = []
@@ -4130,7 +4294,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.34.2"
+APP_VERSION = "2.35.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -8369,7 +8533,16 @@ class RoomDialog(QDialog):
         self._add_paths(paths)
 
     def _add_paths(self, paths):
-        """Files and pictures can be added at any moment, even while the members are talking: they see them from their next turn."""
+        QApplication.setOverrideCursor(Qt.WaitCursor)  # opening a big archive can take a moment
+        try:
+            self._add_paths_now(paths)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _add_paths_now(self, paths):
+        """Files and pictures can be added at any moment, even while the members are talking: they see them from their next turn.
+        Any file works: documents and text are read, archives (zip, rar, 7z, tar, gz...) are opened and their readable files read,
+        pictures go to the members that can see them, and anything else is described to them (name, size, readable strings)."""
         boss = room_boss(self.room) is not None
         have = {f["name"] for f in self.room["files"]}
         bad, added = [], []
@@ -8391,10 +8564,18 @@ class RoomDialog(QDialog):
                     shutil.copy2(p, dest)
                     rec["image"] = True
                     rec["path"] = dest
+                elif ext in ARCHIVE_EXTS:
+                    rec["text"] = read_archive(p)[:300000]
+                    rec["archive"] = True
                 else:
-                    rec["text"] = read_document(p)[:300000]
+                    try:
+                        rec["text"] = read_document(p)[:300000]
+                    except RuntimeError as e:
+                        if "binary" not in str(e).lower():
+                            raise
+                        rec["text"] = describe_binary(p)  # any file is accepted
             except Exception as e:
-                bad.append("%s (%s)" % (os.path.basename(p), str(e)[:60]))
+                bad.append("%s (%s)" % (os.path.basename(p), str(e)[:90]))
                 continue
             have.add(name)
             self.room["files"].append(rec)
