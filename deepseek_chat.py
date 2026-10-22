@@ -943,6 +943,8 @@ def strip_for_save(msg):
         out["sugg"] = msg["sugg"][:3]
     if msg.get("skill_offer"):
         out["skill_offer"] = msg["skill_offer"]
+    if msg.get("resume_digest"):
+        out["resume_digest"] = str(msg["resume_digest"])[:9000]
     if msg.get("activity"):
         # keep the file small: only the last steps, each shortened (full logs were making chats.json huge)
         out["activity"] = [dict(s, text=str(s.get("text", ""))[:3000], **({"diff": str(s["diff"])[:6000]} if s.get("diff") else {}))
@@ -1561,7 +1563,7 @@ def tools_prompt(runner):
             "PYTHON: run_python runs Python code on the user's computer (a code interpreter) in this chat's work folder: " + runner.work_dir + ". "
             "Use it whenever a calculation, data analysis, chart, image, spreadsheet, document or file conversion is better done by running code than by guessing. "
             "print() what you need to see; save every result file (charts with matplotlib plt.savefig, tables, .xlsx, .docx, .csv...) in the current folder with a relative name - "
-            "the user then finds it in the chat attachments. If a library is missing call pip_install once, then run again. If the code fails, read the error, fix it and run again "
+            "files written there are scratch and stay hidden: the user sees a file in the chat attachments ONLY when your reply names it by file name, so name the files they asked for (or that you want them to look at) in your final reply, and never name scratch files. If a library is missing call pip_install once, then run again. If the code fails, read the error, fix it and run again "
             "(at most 3 tries, then explain). Never use input(), never plt.show(), never touch system files. Tell the user briefly what the result is."
         )
     if runner.allow_computer:
@@ -2437,6 +2439,34 @@ NOTES_TOOLS = [
 ]
 
 
+def interrupt_digest(steps, partial=""):
+    """What the model is told when the user cut in while it was working (the user never sees this text): everything it had done."""
+    tools = [x for x in steps if x.get("k") == "tool"]
+    lines = ["[SYSTEM NOTE, not written by the user: the user sent a new message while you were still working on your previous reply, so it was "
+             "stopped here. First go through EVERYTHING you had already done (%d operations, listed below, oldest first), then read the user's next "
+             "message, adapt to it and continue from where you stopped. Do NOT redo finished operations and do NOT mention this note." % len(tools)]
+    for x in tools[-60:]:
+        t = " ".join(str(x.get("text", "")).split())[:170]
+        lines.append("- " + ("FAILED: " if not x.get("ok", True) else "") + t)
+    if len(tools) > 60:
+        lines.insert(1, "(%d older operations not listed)" % (len(tools) - 60))
+    if partial.strip():
+        lines.append("What you had written so far in this reply:\n" + partial.strip()[-1500:])
+    lines.append("]")
+    return "\n".join(lines)
+
+
+def clean_todos(items):
+    """The todo list the model sent, reduced to [{content, status}] (also used to show it while the reply is still streaming)."""
+    clean = []
+    for it in (items if isinstance(items, list) else [])[:40]:
+        if not isinstance(it, dict) or not str(it.get("content") or "").strip():
+            continue
+        st = it.get("status") if it.get("status") in ("pending", "in_progress", "completed") else "pending"
+        clean.append({"content": str(it["content"]).strip()[:200], "status": st})
+    return clean
+
+
 class ToolRunner:
     """Runs the file tools. Reading is limited to roots; writing is limited to writable (a subset of roots)."""
 
@@ -2679,12 +2709,7 @@ class ToolRunner:
         items = a.get("todos")
         if not isinstance(items, list):
             raise ToolError("todos must be a list of {content, status}")
-        clean = []
-        for it in items[:40]:
-            if not isinstance(it, dict) or not str(it.get("content") or "").strip():
-                continue
-            st = it.get("status") if it.get("status") in ("pending", "in_progress", "completed") else "pending"
-            clean.append({"content": str(it["content"]).strip()[:200], "status": st})
+        clean = clean_todos(items)
         self.todo(clean)
         done = sum(1 for x in clean if x["status"] == "completed")
         cur = next((x["content"] for x in clean if x["status"] == "in_progress"), "")
@@ -4105,7 +4130,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.33.0"
+APP_VERSION = "2.34.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/saleh9688/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -4466,6 +4491,8 @@ class ChatView(QTextBrowser):
     def __init__(self, *a):
         super().__init__(*a)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.marks = []         # parts chosen for «رد على المحدد»: [{a, b, q}] (document points), shaded until sent
+        self.installEventFilter(self)  # QAbstractScrollArea ignores mouse/wheel events that land on its side margins; take them here
         self._a = None          # selection start / end as document points
         self._b = None
         self._press = None
@@ -4512,6 +4539,46 @@ class ChatView(QTextBrowser):
         cb = getattr(self, "on_resized", None)
         if cb:
             cb()
+
+    def eventFilter(self, obj, ev):
+        if obj is self:
+            t = ev.type()
+            if t == QEvent.Wheel:
+                self.wheelEvent(ev)
+                return True
+            if t == QEvent.MouseButtonPress:
+                self.mousePressEvent(ev)
+                return True
+            if t == QEvent.MouseMove:
+                self.mouseMoveEvent(ev)
+                return True
+            if t == QEvent.MouseButtonRelease:
+                self.mouseReleaseEvent(ev)
+                return True
+            if t == QEvent.MouseButtonDblClick:
+                self.mouseDoubleClickEvent(ev)
+                return True
+        return super().eventFilter(obj, ev)
+
+    def viewportEvent(self, e):
+        self._in_vp = True
+        try:
+            return super().viewportEvent(e)
+        finally:
+            self._in_vp = False
+
+    def _pt(self, e):
+        """Mouse position in viewport coordinates, also for events that land on the side margins (those use the widget's own coordinates)."""
+        p = e.position().toPoint()
+        return p if getattr(self, "_in_vp", False) else self.viewport().mapFrom(self, p)
+
+    def wheelEvent(self, e):
+        if e.modifiers() & Qt.ControlModifier:
+            return super().wheelEvent(e)
+        sb = self.verticalScrollBar()
+        px = e.pixelDelta().y()
+        sb.setValue(sb.value() - (px if px else int(e.angleDelta().y() / 120.0 * sb.singleStep() * 3)))
+        e.accept()
 
     # ----- coordinates
     def _to_doc(self, p):
@@ -4579,11 +4646,12 @@ class ChatView(QTextBrowser):
         xs = [line.cursorToX(a + i)[0] for i in range(0, n + 1)]
         return min(xs), max(xs)
 
-    def _ordered(self):
-        """Selected lines as [(block, layout, line, x0, x1, rtl)], x in document coordinates."""
-        if self._a is None or self._b is None:
+    def _ordered(self, pa=None, pb=None):
+        """Selected lines as [(block, layout, line, x0, x1, rtl)], x in document coordinates (of the selection, or of the points given)."""
+        sa, sb_ = (self._a, self._b) if pa is None else (pa, pb)
+        if sa is None or sb_ is None:
             return []
-        la, lb = self._line_at(self._a), self._line_at(self._b)
+        la, lb = self._line_at(sa), self._line_at(sb_)
         if not la or not lb:
             return []
 
@@ -4591,7 +4659,7 @@ class ChatView(QTextBrowser):
             blk, tl, i = t
             return (blk.position(), i)
 
-        a_pt, b_pt = self._a, self._b
+        a_pt, b_pt = sa, sb_
         if key(la) > key(lb) or (key(la) == key(lb) and False):
             la, lb = lb, la
             a_pt, b_pt = b_pt, a_pt
@@ -4732,14 +4800,18 @@ class ChatView(QTextBrowser):
     def has_selection(self):
         return self.has_visual_selection() or self.textCursor().hasSelection()
 
+    def selection_points(self):
+        """The two document points of the visual selection (copies), or None."""
+        if self.has_visual_selection():
+            return QPointF(self._a), QPointF(self._b)
+        return None
+
     def clear_selection(self):
         changed = self._a is not None or self.textCursor().hasSelection()
         self._a = self._b = None
         self._force = False
         self._word = None
-        c = self.textCursor()
-        c.clearSelection()
-        self.setTextCursor(c)
+        self.drop_native_selection()
         self.viewport().update()
         if changed:
             self.selection_changed.emit()
@@ -4834,12 +4906,24 @@ class ChatView(QTextBrowser):
     def paintEvent(self, e):
         self._paint_boxes()
         super().paintEvent(e)
-        if not self.has_visual_selection():
+        marks = getattr(self, "marks", None) or []
+        if not self.has_visual_selection() and not marks:
             return
         p = QPainter(self.viewport())
         try:
             dx, dy = self.horizontalScrollBar().value(), self.verticalScrollBar().value()
             vh = self.viewport().height()
+            mc = QColor(self.sel_color)
+            mc.setAlpha(max(40, mc.alpha() - 25))
+            for mk in marks:  # parts already chosen for «رد على المحدد» stay shaded until the message is sent
+                for blk, tl, line, x0, x1 in self._ordered(mk["a"], mk["b"]):
+                    r = line.rect()
+                    top = self._origin(blk, tl).y() + r.top() - dy
+                    if top > vh or top + r.height() < 0:
+                        continue
+                    p.fillRect(QRectF(x0 - dx, top, max(2.0, x1 - x0), r.height()), mc)
+            if not self.has_visual_selection():
+                return
             for blk, tl, line, x0, x1 in self._ordered():
                 r = line.rect()
                 top = self._origin(blk, tl).y() + r.top() - dy
@@ -4853,7 +4937,7 @@ class ChatView(QTextBrowser):
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton:
             return super().mousePressEvent(e)
-        pos = e.position().toPoint()
+        pos = self._pt(e)
         self._press = pos
         self._drag = False
         self._on_link = bool(self.anchorAt(pos))
@@ -4889,7 +4973,7 @@ class ChatView(QTextBrowser):
     def mouseDoubleClickEvent(self, e):
         if e.button() != Qt.LeftButton:
             return super().mouseDoubleClickEvent(e)
-        pos = e.position().toPoint()
+        pos = self._pt(e)
         if self.anchorAt(pos):
             return super().mouseDoubleClickEvent(e)
         w = self._word_at(self._to_doc(pos))
@@ -4907,7 +4991,7 @@ class ChatView(QTextBrowser):
         self.selection_changed.emit()
 
     def mouseMoveEvent(self, e):
-        pos = e.position().toPoint()
+        pos = self._pt(e)
         if (e.buttons() & Qt.LeftButton) and self._press is not None and not self._on_link:
             if not self._drag and (pos - self._press).manhattanLength() < 4:
                 return
@@ -10286,6 +10370,7 @@ class App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.runs = {}  # chat id -> Run, for every chat that is answering right now
+        self._quote_cards = {}  # id(quote) -> {frame, edit, a, b}: the cards shown over the shaded text
         self.room_thinking = {}  # room id -> name of the member who is thinking right now
         self.room_bg = None  # the room panel parked (hidden) while its talk keeps running after the panel was closed
         self.setWindowTitle("5belan")
@@ -10608,7 +10693,15 @@ class App(QMainWindow):
         tbl.addWidget(self.todo_body)
         self.todo_bar.setVisible(False)
         self._todo_open = False
-        ml.addWidget(self.todo_bar)
+        self.todo_bar.setMaximumWidth(1500)
+        self.todo_wrap = QWidget()  # same margins and width rules as the message box below it, so the two line up
+        twl = QHBoxLayout(self.todo_wrap)
+        twl.setContentsMargins(14, 2, 14, 2)
+        twl.addStretch(1)
+        twl.addWidget(self.todo_bar, 100)
+        twl.addStretch(1)
+        self.todo_wrap.setVisible(False)
+        ml.addWidget(self.todo_wrap)
 
         self.reply_btn = QPushButton("رد على المحدد", self.view.viewport())  # floats over the selected text
         self.reply_btn.setObjectName("banner")
@@ -10617,7 +10710,7 @@ class App(QMainWindow):
         self.reply_btn.setCursor(Qt.PointingHandCursor)
         self.reply_btn.clicked.connect(self.add_quote_from_selection)
         self.reply_btn.setVisible(False)
-        self.view.verticalScrollBar().valueChanged.connect(lambda _v: self.place_reply_btn())
+        self.view.verticalScrollBar().valueChanged.connect(lambda _v: (self.place_reply_btn(), self.place_quote_cards()))
 
         # ---------- composer (rounded box like the Claude app) ----------
         wrap = QWidget()
@@ -10659,7 +10752,7 @@ class App(QMainWindow):
         self.inp.setFont(QFont(FONT["family"], TEXT_FONT_SIZE))
         self.inp.setFixedHeight(46)
         self.inp.setLayoutDirection(Qt.RightToLeft)
-        self.inp.document().setDefaultTextOption(rtl_direction_option())  # typing always starts from the right
+        self.inp.document().setDefaultTextOption(auto_direction_option())  # Arabic starts from the right, English from the left
         self.inp.installEventFilter(self)
         self.inp.textChanged.connect(self.grow_input)
         self.inp.textChanged.connect(lambda: QTimer.singleShot(0, self._room_slash_hint) if self.inp.toPlainText() == "/" else None)
@@ -10878,14 +10971,102 @@ class App(QMainWindow):
             return
         if len(sel) > 1500:
             sel = sel[:1500] + "…"
-        if not any(q["q"] == sel for q in self.quotes):
-            self.quotes.append({"q": sel, "c": ""})
+        pts = self.view.selection_points()
+        q = next((x for x in self.quotes if x["q"] == sel), None)
+        if q is None:
+            q = {"q": sel, "c": ""}
+            self.quotes.append(q)
         self.view.clear_selection()
         self.refresh_quotes()
-        self.inp.setFocus()
+        if pts is not None and id(q) not in self._quote_cards:
+            self.add_quote_card(q, pts[0], pts[1])
+            self._quote_cards[id(q)]["edit"].setFocus()
+        else:
+            self.inp.setFocus()
+
+    def add_quote_card(self, q, a, b):
+        """The quote card sits right over the text that was shaded (it replaces the «رد على المحدد» button) with a line for your comment."""
+        fr = QFrame(self.view.viewport())
+        fr.setObjectName("quotecard")
+        v = QVBoxLayout(fr)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(6)
+        top = QHBoxLayout()
+        head = QLabel("ردّك على هذا الجزء")
+        head.setObjectName("chip")
+        top.addWidget(head, 1)
+        x = QToolButton()
+        x.setText("×")
+        x.setObjectName("flat")
+        x.setCursor(Qt.PointingHandCursor)
+        x.setToolTip("إلغاء الاقتباس")
+        x.clicked.connect(lambda _=False, qq=q: self.remove_quote(qq))
+        top.addWidget(x)
+        v.addLayout(top)
+        t = q["q"].replace("\n", " ").strip()
+        body = QLabel(bidi_fix(t if len(t) <= 140 else t[:137] + "…"))
+        body.setWordWrap(True)
+        v.addWidget(body)
+        ed = QLineEdit(q.get("c", ""))
+        ed.setPlaceholderText("ردّك على هذا الجزء (اختياري)، وبعدها اكتب رسالتك واضغط إرسال")
+        ed.textChanged.connect(lambda t_, qq=q: qq.__setitem__("c", t_))
+        ed.returnPressed.connect(lambda: self.inp.setFocus())
+        v.addWidget(ed)
+        fr.setFixedWidth(min(430, max(240, self.view.viewport().width() - 24)))
+        fr.adjustSize()
+        fr.show()
+        self.view.marks.append({"a": a, "b": b, "q": q})
+        self._quote_cards[id(q)] = {"frame": fr, "edit": ed, "a": a, "b": b}
+        self.place_quote_cards()
+        self.view.viewport().update()
+
+    def place_quote_cards(self):
+        """Keep each quote card just above its shaded text (below it when there is no room); hidden while that text is off screen."""
+        v = self.view
+        vp = v.viewport()
+        dx, dy = v.horizontalScrollBar().value(), v.verticalScrollBar().value()
+        for rec in list(self._quote_cards.values()):
+            fr = rec["frame"]
+            try:
+                rows = v._ordered(rec["a"], rec["b"])
+            except Exception:
+                rows = []
+            if not rows:
+                fr.hide()
+                continue
+            top = min(v._origin(r[0], r[1]).y() + r[2].rect().top() for r in rows) - dy
+            bot = max(v._origin(r[0], r[1]).y() + r[2].rect().top() + r[2].rect().height() for r in rows) - dy
+            lo = min(r[3] for r in rows) - dx
+            hi = max(r[4] for r in rows) - dx
+            fr.setFixedWidth(min(430, max(240, vp.width() - 24)))
+            fr.adjustSize()
+            bw, bh = fr.width(), fr.height()
+            if bot < 0 or top > vp.height():
+                fr.hide()
+                continue
+            y = top - bh - 6
+            if y < 4:
+                y = bot + 6
+            x = int((lo + hi) / 2 - bw / 2)
+            fr.move(max(4, min(x, vp.width() - bw - 4)), int(max(4, min(y, vp.height() - bh - 4))))
+            fr.show()
+            fr.raise_()
+
+    def clear_quote_cards(self, keep=()):
+        """Remove the cards (and shading) of quotes that are gone; with keep = the quotes that still exist."""
+        alive = {id(q) for q in keep}
+        for k in list(self._quote_cards):
+            if k not in alive:
+                rec = self._quote_cards.pop(k)
+                rec["frame"].hide()
+                rec["frame"].setParent(None)
+                rec["frame"].deleteLater()
+        self.view.marks = [m for m in self.view.marks if id(m["q"]) in alive]
+        self.view.viewport().update()
 
     def refresh_quotes(self):
         """Each quoted part is a small chip above the input; hover shows it, click opens a mini card with the comment box."""
+        self.clear_quote_cards(self.quotes)
         while self.quotes_layout.count():
             it = self.quotes_layout.takeAt(0)
             w = it.widget()
@@ -10982,13 +11163,17 @@ class App(QMainWindow):
                     out.append({"src": "bot", "kind": kind, "name": name, "body": body, "mi": i})
         out = out[::-1]
         wd = os.path.join(self.chat_dir(), "work")
+        # files the code wrote while working are scratch: they appear here only when a reply names them (or you named them yourself)
+        said = "\n".join(str(m.get("content", "")) if m.get("role") == "assistant" else str(m.get("shown", "")) for m in self.current["msgs"]).lower()
         try:
             for root, _d, files in os.walk(wd):
                 for fn in sorted(files):
-                    if fn.startswith("_run_"):
+                    if fn.startswith("_run_") or fn.endswith((".pyc", ".tmp")) or "__pycache__" in root:
                         continue
                     fp = os.path.join(root, fn)
                     rel = os.path.relpath(fp, wd).replace("\\", "/")
+                    if fn.lower() not in said and rel.lower() not in said:
+                        continue
                     out.append({"src": "work", "name": rel, "path": fp, "mi": int(os.path.getmtime(fp))})
         except OSError:
             pass
@@ -10998,6 +11183,7 @@ class App(QMainWindow):
         mx = CHAT_WIDTHS.get(self.cfg.get("chat_width", "wide"), CHAT_WIDTHS["wide"])[1]
         self.view.set_max_width(mx)
         self.composer.setMaximumWidth(min(mx, 16777215))
+        self.todo_bar.setMaximumWidth(min(mx, 16777215))
 
     def toggle_files_panel(self, on):
         self._panel_user_off = not on
@@ -11297,9 +11483,7 @@ class App(QMainWindow):
             s = self._set_attrs(s)
             self.model_box.setCurrentText(s["model"])
             self.think_box.setCurrentText(s["thinking"])
-            if self.browser_enabled and not self.web_ok:
-                self.browser_enabled = bool(self.ensure_browser(silent=True))
-            vis = bool(self.browser_container is not None and not self.browser_container.isHidden())
+            vis = bool(self.browser_container is not None and not self.browser_container.isHidden())  # the engine is NOT started here
             self.browser_btn.blockSignals(True)
             self.browser_btn.setChecked(vis)
             self.browser_btn.blockSignals(False)
@@ -12000,7 +12184,7 @@ class App(QMainWindow):
             parts.append("تحكم")
         if getattr(self, "terminal_ok", False):
             parts.append("طرفية" + (" (موافقة مسبقة)" if getattr(self, "terminal_preapprove", False) else ""))
-        if self.browser_enabled and self.web_ok:
+        if self.browser_enabled:
             parts.append("متصفح")
         self.access_btn.setText("الصلاحيات " + "، ".join(parts) if parts else "بدون صلاحيات")
         tip = ["صلاحيات هذي المحادثة فقط — اضغط للتعديل"]
@@ -12165,6 +12349,7 @@ class App(QMainWindow):
         keep = sb.value()
         self._drop_boxes()
         self.view.clear()
+        self.clear_quote_cards(())
         self.reply_ranges = []
         self.copy_store.clear()
         self.show_files("")
@@ -12357,6 +12542,7 @@ class App(QMainWindow):
         self._place_pending = False
         self._place_boxes()
         self.place_reply_btn()
+        self.place_quote_cards()
 
     def _render_details_box(self, c, steps, act_id="x", live=False):
         """The thinking outline sits in its own scrollable box, so a long outline never pushes the answer far down."""
@@ -14107,6 +14293,10 @@ class App(QMainWindow):
         self._todo_open = not self._todo_open
         self.update_todo_bar()
 
+    def _todo_show(self, on):
+        self.todo_bar.setVisible(bool(on))
+        self.todo_wrap.setVisible(bool(on))
+
     def update_todo_bar(self):
         """The todo list of the chat on screen: progress, the step in progress, and (opened) every step."""
         from html import escape
@@ -14114,7 +14304,7 @@ class App(QMainWindow):
         items = (c.get("todos") or []) if c else []
         running = bool(c and c["id"] in self.runs)
         if not items or (not running and all(x.get("status") == "completed" for x in items)):
-            self.todo_bar.setVisible(False)
+            self._todo_show(False)
             return
         col = THEMES[self.theme]
         done = sum(1 for x in items if x.get("status") == "completed")
@@ -14133,7 +14323,7 @@ class App(QMainWindow):
                     rows.append('<div>%s</div>' % t)
             self.todo_body.setText('<div dir="rtl">%s</div>' % "".join(rows))
         self.todo_body.setVisible(self._todo_open)
-        self.todo_bar.setVisible(True)
+        self._todo_show(True)
 
     def update_room_bar(self):
         c = self.current
@@ -14814,8 +15004,8 @@ class App(QMainWindow):
             return
         api_text = text
         if self._merge_note:
-            api_text = ("[هذي الرسالة وصلت وأنت لسه تشتغل على ردك السابق، فقاطعتك. ردّك السابق حتى نقطة التوقف موجود فوق. "
-                        "كمّل اللي كنت تسويه مع مراعاة الإضافة التالية، وبدون ما تعيد اللي قلته.]\n\n" + text) if text else text
+            api_text = ("[هذي رسالة جديدة وصلت وأنت لسه تشتغل على ردك السابق فقاطعتك. اقرأ كل اللي سويته (مذكور في ملاحظة النظام فوق)، "
+                        "وبعدين انتبه للرسالة التالية وكمّل من وين وقفت مع مراعاتها، بدون ما تعيد اللي خلص وبدون ما تذكر هذي الملاحظة.]\n\n" + text) if text else text
             self._merge_note = False
         try:
             content, names = self.build_user_content(self.compose_text(api_text, quotes), model)
@@ -14893,6 +15083,10 @@ class App(QMainWindow):
         wroots = [d for d in self.writable_dirs if os.path.isdir(d)] if (roots and self.write_enabled) else []
         shell_mode = self.shell_mode if self.shell_mode in ("ask", "free") else "off"
         allow_computer = bool(self.computer_enabled)
+        if self.browser_enabled and not self.web_ok:
+            write_state(last_event="starting the built-in browser engine")
+            self.browser_enabled = bool(self.ensure_browser(silent=True))  # first reply that may browse: start it now, not when a chat is opened
+            write_state(last_event="built-in browser engine ready" if self.web_ok else "built-in browser engine unavailable")
         use_browser = bool(self.browser_enabled and self.web_ok)
         runner = None
         if True:  # the code interpreter is always available, so there is always a runner
@@ -14986,6 +15180,14 @@ class App(QMainWindow):
                         slot["name"] += fn["name"]
                     if fn.get("arguments"):
                         slot["args"] += fn["arguments"]
+                    if slot["name"] == "todo_write" and slot["args"].rstrip().endswith("}") and slot.get("_todo") != len(slot["args"]):
+                        try:  # the list is complete: show it now, while the model is still going
+                            lst = clean_todos(json.loads(slot["args"]).get("todos"))
+                            slot["_todo"] = len(slot["args"])
+                            if lst:
+                                put("todo", lst)
+                        except Exception:
+                            pass
         return "".join(content), "".join(reasoning), [calls[i] for i in sorted(calls)]
 
     def worker(self, key, model, think, messages, runner, run):
@@ -15466,18 +15668,17 @@ class App(QMainWindow):
                 content, reasoning = val
                 ch_ = R.chat
                 cur = R is self.cur_run
+                digest = ""
                 if R.interrupt is not None:
                     content = re.sub(r"\n*⏹ أوقفتّه بطلبك.*$", "", content, flags=re.S).strip()
-                    acts = [x.get("text", "") for x in ((L or {}).get("steps") or []) if x.get("k") == "tool"][-10:]
-                    if acts:
-                        content = (content + "\n\n" if content else "") + "[قاطعني المستخدم؛ آخر ما نفّذته: " + " | ".join(a[:80] for a in acts) + "]"
-                    if not content:
-                        content = "(قاطعني المستخدم قبل ما أكتب شي)"
+                    digest = interrupt_digest((L or {}).get("steps") or [], content)  # for the model only; the chat shows just the thinking
                 content, mem_msgs = apply_memory_marks(content)
                 for mm in mem_msgs:
                     self.statusBar().showMessage(mm, 5000)
                 content, offer_ = extract_skill_offer(content)
                 msg = {"role": "assistant", "content": content, "reasoning": reasoning}
+                if digest:
+                    msg["resume_digest"] = digest
                 if offer_ and ch_.get("id") != "telegram":
                     msg["skill_offer"] = offer_
                 if R.cut or "⏹ أوقفتّه بطلبك" in content:
