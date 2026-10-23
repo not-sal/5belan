@@ -1,4 +1,4 @@
-# 5belan (خبيلان) — handoff for the next agent
+﻿# 5belan (خبيلان) — handoff for the next agent
 
 Written 2026-10-17 at version **2.19.1**. Read this first. The owner is **أبو عبدالله** (Saleh); he writes Saudi Arabic and wants answers in Saudi Arabic.
 
@@ -11,8 +11,8 @@ A desktop AI agent / chat app on the **DeepSeek API**, written in **one Python f
 | **Dev copy (main file the owner edits/tests)** | `C:\Users\Admin\Desktop\deep\deepseek_chat.py` (folder `C:\Users\Admin\Desktop\deep`) |
 | **Installed copy** (what actually runs on his PC, auto-updated from GitHub) | `C:\Users\Admin\AppData\Local\Programs\5belan` (has `.venv`, `deepseek_chat.py`, `guard.py`) |
 | **User data** (chats, config, memory, files) — NEVER commit | `%APPDATA%\5belan` (= `C:\Users\Admin\AppData\Roaming\5belan`): `config.json`, `chats.json`, `memory.md`, `activity.jsonl`, `files\<chat id>\...` (attachments, `work\` = Python outputs), `pylibs\` (pip packages for run_python), `pages\` (page-watch copies). Env `BELAN_DATA_DIR` overrides it. |
-| **GitHub repo (source of truth, public)** | `https://github.com/saleh9688/5belan` (branch `main`) |
-| Auto-update manifest | `https://raw.githubusercontent.com/saleh9688/5belan/main/update.json` |
+| **GitHub repo (source of truth, public)** | `https://github.com/not-sal/5belan` (branch `main`) |
+| Auto-update manifest | `https://raw.githubusercontent.com/not-sal/5belan/main/update.json` |
 
 The device's connected folders (for the remote-devices tools) are: the `deep` dev folder, `Desktop`, and the installed `5belan` folder. The device shell is a Linux VM, **not** Windows: it can read/write those folders but cannot see Windows startup entries, the registry, etc.
 
@@ -21,8 +21,8 @@ Repo layout: `deepseek_chat.py` (the whole app, ~10.4k lines), `guard.py` (safe 
 ## 3. HOW RELEASES / AUTO-UPDATE WORK
 1. Edit `deepseek_chat.py`; bump `APP_VERSION = "x.y.z"` (single line near the top, ~line 2950).
 2. `python3 -m py_compile deepseek_chat.py`.
-3. `installers/build_release.sh /tmp/out --publish "notes"` does: builds `5belan-Setup.exe` (needs `makensis`), `5belan-linux.tar.gz`, `5belan-macOS.zip`; runs `publish.py --repo saleh9688/5belan --pip PySide6-WebEngine --notes ...` (rewrites `update.json` with SHA-256 of `deepseek_chat.py guard.py 5belan.png 5belan.ico requirements.txt`, **without** pushing); then `git add -A`, commit, `git push origin HEAD:main`. Without `--publish` it only builds.
-4. Verify: `curl -s https://raw.githubusercontent.com/saleh9688/5belan/main/update.json | grep version` and compare `sha256sum` of raw `deepseek_chat.py` with the local file. raw.githubusercontent is cached up to ~5 min — wait before panicking.
+3. `installers/build_release.sh /tmp/out --publish "notes"` does: builds `5belan-Setup.exe` (needs `makensis`), `5belan-linux.tar.gz`, `5belan-macOS.zip`; runs `publish.py --repo not-sal/5belan --pip PySide6-WebEngine --notes ...` (rewrites `update.json` with SHA-256 of `deepseek_chat.py guard.py 5belan.png 5belan.ico requirements.txt`, **without** pushing); then `git add -A`, commit, `git push origin HEAD:main`. Without `--publish` it only builds.
+4. Verify: `curl -s https://raw.githubusercontent.com/not-sal/5belan/main/update.json | grep version` and compare `sha256sum` of raw `deepseek_chat.py` with the local file. raw.githubusercontent is cached up to ~5 min — wait before panicking.
 5. Copy the new `deepseek_chat.py` to the owner's dev folder (device tools: `device_stage_files` the dev file to get `mtimeMs`, then `device_commit_files` with `expectedMtimeMs`), and send him `5belan-Setup.exe` with `SendUserFile`.
 6. Commit messages end with the attribution lines the harness reminder gives (Co-Authored-By / Claude-Session).
 
@@ -30,7 +30,7 @@ How clients update: `check_updates()` fetches `update.json` every **3 minutes** 
 
 Building on the owner's Windows PC: the dev folder `C:\Users\Admin\Desktop\deep` is itself a git clone of the repo (`main` tracks `origin/main`, `core.autocrlf=false` so file hashes match GitHub; `.git/info/exclude` whitelists only repo files, so `chats.json`/`config.json`/logs/backups there can never be committed). Push works through Git Credential Manager. NSIS is installed (`C:\Program Files (x86)\NSIS`); run `bash installers/build_release.sh <out> [--publish "notes"]` from Git Bash — it finds makensis, uses `py` when `python3` is the Store stub, and zips with Python when `zip` is missing.
 
-Git access: the sandbox clone is made with the `add_repo` tool (push access) — there is **no token to reuse**; in a new session call `add_repo` for `saleh9688/5belan` with `access: "push"`, clone, work there. Never put API keys, `config.json`, `chats.json`, logs in the repo (`publish.py` writes a `.gitignore` for these).
+Git access: the sandbox clone is made with the `add_repo` tool (push access) — there is **no token to reuse**; in a new session call `add_repo` for `not-sal/5belan` with `access: "push"`, clone, work there. Never put API keys, `config.json`, `chats.json`, logs in the repo (`publish.py` writes a `.gitignore` for these).
 
 ## 4. ARCHITECTURE MAP (`deepseek_chat.py`)
 - Top: constants, `DATA_DIR`, `THEMES`, prompts (`SYSTEM_PROMPT`, `tools_prompt(runner)`), tool schemas: `READ_TOOLS`, `WRITE_TOOLS`, `SHELL_TOOLS`, `PYTHON_TOOLS`, `COMPUTER_TOOLS`, `BROWSER_TOOLS`, `NOTES_TOOLS`.
