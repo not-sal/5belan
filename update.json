@@ -1,29 +1,29 @@
 {
-  "version": "2.35.0",
-  "notes": "2.35: مرفقات غرفة النقاش تقبل أي ملف من جهازك، حتى zip و rar و 7z (يفتحها ويقرأ الملفات اللي داخلها)، والملفات الثنائية توصف للأعضاء بدل ما ترفضها",
-  "files": [
-    {
-      "name": "deepseek_chat.py",
-      "sha256": "24597a80cc3452ddfa7682646a70e39455b94ffc4b19cbff5fa62bba6b8d9cd6"
-    },
-    {
-      "name": "guard.py",
-      "sha256": "ebe1ba734f6e7b26a11d5acd47b26934cc80d53f549ce0d0df5581ad181d7525"
-    },
-    {
-      "name": "5belan.png",
-      "sha256": "2995b3e9e25c37d0a3bb7221b0b2dae3b9b998cf6b715ac240f5ae1659f9ce46"
-    },
-    {
-      "name": "5belan.ico",
-      "sha256": "69cc2607cb22abe07f81d19a88d0243610e253d2e33b712e75eda211147d7343"
-    },
-    {
-      "name": "requirements.txt",
-      "sha256": "57aa0e5a6c24527ec89139dc7c6658fb8d06077d200d6632a90e164b24758470"
-    }
-  ],
-  "pip": [
-    "PySide6-WebEngine"
-  ]
+    "version":  "2.35.0",
+    "notes":  "2.35: Ù…Ø±ÙÙ‚Ø§Øª ØºØ±ÙØ© Ø§Ù„Ù†Ù‚Ø§Ø´ ØªÙ‚Ø¨Ù„ Ø£ÙŠ Ù…Ù„Ù Ù…Ù† Ø¬Ù‡Ø§Ø²ÙƒØŒ Ø­ØªÙ‰ zip Ùˆ rar Ùˆ 7z (ÙŠÙØªØ­Ù‡Ø§ ÙˆÙŠÙ‚Ø±Ø£ Ø§Ù„Ù…Ù„ÙØ§Øª Ø§Ù„Ù„ÙŠ Ø¯Ø§Ø®Ù„Ù‡Ø§)ØŒ ÙˆØ§Ù„Ù…Ù„ÙØ§Øª Ø§Ù„Ø«Ù†Ø§Ø¦ÙŠØ© ØªÙˆØµÙ Ù„Ù„Ø£Ø¹Ø¶Ø§Ø¡ Ø¨Ø¯Ù„ Ù…Ø§ ØªØ±ÙØ¶Ù‡Ø§",
+    "files":  [
+                  {
+                      "name":  "deepseek_chat.py",
+                      "sha256":  "a93c2c9df697e1848805ca51870de544a2b7896c621b6550653800cbf5e46507"
+                  },
+                  {
+                      "name":  "guard.py",
+                      "sha256":  "ebe1ba734f6e7b26a11d5acd47b26934cc80d53f549ce0d0df5581ad181d7525"
+                  },
+                  {
+                      "name":  "5belan.png",
+                      "sha256":  "2995b3e9e25c37d0a3bb7221b0b2dae3b9b998cf6b715ac240f5ae1659f9ce46"
+                  },
+                  {
+                      "name":  "5belan.ico",
+                      "sha256":  "69cc2607cb22abe07f81d19a88d0243610e253d2e33b712e75eda211147d7343"
+                  },
+                  {
+                      "name":  "requirements.txt",
+                      "sha256":  "57aa0e5a6c24527ec89139dc7c6658fb8d06077d200d6632a90e164b24758470"
+                  }
+              ],
+    "pip":  [
+                "PySide6-WebEngine"
+            ]
 }
