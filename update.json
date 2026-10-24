@@ -1,14 +1,14 @@
 {
-  "version": "2.35.4",
-  "notes": "2.35.4: الاسم 5belan مع الأيقونة في مدير المهام",
+  "version": "2.35.5",
+  "notes": "2.35.5: إصلاح أيقونة خبيلان في مدير المهام",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "8a230df5921a22c535aea1e2003ff9355237a72a763e428c001c9c13712b4a47"
+      "sha256": "d88f094f63aa685665cd18a0c93fdfc6ad11fd0580538258cd8bca2d64cab80d"
     },
     {
       "name": "guard.py",
-      "sha256": "7ad67d6c2023d80b59e4b4251b7deae161a1928f9a62282df046afb48780f13a"
+      "sha256": "3b08fe686c0fe7afcc5e219d96dc59c1e74da855084da82b8ed52462972612a3"
     },
     {
       "name": "5belan.png",
