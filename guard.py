@@ -174,9 +174,9 @@ def tail_log(lines=12):
 # ------------------------------------------------------------------ الاسم في مدير المهام
 # مدير المهام (ويندوز) يعرض "وصف الملف التنفيذي"، ومراقب النظام (لينكس/ماك) يعرض اسم الملف.
 # فنسوي نسخة من بايثون باسم 5belan، وفيها بيانات الإصدار "خبيلان". أي فشل = نكمّل بالعادي.
-BRAND_NAME = "\u062e\u0628\u064a\u0644\u0627\u0646"  # خبيلان
+BRAND_NAME = "5belan"
 BRAND_EXE = "5belan"
-BRAND_STAMP = "v1"
+BRAND_STAMP = "v2"
 
 
 def _app_version():
@@ -221,7 +221,27 @@ def version_resource(version):
     return _ver_block("VS_VERSION_INFO", fixed, _ver_pad(sfi) + _ver_pad(vfi))
 
 
-def _set_version_info(path, data):
+def icon_resources():
+    """من 5belan.ico: عناصر RT_ICON + مجموعة RT_GROUP_ICON، على شكل (نوع، رقم، لغة، بيانات)."""
+    try:
+        with open(os.path.join(BASE, "5belan.ico"), "rb") as f:
+            raw = f.read()
+        count = struct.unpack_from("<H", raw, 4)[0]
+        group = struct.pack("<HHH", 0, 1, count)
+        out = []
+        for i in range(count):
+            w, h, cc, _r, planes, bits, size, off = struct.unpack_from("<BBBBHHII", raw, 6 + 16 * i)
+            rid = 100 + i
+            out.append((3, rid, raw[off:off + size]))
+            group += struct.pack("<BBBBHHIH", w, h, cc, 0, planes, bits, size, rid)
+        out.append((14, 1, group))
+        return out
+    except Exception:
+        return []
+
+
+def _set_resources(path, items):
+    """يكتب الموارد داخل exe. items = [(نوع، رقم، بيانات)] وكل واحد بلغتين (محايدة وإنجليزي) عشان يغلب القديم."""
     import ctypes
     k = ctypes.WinDLL("kernel32", use_last_error=True)
     k.BeginUpdateResourceW.restype = ctypes.c_void_p
@@ -232,9 +252,16 @@ def _set_version_info(path, data):
     h = k.BeginUpdateResourceW(path, 0)
     if not h:
         return False
-    buf = ctypes.create_string_buffer(data, len(data))
-    ok = k.UpdateResourceW(h, 16, 1, 0x0409, buf, len(data))  # RT_VERSION, id 1, en-US
-    return bool(k.EndUpdateResourceW(h, 0 if ok else 1)) and bool(ok)
+    ok = True
+    for rtype, rid, data in items:
+        buf = ctypes.create_string_buffer(data, len(data))
+        for lang in (0x0409, 0):
+            ok = bool(k.UpdateResourceW(h, rtype, rid, lang, buf, len(data))) and ok
+    return bool(k.EndUpdateResourceW(h, 0 if ok else 1)) and ok
+
+
+def _set_version_info(path, data):
+    return _set_resources(path, [(16, 1, data)] + icon_resources())
 
 
 def _venv_home():

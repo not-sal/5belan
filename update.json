@@ -1,14 +1,14 @@
 {
-  "version": "2.35.3",
-  "notes": "2.35.3: اسم خبيلان في مدير المهام يشتغل حتى مع بايثون النظام",
+  "version": "2.35.4",
+  "notes": "2.35.4: الاسم 5belan مع الأيقونة في مدير المهام",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "da7ba0eede66f639480632bc7c0d80273cd97427529d38f73ad58aefa5339263"
+      "sha256": "8a230df5921a22c535aea1e2003ff9355237a72a763e428c001c9c13712b4a47"
     },
     {
       "name": "guard.py",
-      "sha256": "25918febbca6038f3bbec448dedf68cef61ca04bb9548f7e9b47f1a3528c4a7b"
+      "sha256": "7ad67d6c2023d80b59e4b4251b7deae161a1928f9a62282df046afb48780f13a"
     },
     {
       "name": "5belan.png",
