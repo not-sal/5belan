@@ -36,6 +36,7 @@ echo "[2/4] Python environment..."
 python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" || { echo "ERROR: Python 3.9 or newer is required."; exit 1; }
 python3 -m venv .venv || { echo "ERROR: could not create the virtual environment (install python3-venv)."; exit 1; }
 PY="$HERE/.venv/bin/python"
+ln -sf python "$HERE/.venv/bin/5belan" 2>/dev/null || true   # process name in the system monitor
 "$PY" -m pip install --upgrade pip >/dev/null 2>&1
 
 NEWOK=1

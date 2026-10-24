@@ -25,6 +25,7 @@ for f in deepseek_chat.py guard.py 5belan.png requirements.txt; do cp "$SRC/$f" 
 # 3. private environment + packages
 if [ ! -x "$APPDIR/.venv/bin/python" ]; then "$PYBIN" -m venv "$APPDIR/.venv" || { echo "Could not create the environment."; read -n 1 -s -r -p "Press any key..."; exit 1; }; fi
 PY="$APPDIR/.venv/bin/python"
+ln -sf python "$APPDIR/.venv/bin/5belan" 2>/dev/null || true   # process name in Activity Monitor
 "$PY" -m pip install --disable-pip-version-check --upgrade pip >/dev/null 2>&1
 echo "Installing packages (a few minutes)..."
 "$PY" -m pip install --disable-pip-version-check -r "$APPDIR/requirements.txt" || { echo "Package installation failed. Check your internet connection and run again."; read -n 1 -s -r -p "Press any key..."; exit 1; }
@@ -36,7 +37,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cat > "$APP/Contents/MacOS/5belan" <<L
 #!/bin/bash
 cd "$APPDIR" || exit 1
-exec "$APPDIR/.venv/bin/python" guard.py deepseek_chat.py > "$APPDIR/launch.log" 2>&1
+exec "$APPDIR/.venv/bin/5belan" guard.py deepseek_chat.py > "$APPDIR/launch.log" 2>&1
 L
 chmod +x "$APP/Contents/MacOS/5belan"
 cat > "$APP/Contents/Info.plist" <<'L'
