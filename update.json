@@ -1,14 +1,14 @@
 {
-  "version": "2.35.2",
-  "notes": "2.35.2: اسم خبيلان يظهر في مدير المهام بدل Python",
+  "version": "2.35.3",
+  "notes": "2.35.3: اسم خبيلان في مدير المهام يشتغل حتى مع بايثون النظام",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "73ed4a401aefb6fd5f127e74825075cc5cb408b81b63aa25aebb54d5538af5cc"
+      "sha256": "da7ba0eede66f639480632bc7c0d80273cd97427529d38f73ad58aefa5339263"
     },
     {
       "name": "guard.py",
-      "sha256": "2419820b92f65931df15bb6ac26e2a653ef9ba96bce7d11781761c3fa55089eb"
+      "sha256": "25918febbca6038f3bbec448dedf68cef61ca04bb9548f7e9b47f1a3528c4a7b"
     },
     {
       "name": "5belan.png",

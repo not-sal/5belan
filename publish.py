@@ -33,6 +33,8 @@ resume.json
 _last_good/
 _last_try/
 _update_backup/
+_brand/
+_brand_probe.txt
 __pycache__/
 *.pyc
 update_source.txt
