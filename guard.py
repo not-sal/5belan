@@ -20,7 +20,9 @@
 
 import glob
 import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -169,12 +171,194 @@ def tail_log(lines=12):
     return "\n".join(rows[-lines:]) if rows else "(error.log فاضي)"
 
 
+# ------------------------------------------------------------------ الاسم في مدير المهام
+# مدير المهام (ويندوز) يعرض "وصف الملف التنفيذي"، ومراقب النظام (لينكس/ماك) يعرض اسم الملف.
+# فنسوي نسخة من بايثون باسم 5belan، وفيها بيانات الإصدار "خبيلان". أي فشل = نكمّل بالعادي.
+BRAND_NAME = "\u062e\u0628\u064a\u0644\u0627\u0646"  # خبيلان
+BRAND_EXE = "5belan"
+BRAND_STAMP = "v1"
+
+
+def _app_version():
+    try:
+        with open(os.path.join(BASE, "deepseek_chat.py"), encoding="utf-8-sig") as f:
+            m = re.search(r'^APP_VERSION\s*=\s*"([\d.]+)"', f.read(), re.M)
+        return m.group(1) if m else "0.0.0"
+    except Exception:
+        return "0.0.0"
+
+
+def _ver_block(key, value=b"", children=b"", text=False):
+    """كتلة واحدة من مورد VS_VERSIONINFO."""
+    k = (key + "\0").encode("utf-16-le")
+    body = k
+    body += b"\0" * (-(6 + len(body)) % 4)
+    body += value
+    if children:
+        body += b"\0" * (-(6 + len(body)) % 4)
+        body += children
+    vlen = len(value) // 2 if text else len(value)
+    return struct.pack("<HHH", 6 + len(body), vlen, 1 if text else 0) + body
+
+
+def _ver_pad(b):
+    return b + b"\0" * (-len(b) % 4)
+
+
+def version_resource(version):
+    nums = [int(x) for x in re.findall(r"\d+", version)][:4]
+    nums += [0] * (4 - len(nums))
+    fixed = struct.pack("<13I", 0xFEEF04BD, 0x00010000, (nums[0] << 16) | nums[1], (nums[2] << 16) | nums[3],
+                        (nums[0] << 16) | nums[1], (nums[2] << 16) | nums[3], 0x3F, 0, 0x00040004, 1, 0, 0, 0)
+    fields = [("CompanyName", BRAND_NAME), ("FileDescription", BRAND_NAME), ("FileVersion", version),
+              ("InternalName", BRAND_EXE), ("OriginalFilename", BRAND_EXE + ".exe"),
+              ("ProductName", BRAND_NAME), ("ProductVersion", version)]
+    strings = b"".join(_ver_pad(_ver_block(k, (v + "\0").encode("utf-16-le"), text=True)) for k, v in fields)
+    table = _ver_block("040904B0", children=strings)
+    sfi = _ver_block("StringFileInfo", children=_ver_pad(table))
+    var = _ver_block("Translation", struct.pack("<HH", 0x0409, 0x04B0))
+    vfi = _ver_block("VarFileInfo", children=_ver_pad(var))
+    return _ver_block("VS_VERSION_INFO", fixed, _ver_pad(sfi) + _ver_pad(vfi))
+
+
+def _set_version_info(path, data):
+    import ctypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.BeginUpdateResourceW.restype = ctypes.c_void_p
+    k.BeginUpdateResourceW.argtypes = [ctypes.c_wchar_p, ctypes.c_int]
+    k.UpdateResourceW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ushort,
+                                  ctypes.c_void_p, ctypes.c_ulong]
+    k.EndUpdateResourceW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    h = k.BeginUpdateResourceW(path, 0)
+    if not h:
+        return False
+    buf = ctypes.create_string_buffer(data, len(data))
+    ok = k.UpdateResourceW(h, 16, 1, 0x0409, buf, len(data))  # RT_VERSION, id 1, en-US
+    return bool(k.EndUpdateResourceW(h, 0 if ok else 1)) and bool(ok)
+
+
+def _venv_home():
+    cfg = os.path.join(sys.prefix, "pyvenv.cfg")
+    try:
+        with open(cfg, encoding="utf-8-sig") as f:
+            for line in f:
+                if line.split("=")[0].strip().lower() == "home":
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _branded_windows():
+    if sys.prefix == getattr(sys, "base_prefix", sys.prefix):
+        return ""
+    scripts = os.path.join(sys.prefix, "Scripts")
+    dest = os.path.join(scripts, BRAND_EXE + ".exe")
+    stamp_file = os.path.join(scripts, BRAND_EXE + ".stamp")
+    home = _venv_home()
+    stamp = "%s|%s|%s" % (BRAND_STAMP, home, sys.version)
+    try:
+        with open(stamp_file, encoding="utf-8") as f:
+            if f.read() == stamp and os.path.exists(dest):
+                return dest
+    except OSError:
+        pass
+    src = os.path.join(home, "pythonw.exe")
+    if not home or not os.path.exists(src):
+        return ""
+    try:
+        for n in os.listdir(home):
+            low = n.lower()
+            if low in ("python3.dll", "python%d%d.dll" % sys.version_info[:2]) or low.startswith("vcruntime140"):
+                shutil.copyfile(os.path.join(home, n), os.path.join(scripts, n))
+        tmp = dest + ".new"
+        shutil.copyfile(src, tmp)
+        if not _set_version_info(tmp, version_resource(_app_version())):
+            os.remove(tmp)
+            return ""
+        os.replace(tmp, dest)
+        # تجربة حقيقية: لازم يشتغل ويشوف نفس البيئة
+        probe = os.path.join(BASE, "_brand_probe.txt")
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+        subprocess.run([dest, "-c", "import sys;open(r'%s','w').write(sys.prefix)" % probe],
+                       timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        with open(probe, encoding="utf-8") as f:
+            good = os.path.normcase(f.read().strip()) == os.path.normcase(sys.prefix)
+        os.remove(probe)
+        if not good:
+            os.remove(dest)
+            return ""
+        with open(stamp_file, "w", encoding="utf-8") as f:
+            f.write(stamp)
+        return dest
+    except Exception as e:
+        say("(الاسم الجديد ما اشتغل: %s)" % e)
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+        return ""
+
+
+def _branded_posix():
+    if sys.prefix == getattr(sys, "base_prefix", sys.prefix):
+        return ""
+    link = os.path.join(os.path.dirname(sys.executable), BRAND_EXE)
+    try:
+        if not os.path.lexists(link):
+            os.symlink(os.path.basename(sys.executable), link)
+        return link if os.access(link, os.X_OK) else ""
+    except OSError:
+        return ""
+
+
+def branded_python():
+    """مسار بايثون باسم 5belan، أو نص فاضي لو ما نقدر."""
+    try:
+        return _branded_windows() if os.name == "nt" else _branded_posix()
+    except Exception:
+        return ""
+
+
+def relaunch_branded():
+    """يعيد تشغيل الحارس بالاسم الجديد. يرجّع True لو سلّم الشغل لنسخة ثانية."""
+    if os.environ.get("BELAN_BRANDED"):
+        return False
+    if os.name == "nt" and not os.path.basename(sys.executable).lower().startswith("pythonw"):
+        return False  # شغّله بنفسك من كونسول: لا تفصله عنه
+    exe = branded_python()
+    if not exe or os.path.normcase(exe) == os.path.normcase(sys.executable):
+        return False
+    env = dict(os.environ)
+    env["BELAN_BRANDED"] = "1"
+    args = [exe, os.path.abspath(__file__)] + sys.argv[1:]
+    try:
+        if os.name == "nt":
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+            subprocess.Popen(args, cwd=BASE, env=env, creationflags=flags, close_fds=True)
+            return True
+        os.execve(exe, args, env)
+    except Exception:
+        return False
+    return False
+
+
 # ------------------------------------------------------------------ التشغيل
 def run_once(app):
     return subprocess.call([sys.executable, app], cwd=BASE)
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--brand":  # يستدعيه المثبّت
+        exe = branded_python()
+        print("branded: " + (exe or "no"))
+        return 0
+    if relaunch_branded():
+        return 0
     name = sys.argv[1] if len(sys.argv) > 1 else "deepseek_chat.py"
     app = os.path.join(BASE, name)
 

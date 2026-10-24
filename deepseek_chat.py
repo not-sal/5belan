@@ -3684,8 +3684,8 @@ class ToolRunner:
     def python_exe():
         exe = sys.executable or ""
         if not getattr(sys, "frozen", False) and exe:
-            if os.name == "nt" and exe.lower().endswith("pythonw.exe"):
-                alt = exe[:-len("pythonw.exe")] + "python.exe"
+            if os.name == "nt" and os.path.basename(exe).lower() in ("pythonw.exe", "5belan.exe"):
+                alt = os.path.join(os.path.dirname(exe), "python.exe")  # the branded 5belan.exe is windowed too
                 if os.path.exists(alt):
                     return alt
             return exe
@@ -4294,7 +4294,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.35.1"
+APP_VERSION = "2.35.2"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")

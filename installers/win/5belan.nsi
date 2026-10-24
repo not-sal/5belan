@@ -137,6 +137,9 @@ Section "5belan" SecMain
 
   ; ---- 5. check
   DetailPrint "Checking the installation..."
+  ; name shown in Task Manager ("5belan" instead of "Python"); harmless when it fails
+  nsExec::ExecToLog '"$INSTDIR\.venv\Scripts\python.exe" "$INSTDIR\guard.py" --brand'
+  Pop $0
   nsExec::ExecToLog '"$INSTDIR\.venv\Scripts\python.exe" -c "import PySide6.QtWidgets, pypdf, docx, openpyxl, matplotlib, arabic_reshaper, bidi"'
   Pop $0
   ${If} $0 != "0"

@@ -1,14 +1,14 @@
 {
-  "version": "2.35.1",
-  "notes": "2.35.1: أيقونة جديدة لخبيلان",
+  "version": "2.35.2",
+  "notes": "2.35.2: اسم خبيلان يظهر في مدير المهام بدل Python",
   "files": [
     {
       "name": "deepseek_chat.py",
-      "sha256": "23fba6ea3f30afb382a19fafbdc17336e2e7c8ae672a76721a9b2089f44d1887"
+      "sha256": "73ed4a401aefb6fd5f127e74825075cc5cb408b81b63aa25aebb54d5538af5cc"
     },
     {
       "name": "guard.py",
-      "sha256": "ebe1ba734f6e7b26a11d5acd47b26934cc80d53f549ce0d0df5581ad181d7525"
+      "sha256": "2419820b92f65931df15bb6ac26e2a653ef9ba96bce7d11781761c3fa55089eb"
     },
     {
       "name": "5belan.png",
