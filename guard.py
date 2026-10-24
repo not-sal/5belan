@@ -249,13 +249,19 @@ def _venv_home():
     return ""
 
 
+def _in_venv():
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+
 def _branded_windows():
-    if sys.prefix == getattr(sys, "base_prefix", sys.prefix):
-        return ""
-    scripts = os.path.join(sys.prefix, "Scripts")
-    dest = os.path.join(scripts, BRAND_EXE + ".exe")
-    stamp_file = os.path.join(scripts, BRAND_EXE + ".stamp")
-    home = _venv_home()
+    if _in_venv():
+        folder = os.path.join(sys.prefix, "Scripts")
+        home = _venv_home()
+    else:  # بايثون النظام مباشرة (مثلاً نسخة التطوير): نسوي مجلد صغير فيه نسخة تشوف نفس المكتبات
+        folder = os.path.join(BASE, "_brand")
+        home = os.path.dirname(os.path.abspath(sys.executable))
+    dest = os.path.join(folder, BRAND_EXE + ".exe")
+    stamp_file = os.path.join(folder, BRAND_EXE + ".stamp")
     stamp = "%s|%s|%s" % (BRAND_STAMP, home, sys.version)
     try:
         with open(stamp_file, encoding="utf-8") as f:
@@ -267,28 +273,36 @@ def _branded_windows():
     if not home or not os.path.exists(src):
         return ""
     try:
+        os.makedirs(folder, exist_ok=True)
         for n in os.listdir(home):
             low = n.lower()
             if low in ("python3.dll", "python%d%d.dll" % sys.version_info[:2]) or low.startswith("vcruntime140"):
-                shutil.copyfile(os.path.join(home, n), os.path.join(scripts, n))
+                shutil.copyfile(os.path.join(home, n), os.path.join(folder, n))
+        if not _in_venv():
+            cfg = os.path.join(folder, "pyvenv.cfg")
+            with open(cfg, "w", encoding="utf-8") as f:
+                f.write("home = %s\ninclude-system-site-packages = true\nversion = %d.%d.%d\n" % ((home,) + tuple(sys.version_info[:3])))
         tmp = dest + ".new"
         shutil.copyfile(src, tmp)
         if not _set_version_info(tmp, version_resource(_app_version())):
             os.remove(tmp)
             return ""
         os.replace(tmp, dest)
-        # تجربة حقيقية: لازم يشتغل ويشوف نفس البيئة
+        # تجربة حقيقية: لازم يشتغل ويشوف نفس البيئة ونفس المكتبات
         probe = os.path.join(BASE, "_brand_probe.txt")
         try:
             os.remove(probe)
         except OSError:
             pass
-        subprocess.run([dest, "-c", "import sys;open(r'%s','w').write(sys.prefix)" % probe],
-                       timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        code = ("import sys\ntry:\n import PySide6.QtCore as q\nexcept Exception:\n q=None\n"
+                "open(r'%s','w').write(sys.prefix+'\\n'+('qt' if q else 'noqt'))" % probe)
+        subprocess.run([dest, "-c", code], timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         with open(probe, encoding="utf-8") as f:
-            good = os.path.normcase(f.read().strip()) == os.path.normcase(sys.prefix)
+            got = f.read().split("\n")
         os.remove(probe)
-        if not good:
+        have_qt = _has_qt()
+        if os.path.normcase(got[0].strip()) != os.path.normcase(folder if not _in_venv() else sys.prefix) \
+                or (have_qt and got[-1] != "qt"):
             os.remove(dest)
             return ""
         with open(stamp_file, "w", encoding="utf-8") as f:
@@ -304,13 +318,24 @@ def _branded_windows():
         return ""
 
 
-def _branded_posix():
-    if sys.prefix == getattr(sys, "base_prefix", sys.prefix):
-        return ""
-    link = os.path.join(os.path.dirname(sys.executable), BRAND_EXE)
+def _has_qt():
     try:
+        import importlib.util
+        return importlib.util.find_spec("PySide6") is not None
+    except Exception:
+        return False
+
+
+def _branded_posix():
+    if _in_venv():
+        folder = os.path.dirname(sys.executable)
+    else:
+        folder = os.path.join(BASE, "_brand")
+    link = os.path.join(folder, BRAND_EXE)
+    try:
+        os.makedirs(folder, exist_ok=True)
         if not os.path.lexists(link):
-            os.symlink(os.path.basename(sys.executable), link)
+            os.symlink(os.path.basename(sys.executable) if _in_venv() else os.path.realpath(sys.executable), link)
         return link if os.access(link, os.X_OK) else ""
     except OSError:
         return ""
