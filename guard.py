@@ -176,7 +176,7 @@ def tail_log(lines=12):
 # فنسوي نسخة من بايثون باسم 5belan، وفيها بيانات الإصدار "خبيلان". أي فشل = نكمّل بالعادي.
 BRAND_NAME = "5belan"
 BRAND_EXE = "5belan"
-BRAND_STAMP = "v2"
+BRAND_STAMP = "v3"
 
 
 def _app_version():
@@ -240,6 +240,44 @@ def icon_resources():
         return []
 
 
+def _existing_icons(k, path):
+    """كل موارد الأيقونة اللي داخل الملف الآن: [(نوع، اسم، لغة)] (الاسم رقم أو مؤشر نص)."""
+    import ctypes
+    from ctypes import wintypes
+    k.LoadLibraryExW.restype = ctypes.c_void_p
+    k.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, wintypes.DWORD]
+    k.FreeLibrary.argtypes = [ctypes.c_void_p]
+    k.EnumResourceNamesW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    k.EnumResourceLanguagesW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.c_void_p]
+    cb_t = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+    lcb_t = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ushort,
+                               ctypes.c_void_p)
+    hmod = k.LoadLibraryExW(path, None, 0x2)  # LOAD_LIBRARY_AS_DATAFILE
+    if not hmod:
+        return []
+    found = []
+    try:
+        for rtype in (3, 14):
+            names = []
+
+            def on_name(_h, _t, name, _l):
+                if name and name < 0x10000:  # رقم، مو مؤشر نص (المؤشر يموت بعد FreeLibrary)
+                    names.append(name)
+                return 1
+            keep = cb_t(on_name)
+            k.EnumResourceNamesW(hmod, rtype, keep, None)
+            for name in names:
+                def on_lang(_h, _t, _n, lang, _l, rtype=rtype, name=name):
+                    found.append((rtype, name, lang))
+                    return 1
+                keep2 = lcb_t(on_lang)
+                k.EnumResourceLanguagesW(hmod, rtype, name, keep2, None)
+    finally:
+        k.FreeLibrary(hmod)
+    return found
+
+
 def _set_resources(path, items):
     """يكتب الموارد داخل exe. items = [(نوع، رقم، بيانات)] وكل واحد بلغتين (محايدة وإنجليزي) عشان يغلب القديم."""
     import ctypes
@@ -249,10 +287,13 @@ def _set_resources(path, items):
     k.UpdateResourceW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ushort,
                                   ctypes.c_void_p, ctypes.c_ulong]
     k.EndUpdateResourceW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    old_icons = _existing_icons(k, path) if any(t == 14 for t, _i, _d in items) else []
     h = k.BeginUpdateResourceW(path, 0)
     if not h:
         return False
     ok = True
+    for rtype, rname, lang in old_icons:  # نشيل أيقونات بايثون القديمة عشان ما تغلب أيقونتنا
+        k.UpdateResourceW(h, rtype, rname, lang, None, 0)
     for rtype, rid, data in items:
         buf = ctypes.create_string_buffer(data, len(data))
         for lang in (0x0409, 0):
