@@ -21,7 +21,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(HERE, "deepseek_chat.py")
 FILES = ["deepseek_chat.py", "guard.py", "5belan.png", "5belan.ico", "requirements.txt"]
-GITIGNORE = """config.json
+GITIGNORE = """HANDOFF.md
+config.json
 chats.json
 *.log
 *.log.old

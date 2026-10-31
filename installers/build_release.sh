@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the three installers from the repo files and (optionally) publish.
 # Usage: installers/build_release.sh <out_dir> [--publish "release notes in Arabic or English"]
+# --publish: updates update.json, pushes to main, and uploads the three installers to a GitHub Release v<version> (needs gh)
 # Needs: makensis (apt install nsis / winget NSIS.NSIS), tar, python, git; zip optional. Run from the repo root.
 set -euo pipefail
 OUT="${1:?out dir}"; shift || true
@@ -47,7 +48,23 @@ cp "$OUT/win/5belan-Setup.exe" "$OUT/"
 ls -la "$OUT"/5belan-Setup.exe "$OUT"/5belan-linux.tar.gz "$OUT"/5belan-macOS.zip
 if [ "${1:-}" = "--publish" ]; then
   NOTES="${2:?notes}"
-  (cd "$ROOT" && "$PY" publish.py --repo saleh9688/5belan --pip PySide6-WebEngine --notes "$NOTES")   # writes update.json, does NOT push
-  (cd "$ROOT" && git add -A && git -c user.name=saleh9688 -c user.email=saleh96881@gmail.com commit -q -m "$VER: $NOTES" && git push -q origin HEAD:main)
-  echo "pushed. verify: curl -s https://raw.githubusercontent.com/saleh9688/5belan/main/update.json | grep version"
+  REPO="not-sal/5belan"
+  # This shell may carry a read-only GH_TOKEN; if a GitHub call is refused, retry with the signed-in `gh` account (keyring).
+  gh_try() { gh "$@" || env -u GH_TOKEN gh "$@"; }
+  git_push() { git push -q "$@" || env -u GH_TOKEN git push -q "$@"; }
+  (cd "$ROOT" && "$PY" publish.py --repo "$REPO" --pip PySide6-WebEngine --notes "$NOTES")   # writes update.json, does NOT push
+  # HANDOFF.md is private (ignored by .gitignore), so `add -A` can never publish it
+  (cd "$ROOT" && git add -A && git -c user.name=not-sal -c user.email=saleh96881@gmail.com commit -q -m "$VER: $NOTES" && git_push origin HEAD:main)
+  echo "pushed. verify: curl -s https://raw.githubusercontent.com/$REPO/main/update.json | grep version"
+  # The program itself goes to GitHub Releases: one release per version with the three installers attached.
+  if command -v gh >/dev/null 2>&1; then
+    (cd "$ROOT" && SHA="$(git rev-parse HEAD)" &&
+      if gh_try release view "v$VER" --repo "$REPO" >/dev/null 2>&1; then
+        gh_try release upload "v$VER" "$OUT/5belan-Setup.exe" "$OUT/5belan-linux.tar.gz" "$OUT/5belan-macOS.zip" --repo "$REPO" --clobber
+      else
+        gh_try release create "v$VER" "$OUT/5belan-Setup.exe" "$OUT/5belan-linux.tar.gz" "$OUT/5belan-macOS.zip" --repo "$REPO" --target "$SHA" --title "5belan $VER" --notes "$NOTES" --latest
+      fi) && echo "release v$VER published: https://github.com/$REPO/releases/tag/v$VER" || echo "WARNING: the GitHub release was not created (is gh signed in? run: gh auth login)"
+  else
+    echo "WARNING: gh (GitHub CLI) is not installed, so no GitHub release was created for $VER"
+  fi
 fi
