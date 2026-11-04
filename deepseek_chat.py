@@ -5190,7 +5190,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.38.0"
+APP_VERSION = "2.38.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -5423,11 +5423,62 @@ def _http_get(url, limit=25 * 1024 * 1024, timeout=30):
     return data
 
 
+def _fresh(url):
+    """The same URL with a cache-busting query, so GitHub's CDN serves the newest copy."""
+    return url + ("&" if "?" in url else "?") + "t=%d" % int(time.time() * 1000)
+
+
+def _raw_via_api(url):
+    """raw.githubusercontent.com/OWNER/REPO/REF/PATH read through the GitHub API instead (not behind the raw CDN cache)."""
+    m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+?)(\?.*)?$", url)
+    if not m:
+        return None
+    api = "https://api.github.com/repos/%s/%s/contents/%s?ref=%s" % (m.group(1), m.group(2), m.group(4), m.group(3))
+    req = urllib.request.Request(api, headers={"User-Agent": "5belan-updater", "Accept": "application/vnd.github.raw"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read(25 * 1024 * 1024 + 1)
+
+
+def fetch_verified(url, want, name, say=None, manifest_url=""):
+    """Download one update file and make sure it is exactly the published one. Right after a release GitHub's CDN can still
+    hand out the previous copy for a few minutes, so: retry with cache-busting, then read it through the GitHub API, and
+    finally accept it only if the newest manifest names that exact checksum."""
+    data, last = None, ""
+    for i, wait in enumerate((0, 5, 15, 30)):
+        if wait:
+            if say:
+                say("نسخة %s على GitHub لسه ما تحدّثت، أعيد المحاولة بعد %d ثانية…" % (name, wait))
+            time.sleep(wait)
+        try:
+            data = _http_get(url if i == 0 else _fresh(url))
+        except Exception as e:
+            last = str(e)
+            continue
+        if hashlib.sha256(data).hexdigest() == want:
+            return data
+    try:
+        data = _raw_via_api(url) or data
+        if data is not None and hashlib.sha256(data).hexdigest() == want:
+            return data
+    except Exception as e:
+        last = str(e)
+    if data is not None and manifest_url:
+        try:  # the manifest we hold may be the older one: trust the file only if the newest manifest names its checksum
+            fresh = json.loads(_http_get(_fresh(manifest_url), limit=2 * 1024 * 1024).decode("utf-8-sig"))
+            if any(f.get("name") == name and str(f.get("sha256", "")).lower() == hashlib.sha256(data).hexdigest() for f in fresh.get("files") or []):
+                return data
+        except Exception:
+            pass
+    raise RuntimeError("checksum mismatch for %s%s (GitHub is probably still publishing the new version: try again in a few minutes)"
+                       % (name, (" — " + last) if last else ""))
+
+
 def fetch_manifest(url):
     m = json.loads(_http_get(url, limit=2 * 1024 * 1024).decode("utf-8-sig"))
     if not isinstance(m, dict) or not m.get("version") or not isinstance(m.get("files"), list):
         raise RuntimeError("bad update manifest")
     m["_base"] = url.rsplit("/", 1)[0] + "/"
+    m["_url"] = url
     return m
 
 
@@ -5457,9 +5508,7 @@ def apply_update(m, progress=None):
                     if hashlib.sha256(fh.read()).hexdigest() == want:
                         continue  # already identical
             say("جاري تنزيل " + name)
-            data = _http_get(str(f.get("url") or (m["_base"] + urllib.parse.quote(name))))
-            if hashlib.sha256(data).hexdigest() != want:
-                raise RuntimeError("checksum mismatch for " + name)
+            data = fetch_verified(str(f.get("url") or (m["_base"] + urllib.parse.quote(name))), want, name, say, m.get("_url", ""))
             if name.endswith(".py"):
                 compile(data.decode("utf-8-sig"), name, "exec")  # never install a file with a syntax error
             p = os.path.join(tmp, name)
