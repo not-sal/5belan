@@ -1693,6 +1693,18 @@ REA_TOOLS = [
         "description": "Get one REA tool's full description and the exact JSON arguments it accepts. Call this before rea_call for a tool you have not used yet.",
         "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "Exact tool name from rea_find_tools."}}, "required": ["name"]}}},
     {"type": "function", "function": {
+        "name": "rea_install_engine",
+        "description": (
+            "Install an analysis engine REA needs but this computer does not have (REA said provider_unavailable / capability_unavailable, "
+            "or the start summary lists it as not installed). The app ALWAYS asks the user first and shows the download size; only after "
+            "a yes it downloads the official release, checks its SHA-256 and wires it into REA. Engines: java (needed by the others), "
+            "ghidra (native exe/dll/so/firmware: decompile, functions, strings), jadx (APK Java code), apktool (APK manifest/resources/smali), "
+            "rizin (disassembly/debugging). Java is added automatically when the engine needs it."),
+        "parameters": {"type": "object", "properties": {
+            "engine": {"type": "string", "enum": ["java", "ghidra", "jadx", "apktool", "rizin"]},
+            "reason": {"type": "string", "description": "One short sentence for the user: what this engine will let you do for their request."}},
+            "required": ["engine", "reason"]}}},
+    {"type": "function", "function": {
         "name": "rea_call",
         "description": (
             "Run one REA tool with its JSON arguments (as given by rea_tool_help) and return its result. Paths must be absolute. "
@@ -1917,9 +1929,7 @@ def rea_client(confirm=None, progress=None):
                 node = install_node(progress)
             if not rea:
                 rea = install_rea(node, progress)
-        env = dict(os.environ)
-        env["PATH"] = os.path.dirname(os.path.abspath(node)) + os.pathsep + env.get("PATH", "")
-        env.pop("GH_TOKEN", None)
+        env = rea_process_env(node)
         work = os.path.join(DATA_DIR, "tools", "rea-work")
         os.makedirs(work, exist_ok=True)
         c = McpStdio([node, rea, "mcp"], env=env, cwd=work, log_path=os.path.join(DATA_DIR, "tools", "rea.log"))
@@ -1949,13 +1959,253 @@ def _rea_families(tools):
     return "\n".join("- %s: %s" % (k, ", ".join(v[:14]) + (" …" if len(v) > 14 else "")) for k, v in sorted(fam.items(), key=lambda x: -len(x[1])))
 
 
+# ----- analysis engines REA can drive but does not install itself: 5belan asks the user, then downloads and wires them
+REA_ENV_FILE = os.path.join(DATA_DIR, "tools", "rea_env.json")
+JADX_JAR_URL = "https://github.com/1013503897/jadx-headless-mcp/releases/download/v0.7.1/jadx-headless-mcp-0.7.1-all.jar"
+JADX_JAR_SHA = "6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75"
+REA_ENGINES = {
+    "java": "Java 21 (Eclipse Temurin JDK) — needed by Ghidra, jadx and apktool",
+    "ghidra": "Ghidra 12.1 — decompiles native programs (exe, dll, so, firmware) into readable code, lists strings and functions",
+    "jadx": "jadx — turns an APK's Java/Kotlin bytecode back into readable Java code",
+    "apktool": "apktool — decodes an APK's manifest, resources and smali",
+    "rizin": "rizin — disassembler and debugger for native programs",
+}
+
+
+def rea_env():
+    """Extra environment for the REA engine: paths of the engines 5belan installed (JAVA_HOME, GHIDRA_INSTALL_DIR, ...)."""
+    d = load_json(REA_ENV_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def rea_env_set(**kw):
+    d = rea_env()
+    for k, v in kw.items():
+        if k == "PATH_PREPEND":
+            d["PATH_PREPEND"] = [x for x in ([v] + list(d.get("PATH_PREPEND") or [])) if x][:8]
+        else:
+            d[k] = v
+    os.makedirs(os.path.dirname(REA_ENV_FILE), exist_ok=True)
+    save_json(REA_ENV_FILE, d)
+
+
+def rea_process_env(node):
+    env = dict(os.environ)
+    extra = rea_env()
+    paths = [os.path.dirname(os.path.abspath(node))] + list(extra.get("PATH_PREPEND") or [])
+    if extra.get("JAVA_HOME"):
+        paths.append(os.path.join(extra["JAVA_HOME"], "bin"))
+    for k, v in extra.items():
+        if k != "PATH_PREPEND" and isinstance(v, str):
+            env[k] = v
+    env["PATH"] = os.pathsep.join(paths + [env.get("PATH", "")])
+    env.pop("GH_TOKEN", None)
+    return env
+
+
+def _http_json(url):
+    hdr = {"User-Agent": "5belan", "Accept": "application/vnd.github+json" if "api.github.com" in url else "application/json"}
+    req = urllib.request.Request(url, headers=hdr)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _download(url, dest, sha256, progress=None, stop=None, label=""):
+    """Download to dest and check its SHA-256 (refuses a file that does not match)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "5belan"})
+    h = hashlib.sha256()
+    got, step = 0, 50 * 1048576
+    with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        nxt = step
+        while True:
+            if stop is not None and stop.is_set():
+                raise ToolError("stopped by the user")
+            chunk = r.read(1048576)
+            if not chunk:
+                break
+            f.write(chunk)
+            h.update(chunk)
+            got += len(chunk)
+            if progress and got >= nxt:
+                nxt += step
+                progress("أنزّل %s… %d ميغا%s" % (label, got // 1048576, (" من %d" % (total // 1048576)) if total else ""))
+    if sha256 and h.hexdigest().lower() != sha256.lower():
+        raise ToolError("the downloaded %s did not match its official SHA-256; it was not installed" % (label or "file"))
+    return dest
+
+
+def _unzip_keep_modes(arc, out):
+    """Extract a zip and keep the executable bits (Ghidra's scripts and native decompiler need them on Linux/macOS)."""
+    with zipfile.ZipFile(arc) as z:
+        for info in z.infolist():
+            target = os.path.normpath(os.path.join(out, info.filename))
+            if not _inside(out, target):
+                continue
+            if info.is_dir():
+                os.makedirs(target, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with z.open(info) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1048576)
+            mode = (info.external_attr >> 16) & 0o777
+            if mode and not IS_WIN:
+                os.chmod(target, mode)
+
+
+def _untar(arc, out):
+    import tarfile
+    with tarfile.open(arc) as t:
+        try:
+            t.extractall(out, filter="data")
+        except TypeError:
+            t.extractall(out)
+
+
+def _arch():
+    import platform
+    return "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+
+
+def _os_name():
+    return "windows" if IS_WIN else ("mac" if IS_MAC else "linux")
+
+
+def engine_plan(engine):
+    """(what will be downloaded, approximate MB) for the approval question, without downloading anything."""
+    if engine == "java":
+        a = _http_json("https://api.adoptium.net/v3/assets/latest/21/hotspot?os=%s&architecture=%s&image_type=jdk" % (_os_name(), _arch()))
+        pkg = a[0]["binary"]["package"]
+        return {"url": pkg["link"], "sha": pkg["checksum"], "name": pkg["name"], "mb": pkg["size"] // 1048576}
+    if engine == "ghidra":
+        rel = next((r for r in _http_json("https://api.github.com/repos/NationalSecurityAgency/ghidra/releases?per_page=20")
+                    if r.get("tag_name", "").startswith("Ghidra_12.1") and not r.get("prerelease")), None)
+        asset = next((x for x in (rel or {}).get("assets") or [] if x["name"].endswith(".zip")), None)
+        if not asset:
+            raise ToolError("could not find a Ghidra 12.1 release")
+        return {"url": asset["browser_download_url"], "sha": (asset.get("digest") or "").replace("sha256:", ""), "name": asset["name"], "mb": asset["size"] // 1048576}
+    if engine == "jadx":
+        return {"url": JADX_JAR_URL, "sha": JADX_JAR_SHA, "name": "jadx-headless-mcp-0.7.1-all.jar", "mb": 30}
+    if engine == "apktool":
+        rel = _http_json("https://api.github.com/repos/iBotPeaches/Apktool/releases/latest")
+        asset = next((x for x in rel.get("assets") or [] if x["name"].endswith(".jar")), None)
+        if not asset:
+            raise ToolError("could not find an apktool release")
+        return {"url": asset["browser_download_url"], "sha": (asset.get("digest") or "").replace("sha256:", ""), "name": asset["name"], "mb": max(1, asset["size"] // 1048576)}
+    if engine == "rizin":
+        rel = _http_json("https://api.github.com/repos/rizinorg/rizin/releases/latest")
+        if IS_WIN:
+            pick = lambda n: n.startswith("rizin-windows-static") and n.endswith(".zip")
+        elif IS_MAC:
+            raise ToolError("on macOS install rizin with Homebrew (brew install rizin); it then works from PATH")
+        else:
+            pick = lambda n: n.endswith("-static-x86_64.tar.xz") and _arch() == "x64"
+        asset = next((x for x in rel.get("assets") or [] if pick(x["name"])), None)
+        if not asset:
+            raise ToolError("no rizin build for this system")
+        return {"url": asset["browser_download_url"], "sha": (asset.get("digest") or "").replace("sha256:", ""), "name": asset["name"], "mb": max(1, asset["size"] // 1048576)}
+    raise ToolError("unknown engine; use one of: " + ", ".join(REA_ENGINES))
+
+
+def engine_installed(engine):
+    e = rea_env()
+    key = {"java": "JAVA_HOME", "ghidra": "GHIDRA_INSTALL_DIR", "jadx": "REA_JADX_MCP_JAR", "apktool": "REA_APKTOOL_COMMAND"}.get(engine)
+    if key:
+        return bool(e.get(key)) and os.path.exists(e[key])
+    if engine == "rizin":
+        return bool(shutil.which("rizin")) or any(os.path.isfile(os.path.join(x, "rizin.exe" if IS_WIN else "rizin")) for x in e.get("PATH_PREPEND") or [])
+    return False
+
+
+def install_engine(engine, plan, progress=None, stop=None):
+    """Download one engine (already approved), verify it and record where it is for REA. Returns a short report."""
+    base = os.path.join(DATA_DIR, "tools")
+    os.makedirs(base, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="belan_eng_", dir=base)
+    try:
+        arc = _download(plan["url"], os.path.join(tmp, plan["name"]), plan["sha"], progress, stop, engine)
+        if progress:
+            progress("أفك وأجهّز %s…" % engine)
+        if engine == "java":
+            out = os.path.join(tmp, "x")
+            os.makedirs(out)
+            (_unzip_keep_modes if arc.endswith(".zip") else _untar)(arc, out)
+            top = os.path.join(out, os.listdir(out)[0])
+            if IS_MAC and os.path.isdir(os.path.join(top, "Contents", "Home")):
+                top = os.path.join(top, "Contents", "Home")
+            dest = os.path.join(base, "jdk21")
+            shutil.rmtree(dest, ignore_errors=True)
+            shutil.move(top, dest)
+            rea_env_set(JAVA_HOME=dest)
+            return "Java 21 installed: " + dest
+        if engine == "ghidra":
+            out = os.path.join(tmp, "x")
+            os.makedirs(out)
+            _unzip_keep_modes(arc, out)
+            top = os.path.join(out, os.listdir(out)[0])
+            dest = os.path.join(base, "ghidra")
+            shutil.rmtree(dest, ignore_errors=True)
+            shutil.move(top, dest)
+            rea_env_set(GHIDRA_INSTALL_DIR=dest)
+            return "Ghidra installed: " + dest
+        if engine == "jadx":
+            dest = os.path.join(base, "jadx")
+            os.makedirs(dest, exist_ok=True)
+            jar = os.path.join(dest, plan["name"])
+            shutil.move(arc, jar)
+            rea_env_set(REA_JADX_MCP_JAR=jar)
+            return "jadx installed: " + jar
+        if engine == "apktool":
+            dest = os.path.join(base, "apktool")
+            os.makedirs(dest, exist_ok=True)
+            jar = os.path.join(dest, "apktool.jar")
+            shutil.move(arc, jar)
+            java = os.path.join(rea_env().get("JAVA_HOME", ""), "bin", "java.exe" if IS_WIN else "java")
+            if IS_WIN:
+                launcher = os.path.join(dest, "apktool.bat")
+                with open(launcher, "w", encoding="utf-8") as f:
+                    f.write('@echo off\r\n"%s" -jar "%%~dp0apktool.jar" %%*\r\n' % java)
+            else:
+                launcher = os.path.join(dest, "apktool")
+                with open(launcher, "w", encoding="utf-8") as f:
+                    f.write('#!/bin/sh\nexec "%s" -jar "$(dirname "$0")/apktool.jar" "$@"\n' % java)
+                os.chmod(launcher, 0o755)
+            rea_env_set(REA_APKTOOL_COMMAND=launcher)
+            return "apktool installed: " + launcher
+        if engine == "rizin":
+            out = os.path.join(tmp, "x")
+            os.makedirs(out)
+            (_unzip_keep_modes if arc.endswith(".zip") else _untar)(arc, out)
+            dest = os.path.join(base, "rizin")
+            shutil.rmtree(dest, ignore_errors=True)
+            shutil.move(out, dest)
+            exe = "rizin.exe" if IS_WIN else "rizin"
+            bindir = next((r for r, _d, fs in os.walk(dest) if exe in fs), None)
+            if not bindir:
+                raise ToolError("rizin was downloaded but its program was not found inside")
+            rea_env_set(PATH_PREPEND=bindir)
+            return "rizin installed: " + bindir
+        raise ToolError("unknown engine")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def rea_restart():
+    """Stop the running engine so the next call starts it again with the new engine paths."""
+    with _REA["lock"]:
+        c = _REA.get("client")
+        _REA["client"] = None
+    if c is not None:
+        c.close()
+
+
 def rea_doctor():
     """Which analysis engines REA can use on this computer (from `rea doctor`): [(name, ok, detail)]."""
     node, rea = find_node(), find_rea()
     if not node or not rea:
         return []
     try:
-        out = subprocess.run([node, rea, "doctor"], capture_output=True, timeout=90,
+        out = subprocess.run([node, rea, "doctor"], capture_output=True, timeout=90, env=rea_process_env(node),
                              **({"creationflags": 0x08000000} if IS_WIN else {})).stdout.decode("utf-8", "replace")
     except Exception:
         return []
@@ -2091,6 +2341,8 @@ def tools_prompt(runner):
             "REVERSE ENGINEERING: you can analyze programs, games, APKs, Electron apps, firmware, libraries and websites with REA. When the "
             "user asks to reverse engineer or to understand how something works inside, call reverse_engineering_start first (it sets "
             "everything up, even the first time), then rea_find_tools -> rea_tool_help -> rea_call. Ask for the target's path if it is missing. "
+            "When the job needs an engine this computer lacks (provider_unavailable, or listed as not installed) call rea_install_engine: "
+            "it asks the user before downloading anything. "
             + REA_METHOD)
     if runner.browser is not None:
         parts.append(
@@ -3222,6 +3474,8 @@ class ToolRunner:
             return "بحث في أدوات الهندسة العكسية: %s" % _cut(a.get("query", ""), 80)
         if name == "rea_tool_help":
             return "قراءة طريقة استخدام: %s" % a.get("name", "")
+        if name == "rea_install_engine":
+            return "تثبيت محرك للهندسة العكسية: %s" % a.get("engine", "")
         if name == "rea_call":
             return "هندسة عكسية · %s: %s" % (a.get("name", ""), _cut(a.get("explanation") or "", 160))
         if name == "todo_write":
@@ -3238,6 +3492,30 @@ class ToolRunner:
                 return True
             return bool(self.confirm(title, detail))
         return rea_client(ask, self.progress)
+
+    def rea_install_engine(self, a):
+        engine = str(a.get("engine") or "").lower()
+        if engine not in REA_ENGINES:
+            raise ToolError("unknown engine; use one of: " + ", ".join(REA_ENGINES))
+        need = ([] if engine in ("java", "rizin") or engine_installed("java") else ["java"]) + ([] if engine_installed(engine) else [engine])
+        if not need:
+            return "%s is already installed. Call reverse_engineering_start again if REA still says it is missing." % engine
+        plans = [(e, engine_plan(e)) for e in need]
+        total = sum(pl["mb"] for _e, pl in plans)
+        lines = "\n".join("- %s (%s، حوالي %d ميغا)" % (REA_ENGINES[e], pl["name"], pl["mb"]) for e, pl in plans)
+        # always asked, even in full-freedom mode: the user wanted to approve every engine download
+        if self.confirm is None or not self.confirm(
+                "تنزيل برنامج للهندسة العكسية",
+                "%s\n\nبنزّل من المصدر الرسمي، وأتأكد من بصمته، وأحطه في مجلد بيانات خبيلان (%s). المجموع تقريباً %d ميغا. أنزّله؟\n\n%s"
+                % (a.get("reason") or "", os.path.join(DATA_DIR, "tools"), total, lines)):
+            raise ToolError("the user said no to downloading %s; continue without it and tell them what it would have unlocked" % engine)
+        done = []
+        for e, pl in plans:
+            done.append(install_engine(e, pl, self.progress, self.stop_event))
+        rea_restart()
+        doc = rea_doctor()
+        state = ", ".join("%s %s" % (n, "ready" if ok else "missing") for n, ok, _d in doc if n in ("ghidra", "jadx", "hopper", "kuna-installation", "node")) or "unknown"
+        return "\n".join(done) + "\nThe REA engine was restarted with it. Engine check now: " + state
 
     def rea_start(self, a):
         c = self._rea()
@@ -3383,7 +3661,7 @@ class ToolRunner:
             mapping["todo_write"] = self.todo_write
         if self.rea_enabled:
             mapping.update({"reverse_engineering_start": self.rea_start, "rea_find_tools": self.rea_find_tools,
-                            "rea_tool_help": self.rea_tool_help, "rea_call": self.rea_call})
+                            "rea_tool_help": self.rea_tool_help, "rea_call": self.rea_call, "rea_install_engine": self.rea_install_engine})
         if self.browser is not None:
             mapping.update({
                 "browser_open": self.browser_open,
@@ -4534,6 +4812,7 @@ TOOL_GROUPS = {
     "rea_find_tools": ("reverse", "الهندسة العكسية"),
     "rea_tool_help": ("reverse", "الهندسة العكسية"),
     "rea_call": ("reverse", "الهندسة العكسية"),
+    "rea_install_engine": ("reverse", "الهندسة العكسية"),
     "start_background": ("shell", "تشغيل أوامر على الجهاز"),
     "read_background": ("shell", "تشغيل أوامر على الجهاز"),
     "stop_background": ("shell", "تشغيل أوامر على الجهاز"),
@@ -4578,7 +4857,7 @@ def _clean_title(text, limit=58):
 
 
 _SUMMARY_KEYS = {
-    "reverse_engineering_start": "rea", "rea_find_tools": "rea", "rea_tool_help": "rea", "rea_call": "rea",
+    "reverse_engineering_start": "rea", "rea_find_tools": "rea", "rea_tool_help": "rea", "rea_call": "rea", "rea_install_engine": "rea",
     "read_file": "read", "analyze_file": "analyze", "list_folder": "list", "search_files": "search", "grep": "search", "find_files": "search",
     "write_file": "write", "edit_file": "write", "save_notes": "write", "make_dir": "mkdir",
     "move_path": "delete", "delete_path": "delete", "run_command": "cmd", "run_python": "py", "pip_install": "pip",
@@ -4751,7 +5030,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.36.0"
+APP_VERSION = "2.37.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
