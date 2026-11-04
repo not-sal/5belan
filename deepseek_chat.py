@@ -3034,6 +3034,159 @@ NOTES_NAME = ".5belan-notes.md"
 NOTES_MAX = 3000
 
 
+# ---------------------------------------------------------------- network: proxy (Windows settings / PAC / manual), IPv4 first, diagnosis
+# Company networks often send everything through a proxy, sometimes only described by a PAC script, which Python does not read by
+# itself. This installs ONE opener for every request of the app, so DeepSeek, updates, Telegram and downloads all use the same route.
+NET = {"mode": "auto", "url": "", "active": "", "why": ""}
+NET_RETRY_WAITS = (2, 4, 8, 15, 25, 40)  # a reply that lost the connection is retried this many times before giving up
+
+
+def _win_inet_settings():
+    if not IS_WIN:
+        return {}
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        out = {}
+        for name in ("ProxyEnable", "ProxyServer", "AutoConfigURL", "ProxyOverride"):
+            try:
+                out[name] = winreg.QueryValueEx(k, name)[0]
+            except OSError:
+                pass
+        return out
+    except Exception:
+        return {}
+
+
+def _pac_proxy(pac_url):
+    """The first PROXY a PAC script names (good enough for the usual company script: DIRECT for the intranet, PROXY for the rest)."""
+    try:
+        direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        txt = direct.open(urllib.request.Request(pac_url, headers={"User-Agent": "5belan"}), timeout=10).read(400000).decode("utf-8", "replace")
+    except Exception:
+        return ""
+    m = re.search(r"PROXY\s+([\w.\-\[\]:]+:\d+)", txt)
+    return m.group(1) if m else ""
+
+
+def net_proxy_choice():
+    """(proxy url or '', where it came from) for the current setting."""
+    mode = NET.get("mode") or "auto"
+    if mode == "none":
+        return "", "بدون بروكسي (اتصال مباشر)"
+    if mode == "manual":
+        u = (NET.get("url") or "").strip()
+        if u and "://" not in u:
+            u = "http://" + u
+        return u, "بروكسي يدوي"
+    sys_px = urllib.request.getproxies()
+    if sys_px.get("https") or sys_px.get("http"):
+        return sys_px.get("https") or sys_px.get("http"), "بروكسي إعدادات النظام"
+    st = _win_inet_settings()
+    if st.get("AutoConfigURL"):
+        px = _pac_proxy(st["AutoConfigURL"])
+        if px:
+            return "http://" + px, "بروكسي من سكربت الشركة (PAC)"
+    return "", "بدون بروكسي"
+
+
+def net_apply(mode=None, url=None):
+    """Build the route every request uses (call again when the setting changes)."""
+    if mode is not None:
+        NET["mode"] = mode
+    if url is not None:
+        NET["url"] = url
+    px, why = net_proxy_choice()
+    NET["active"], NET["why"] = px, why
+    handlers = [urllib.request.ProxyHandler({"http": px, "https": px} if px else {})]
+    if px and "@" in px:
+        handlers.append(urllib.request.ProxyBasicAuthHandler())
+    urllib.request.install_opener(urllib.request.build_opener(*handlers))
+    return px, why
+
+
+def _prefer_ipv4():
+    """Try IPv4 addresses first: many company networks advertise IPv6 that goes nowhere, and each try then waits for a timeout."""
+    import socket
+    orig = socket.getaddrinfo
+    if getattr(orig, "_belan", False):
+        return
+
+    def gai(host, *a, **k):
+        res = orig(host, *a, **k)
+        return sorted(res, key=lambda r: 0 if r[0] == socket.AF_INET else 1)
+
+    gai._belan = True
+    socket.getaddrinfo = gai
+
+
+_prefer_ipv4()
+
+
+def net_is_connection_error(e):
+    return isinstance(e, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)) and not isinstance(e, urllib.error.HTTPError)
+
+
+def net_check(key=""):
+    """Walk the connection to DeepSeek step by step and say, in plain Arabic, where it stops: [(step, ok, detail)]."""
+    import socket
+    import ssl
+    host = "api.deepseek.com"
+    rows = []
+    px, why = net_apply()
+    rows.append(("الطريق", True, "%s%s" % (why, (": " + re.sub(r"//[^@/]*@", "//***@", px)) if px else "")))
+    if not px:
+        try:
+            ips = sorted({r[4][0] for r in socket.getaddrinfo(host, 443)})
+            rows.append(("الوصول لاسم الموقع (DNS)", True, ", ".join(ips[:3])))
+        except Exception as e:
+            rows.append(("الوصول لاسم الموقع (DNS)", False, "الشبكة ما تعرف api.deepseek.com (%s). غالباً الشركة حاجبته أو تحتاج بروكسي." % e))
+            return rows
+        try:
+            with socket.create_connection((host, 443), timeout=10) as sk:
+                rows.append(("الاتصال بالسيرفر", True, "منفذ 443 مفتوح"))
+                try:
+                    with ssl.create_default_context().wrap_socket(sk, server_hostname=host) as tls:
+                        issuer = dict(x[0] for x in tls.getpeercert().get("issuer", ()))
+                        rows.append(("التشفير (الشهادة)", True, "الشهادة من: %s" % issuer.get("organizationName", "?")))
+                except ssl.SSLCertVerificationError as e:
+                    rows.append(("التشفير (الشهادة)", False, "الشبكة تفتح الاتصال وتفحصه بشهادة ما يثق فيها الجهاز (%s). اطلب من IT تثبيت شهادة الشركة على اللابتوب." % e.verify_message))
+                    return rows
+        except Exception as e:
+            rows.append(("الاتصال بالسيرفر", False, "الجدار الناري قطع الاتصال (%s). جرّب «بروكسي إعدادات النظام» أو اسأل IT عن بروكسي الشركة." % e))
+            return rows
+    try:
+        req = urllib.request.Request("https://api.deepseek.com/user/balance", headers={"Authorization": "Bearer " + (key or "x"), "User-Agent": "5belan"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            rows.append(("طلب DeepSeek", True, "HTTP %d: يشتغل" % r.status))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read(3000).decode("utf-8", "replace")
+        except Exception:
+            pass
+        if e.code == 401:
+            rows.append(("طلب DeepSeek", True, "وصلت DeepSeek (المفتاح ناقص أو غلط، بس الشبكة سليمة)"))
+        elif e.code == 407:
+            rows.append(("طلب DeepSeek", False, "البروكسي يطلب تسجيل دخول. اكتب البروكسي يدوي بالشكل http://user:pass@host:port إذا الشركة تسمح."))
+        elif "deepseek" not in body.lower() and ("<html" in body.lower() or e.code in (403, 451)):
+            rows.append(("طلب DeepSeek", False, "رجعت صفحة حجب من الشبكة (HTTP %d): الشركة مانعة DeepSeek. هذا يحتاج موافقة IT." % e.code))
+        else:
+            rows.append(("طلب DeepSeek", False, "HTTP %d: %s" % (e.code, body[:160])))
+    except Exception as e:
+        t = str(e)
+        if "Tunnel connection failed: 407" in t:
+            why = "البروكسي يطلب تسجيل دخول. اكتب البروكسي يدوي بالشكل http://user:pass@host:port إذا الشركة تسمح."
+        elif "Tunnel connection failed" in t:
+            why = "بروكسي الشركة رفض الاتصال بـ DeepSeek (%s): الموقع محجوب عندهم، وهذا يحتاج موافقة IT." % t.split("failed:")[-1].strip(" >")
+        elif px and ("10061" in t or "refused" in t.lower() or "timed out" in t.lower()):
+            why = "البروكسي (%s) ما يرد. تأكد من عنوانه أو جرّب «تلقائي»." % re.sub(r"//[^@/]*@", "//***@", px)
+        else:
+            why = "ما وصل (%s)." % t
+        rows.append(("طلب DeepSeek", False, why))
+    return rows
+
+
 def api_chat(key, model, messages, tools=None, think="off", timeout=600, max_tokens=None):
     """One non-streaming call. Returns (message dict, usage dict)."""
     payload = {"model": model, "messages": messages, "stream": False}
@@ -3049,8 +3202,15 @@ def api_chat(key, model, messages, tools=None, think="off", timeout=600, max_tok
     req = urllib.request.Request(
         API_URL, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        obj = json.loads(r.read().decode("utf-8", errors="replace"))
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                obj = json.loads(r.read().decode("utf-8", errors="replace"))
+            break
+        except Exception as e:
+            if attempt == 3 or not net_is_connection_error(e):
+                raise
+            time.sleep(NET_RETRY_WAITS[attempt])
     return (obj.get("choices") or [{}])[0].get("message") or {}, obj.get("usage") or {}
 
 
@@ -5030,7 +5190,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.37.0"
+APP_VERSION = "2.38.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -6585,7 +6745,7 @@ CHAT_WIDTHS = {
 class AppSettingsDialog(QDialog):
     """Application-wide settings (like the Settings page in the Claude app): account, appearance, updates."""
 
-    def __init__(self, parent, key, remember, theme, update_url, width="wide", suggest=True, auto_update=False, skill_offers=True, khaled=False, rea=True):
+    def __init__(self, parent, key, remember, theme, update_url, width="wide", suggest=True, auto_update=False, skill_offers=True, khaled=False, rea=True, net_mode="auto", net_url="", api_key=""):
         super().__init__(parent)
         self.setWindowTitle("إعدادات التطبيق")
         self.resize(600, 560)
@@ -6655,6 +6815,28 @@ class AppSettingsDialog(QDialog):
         self.rea_box = QCheckBox("الهندسة العكسية (REA): لما تطلب تحليل برنامج أو لعبة أو تطبيق، خبيلان يجهّز الأداة ويشتغل على طول")
         self.rea_box.setChecked(bool(rea))
         lay.addWidget(self.rea_box)
+        hn = QLabel("الشبكة")
+        hn.setObjectName("h2")
+        lay.addWidget(hn)
+        rown = QHBoxLayout()
+        rown.addWidget(QLabel("الاتصال بالإنترنت:"))
+        self.net_box = QComboBox()
+        self.net_box.addItem("تلقائي (إعدادات ويندوز وبروكسي الشركة)", "auto")
+        self.net_box.addItem("بدون بروكسي", "none")
+        self.net_box.addItem("بروكسي يدوي", "manual")
+        self.net_box.setCurrentIndex(max(0, self.net_box.findData(net_mode)))
+        rown.addWidget(self.net_box, 1)
+        self.net_url = QLineEdit(net_url)
+        self.net_url.setLayoutDirection(Qt.LeftToRight)
+        self.net_url.setPlaceholderText("http://proxy.company.com:8080")
+        self.net_url.setEnabled(net_mode == "manual")
+        self.net_box.currentIndexChanged.connect(lambda _i: self.net_url.setEnabled(self.net_box.currentData() == "manual"))
+        rown.addWidget(self.net_url, 1)
+        bn = QPushButton("فحص الاتصال")
+        bn.clicked.connect(self._net_check)
+        rown.addWidget(bn)
+        lay.addLayout(rown)
+        self._api_key = api_key
         self._count_skills()
         h3 = QLabel("التحديثات")
         h3.setObjectName("h3")
@@ -6693,6 +6875,33 @@ class AppSettingsDialog(QDialog):
         self.import_requested = True
         self.accept()
 
+    def _net_check(self):
+        """Try the route chosen here (without saving it) and show where the connection to DeepSeek stops."""
+        old = (NET.get("mode"), NET.get("url"))
+        mode, url = self.net_box.currentData() or "auto", self.net_url.text().strip()
+        box = QMessageBox(self)
+        box.setWindowTitle("فحص الاتصال")
+        box.setText("أفحص الاتصال بـ DeepSeek…")
+        box.setStandardButtons(QMessageBox.StandardButton.Close)
+        box.show()
+
+        def work():
+            try:
+                net_apply(mode, url)
+                return net_check(self.key_edit.text().strip() or self._api_key)
+            finally:
+                net_apply(*old)
+
+        def done(rows, err):
+            if err:
+                box.setText("الفحص نفسه فشل: %s" % err)
+                return
+            ok_all = all(r[1] for r in rows)
+            box.setText(("الاتصال سليم، خبيلان يقدر يشتغل على هذي الشبكة." if ok_all else "لقيت وين يوقف الاتصال:") + "\n\n" +
+                        "\n".join("%s %s: %s" % ("✓" if ok else "✗", step, det) for step, ok, det in rows))
+
+        run_later(self, work, done)
+
     def _count_skills(self):
         n = len(list_skills())
         self.skills_label.setText(("عندك %d مهارة. تختار اللي تبيها لكل محادثة من «إعدادات المحادثة»." % n) if n else "ما عندك مهارات للحين.")
@@ -6717,6 +6926,8 @@ class AppSettingsDialog(QDialog):
             "skill_offers": self.offer_box.isChecked(),
             "khaled": self.khaled_box.isChecked(),
             "rea": self.rea_box.isChecked(),
+            "net_mode": self.net_box.currentData() or "auto",
+            "net_url": self.net_url.text().strip(),
         }
 
 
@@ -11381,6 +11592,10 @@ class App(QMainWindow):
         cfg = load_json(CONFIG_PATH, {})
         self.cfg = cfg if isinstance(cfg, dict) else {}
         cfg = self.cfg
+        try:
+            net_apply(cfg.get("net_proxy_mode") or "auto", cfg.get("net_proxy_url") or "")
+        except Exception as ex:
+            log_event("network setup: %s" % ex)
         if not cfg.get("upd_notify_only"):  # 2.28.0: a new version only tells you (orange button); you decide, auto-update is opt-in
             cfg["auto_update"] = False
             cfg["upd_notify_only"] = True
@@ -12487,7 +12702,8 @@ class App(QMainWindow):
                                 self.cfg.get("chat_width", "wide"),
                                 self.cfg.get("suggest", True) is not False, False,
                                 self.cfg.get("skill_offers", True) is not False, bool(self.cfg.get("khaled_button")),
-                                self.cfg.get("rea_enabled", True) is not False)
+                                self.cfg.get("rea_enabled", True) is not False, self.cfg.get("net_proxy_mode") or "auto",
+                                self.cfg.get("net_proxy_url") or "", self.key_edit.text().strip())
         if not dlg.exec():
             return
         v = dlg.values()
@@ -12496,6 +12712,9 @@ class App(QMainWindow):
         self.cfg["skill_offers"] = bool(v["skill_offers"])
         self.cfg["khaled_button"] = bool(v["khaled"])
         self.cfg["rea_enabled"] = bool(v["rea"])
+        self.cfg["net_proxy_mode"] = v["net_mode"]
+        self.cfg["net_proxy_url"] = v["net_url"]
+        net_apply(v["net_mode"], v["net_url"])
         self.key_edit.setText(v["key"])
         self.remember_box.setChecked(v["remember"])
         if v["remember"] and v["key"]:
@@ -16214,9 +16433,14 @@ class App(QMainWindow):
                 except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
                     if not isinstance(e, urllib.error.HTTPError):
                         net_retries += 1
-                        if net_retries <= 3 and not run.stop_event.is_set():
-                            put("warn", "انقطع الاتصال، أعيد المحاولة (%d/3)..." % net_retries)
-                            time.sleep(2 * net_retries)
+                        if net_retries <= len(NET_RETRY_WAITS) and not run.stop_event.is_set():
+                            wait_ = NET_RETRY_WAITS[net_retries - 1]
+                            put("warn", "ما قدرت أوصل لـ DeepSeek، أعيد المحاولة بعد %d ثانية (%d/%d)..." % (wait_, net_retries, len(NET_RETRY_WAITS)))
+                            end_ = time.time() + wait_
+                            while time.time() < end_ and not run.stop_event.is_set():
+                                time.sleep(0.25)
+                            if net_retries == 2:
+                                net_apply()  # the route may have changed (proxy turned on, Wi-Fi switched)
                             continue
                         raise
                     try:
@@ -16313,7 +16537,11 @@ class App(QMainWindow):
                     messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
                     self.report_changes(runner, run)
         except Exception as e:
-            put("err", str(e))
+            msg = str(e)
+            if net_is_connection_error(e):
+                msg = ("ما قدرت أوصل لـ DeepSeek بعد %d محاولات (%s).\nافتح إعدادات التطبيق ← الشبكة ← «فحص الاتصال» يقولك وين المشكلة بالضبط."
+                       % (len(NET_RETRY_WAITS) + 1, msg))
+            put("err", msg)
 
     @staticmethod
     def shrink_messages(messages):
