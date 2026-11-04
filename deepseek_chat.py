@@ -3127,6 +3127,59 @@ def net_is_connection_error(e):
     return isinstance(e, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)) and not isinstance(e, urllib.error.HTTPError)
 
 
+NET_REPORT_DIR = os.path.join(DATA_DIR, "network_reports")
+
+
+def net_looks_blocked(code, body):
+    """An HTTP answer that came from the network (a company proxy or filter), not from DeepSeek: DeepSeek answers errors in JSON."""
+    b = (body or "").strip().lower()
+    if code in (407, 451):
+        return True
+    if b.startswith("{") and ("error" in b or "deepseek" in b):
+        return False
+    return code in (403, 502, 503, 504, 511) and ("<html" in b or "<!doctype" in b or not b)
+
+
+def net_report_text(err, rows):
+    """The report the user can copy or send: when, what failed, the route, and every check step."""
+    import platform
+    lines = ["5belan %s · %s" % (APP_VERSION, time.strftime("%Y-%m-%d %H:%M:%S")),
+             "OS: %s" % platform.platform(),
+             "الخطأ: %s" % (err or "-"),
+             "الطريق: %s%s" % (NET.get("why") or "-", (" (" + re.sub(r"//[^@/]*@", "//***@", NET.get("active") or "") + ")") if NET.get("active") else ""),
+             "", "فحص الاتصال:"]
+    lines += ["%s %s: %s" % ("✓" if ok else "✗", st, det) for st, ok, det in rows] or ["(ما تم)"]
+    return "\n".join(lines)
+
+
+def net_save_report(text):
+    try:
+        os.makedirs(NET_REPORT_DIR, exist_ok=True)
+        path = os.path.join(NET_REPORT_DIR, "network_%s.txt" % time.strftime("%Y%m%d_%H%M%S"))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        old = sorted(os.listdir(NET_REPORT_DIR))
+        for fn in old[:-30]:  # keep the last 30
+            try:
+                os.remove(os.path.join(NET_REPORT_DIR, fn))
+            except OSError:
+                pass
+        return path
+    except Exception:
+        return ""
+
+
+def net_last_report():
+    try:
+        files = sorted(os.listdir(NET_REPORT_DIR))
+        if files:
+            with open(os.path.join(NET_REPORT_DIR, files[-1]), "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+    except Exception:
+        pass
+    return ""
+
+
 def net_check(key=""):
     """Walk the connection to DeepSeek step by step and say, in plain Arabic, where it stops: [(step, ok, detail)]."""
     import socket
@@ -5190,7 +5243,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.38.1"
+APP_VERSION = "2.39.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -7758,6 +7811,9 @@ def build_problem_report(tb=""):
     crash = _report_native_crash()
     if crash:
         lines += ["", "--- native crash (crash.log) ---", crash]
+    netr = net_last_report()
+    if netr:
+        lines += ["", "--- last network report ---", netr.strip()]
     try:
         with open(EVENTS_LOG, "r", encoding="utf-8", errors="replace") as f:
             lines += ["", "--- last events ---"] + f.read().splitlines()[-25:]
@@ -14220,6 +14276,59 @@ class App(QMainWindow):
             f.setForeground(QColor(col["accent"]))
             c.insertText(bidi_fix(it), f)
 
+    def show_network_failure(self, err):
+        """خبيلان could not reach DeepSeek: find out why (in the background), save the report, and show it with a copy button."""
+        if time.time() - getattr(self, "_netfail_t", 0) < 90:  # one window at a time, not one per chat
+            return
+        self._netfail_t = time.time()
+        key = self.key_edit.text().strip()
+
+        def done(rows, ex):
+            text = net_report_text(err, rows or [("فحص الاتصال", False, str(ex))] if ex else rows or [])
+            path = net_save_report(text)
+            log_event("network failure: %s" % _cut(str(err), 200))
+            dlg = QDialog(self)
+            dlg.setWindowTitle("خبيلان ما قدر يتصل بـ DeepSeek")
+            dlg.resize(620, 420)
+            v = QVBoxLayout(dlg)
+            blocked = any(not ok and ("محجوب" in det or "حجب" in det or "IT" in det) for _s, ok, det in (rows or []))
+            head = QLabel("شبكة الشركة حاجبة DeepSeek. هذا يحتاج موافقة قسم IT، وهذا التقرير يوضح لهم المطلوب." if blocked
+                          else "ما قدرت أوصل لـ DeepSeek. هذا اللي لقيته:")
+            head.setWordWrap(True)
+            head.setObjectName("h2")
+            v.addWidget(head)
+            body = QPlainTextEdit(text)
+            body.setReadOnly(True)
+            body.setLayoutDirection(Qt.RightToLeft)
+            v.addWidget(body, 1)
+            if path:
+                where = QLabel("انحفظ هنا: " + path)
+                where.setObjectName("chip")
+                where.setWordWrap(True)
+                where.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                v.addWidget(where)
+            row = QHBoxLayout()
+            cp = QPushButton("نسخ التقرير")
+            cp.clicked.connect(lambda: (self._copy(text), cp.setText("انتسخ")))
+            row.addWidget(cp)
+            if path:
+                op = QPushButton("فتح المجلد")
+                op.clicked.connect(lambda: open_path(os.path.dirname(path)))
+                row.addWidget(op)
+            row.addStretch(1)
+            cl = QPushButton("إغلاق")
+            cl.clicked.connect(dlg.accept)
+            row.addWidget(cl)
+            v.addLayout(row)
+            dlg.setAttribute(Qt.WA_DeleteOnClose)
+            dlg.show()
+            try:
+                QApplication.alert(self, 5000)
+            except Exception:
+                pass
+
+        run_later(self, lambda: net_check(key), done)
+
     def maybe_khaled_flash(self, t0):
         """«زر خالد»: the reply is done and nobody touched the computer for a minute while it was thinking -> flash the screen."""
         if not self.cfg.get("khaled_button"):
@@ -16501,6 +16610,10 @@ class App(QMainWindow):
                         use_tools = False
                         put("warn", "هذي المحادثة قديمة وما تدعم ملفات الجهاز، فأرسلت الطلب بدونها. ابدأ محادثة جديدة لو تبيها.")
                         continue
+                    if net_looks_blocked(e.code, detail):
+                        put("err", "شبكة الشركة منعت الاتصال بـ DeepSeek (HTTP %s). طلعت لك نافذة فيها التفاصيل وتقدر تنسخها." % e.code)
+                        put("netfail", "HTTP %s from the network, not from DeepSeek: %s" % (e.code, re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", detail))[:300]))
+                        return
                     put("err", "HTTP %s: %s" % (e.code, detail))
                     return
                 except urllib.error.HTTPError as e:
@@ -16518,6 +16631,10 @@ class App(QMainWindow):
                         self.shrink_messages(messages)
                         put("warn", "المحادثة طويلة جداً، قصّرت النتائج القديمة وأعيد المحاولة...")
                         continue
+                    if net_looks_blocked(e.code, detail):
+                        put("err", "شبكة الشركة منعت الاتصال بـ DeepSeek (HTTP %s). طلعت لك نافذة فيها التفاصيل وتقدر تنسخها." % e.code)
+                        put("netfail", "HTTP %s from the network, not from DeepSeek: %s" % (e.code, re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", detail))[:300]))
+                        return
                     put("err", "HTTP %s: %s" % (e.code, detail))
                     return
                 if run.stop_event.is_set():
@@ -16588,7 +16705,8 @@ class App(QMainWindow):
         except Exception as e:
             msg = str(e)
             if net_is_connection_error(e):
-                msg = ("ما قدرت أوصل لـ DeepSeek بعد %d محاولات (%s).\nافتح إعدادات التطبيق ← الشبكة ← «فحص الاتصال» يقولك وين المشكلة بالضبط."
+                put("netfail", msg)
+                msg = ("ما قدرت أوصل لـ DeepSeek بعد %d محاولات (%s).\nطلعت لك نافذة فيها سبب المشكلة، وتقدر تنسخها أو تلقاها محفوظة."
                        % (len(NET_RETRY_WAITS) + 1, msg))
             put("err", msg)
 
@@ -16973,6 +17091,8 @@ class App(QMainWindow):
                 self.finish(R)
                 self.maybe_khaled_flash((L or {}).get("t0"))
                 self.request_suggestions(ch_, len(ch_["msgs"]) - 1)
+            elif kind == "netfail":
+                self.show_network_failure(val)
             elif kind == "err":
                 ch_ = R.chat
                 cur = R is self.cur_run
