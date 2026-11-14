@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import queue
+import random
 import re
 import shutil
 import subprocess
@@ -106,6 +107,9 @@ def usage_cost(model, u, ts=None):
     hit, miss = int(hit or 0), int(miss or 0)
     out = int(u.get("completion_tokens") or 0)
     usd = (hit * h + miss * m + out * o) / 1e6 * (1.0 if is_peak(ts) else 0.5)
+    stu = u.get("server_tool_use") or {}
+    if isinstance(stu, dict):  # web searches and page reads are billed per use, on top of tokens
+        usd += sum(int(stu.get(k) or 0) for k in ("tool_search", "tool_fetch", "tool_image_search")) * WEB_SEARCH_USD
     return usd, pt, out, hit
 THINKING_LEVELS = ["off", "low", "high", "max"]
 
@@ -147,8 +151,8 @@ SYSTEM_PROMPT = (
     'type is bar, barh, line, pie or scatter. For scatter use "points":[[x,y],...] in each series instead of labels and values. '
     "Pie charts use the first series only. Use only real numbers the user gave you or clearly labelled sample data. "
     "The app draws the chart and shows it in the chat.\n"
-    "LIMITS: you cannot create photos or AI-generated pictures. For visuals use charts, SVG diagrams or SVG illustrations. "
-    "If the user asks for a photo, explain that this app cannot generate one."
+    "PICTURES: real AI pictures (photos, art, logos, posters) are made with the generate_image tool when it is available; "
+    "charts and diagrams are better as chart blocks or SVG."
 )
 
 ARABIC_RE = re.compile(r"[؀-ۿ]")
@@ -388,20 +392,68 @@ def read_xlsx(path):
         return "\n".join(out)
 
 
+OFFICE_PARSE_EXTS = (".doc", ".ppt", ".xls", ".odt", ".odp", ".ods", ".rtf", ".pages", ".key", ".numbers", ".epub", ".wps",
+                     ".dps", ".et", ".hwp", ".xlsm", ".xlsb", ".docm", ".pptm", ".dotx", ".potx", ".bmp", ".tif", ".tiff", ".heic")
+
+
+def read_pptx(path):
+    """Text of every slide (and its speaker notes) of a PowerPoint file, without extra packages."""
+    out = []
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+
+        def num(n):
+            m = re.search(r"(\d+)\.xml$", n)
+            return int(m.group(1)) if m else 0
+        for n in sorted([x for x in names if re.match(r"ppt/slides/slide\d+\.xml$", x)], key=num):
+            x = z.read(n).decode("utf-8", errors="replace")
+            paras = []
+            for p in re.findall(r"<a:p>.*?</a:p>", x, re.S):
+                t = "".join(html.unescape(t_) for t_ in re.findall(r"<a:t>(.*?)</a:t>", p, re.S))
+                if t.strip():
+                    paras.append(t)
+            note = "ppt/notesSlides/notesSlide%d.xml" % num(n)
+            notes = ""
+            if note in names:
+                nx = z.read(note).decode("utf-8", errors="replace")
+                notes = " ".join(html.unescape(t_) for t_ in re.findall(r"<a:t>(.*?)</a:t>", nx, re.S) if not t_.strip().isdigit())
+            out.append("[Slide %d]\n%s%s" % (num(n), "\n".join(paras), ("\n(notes: %s)" % notes.strip()) if notes.strip() else ""))
+    return "\n\n".join(out)
+
+
 def read_document(path):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".docx":
         text = read_docx(path)
     elif ext == ".pdf":
-        text = read_pdf(path)
+        try:
+            text = read_pdf(path)
+        except RuntimeError:
+            if not DS_KEY:
+                raise
+            text = ds_parse_file(path)  # a scanned PDF: DeepSeek reads the pages (OCR)
     elif ext == ".xlsx":
         text = read_xlsx(path)
+    elif ext == ".pptx":
+        text = read_pptx(path)
+    elif ext in ARCHIVE_EXTS and ext not in (".apk", ".jar", ".iso"):
+        text = read_archive(path)
+    elif ext in IMAGE_MIME or ext in OFFICE_PARSE_EXTS:
+        if not DS_KEY:
+            raise RuntimeError("this file type is read by DeepSeek file parsing, which needs the API key")
+        text = ds_parse_file(path)
     else:
         with open(path, "rb") as f:
             data = f.read()
         if b"\x00" in data[:4096]:
-            raise RuntimeError("Unsupported binary file type")
-        text = decode_text(data)
+            if not DS_KEY:
+                raise RuntimeError("Unsupported binary file type")
+            try:
+                text = ds_parse_file(path)  # maybe an Office/document format DeepSeek can read
+            except Exception:
+                raise RuntimeError("Unsupported binary file type")
+        else:
+            text = decode_text(data)
     if len(text) > MAX_TEXT_CHARS:
         text = text[:MAX_TEXT_CHARS] + "\n[...truncated...]"
     return text
@@ -1103,6 +1155,8 @@ def strip_for_save(msg):
         out["cost"] = msg["cost"]
     if msg.get("sources"):
         out["sources"] = msg["sources"]
+    if msg.get("images"):
+        out["images"] = [str(p) for p in msg["images"][:12]]
     if msg.get("sugg"):
         out["sugg"] = msg["sugg"][:3]
     if msg.get("skill_offer"):
@@ -2323,6 +2377,24 @@ def tools_prompt(runner):
             "files written there are scratch and stay hidden: the user sees a file in the chat attachments ONLY when your reply names it by file name, so name the files they asked for (or that you want them to look at) in your final reply, and never name scratch files. If a library is missing call pip_install once, then run again. If the code fails, read the error, fix it and run again "
             "(at most 3 tries, then explain). Never use input(), never plt.show(), never touch system files. Tell the user briefly what the result is."
         )
+    if runner.work_dir:
+        parts.append(
+            "PICTURES: generate_image makes real AI pictures. Turn the user's idea into a rich ENGLISH prompt (subject, details, setting, "
+            "composition, lighting, colors, mood, style) and pick a fitting size (1344x768 wide, 768x1344 story/poster, 1024x1024 square). "
+            "Pictures cannot contain correct Arabic writing: make the picture without text, then add the words with add_text_to_image. "
+            "After a picture is made, ask nothing; briefly say what you made and offer one or two concrete variations.")
+    if runner.llm is not None:
+        parts.append(
+            "TRANSLATION: for any translation longer than a couple of sentences, and for EVERY file, use the translate tool (translator + "
+            "reviewer, the user's glossary, consistent terms). A file comes back in the same format (Word -> Word, Excel -> Excel, "
+            "PowerPoint -> PowerPoint, subtitles keep timings; PDF -> Word): name the new file in your reply. Use dictionary_lookup "
+            "when unsure of a single word, arabic_text_tools for diacritics/numbers in words, and glossary_save when the user says a term "
+            "must always be translated a certain way.")
+    if runner.web_builtin or runner.web_fn:
+        parts.append(
+            "WEB: you can search the web and read pages (" + ("built in" if runner.web_builtin else "web_search and read_url") + "). "
+            "Search whenever the answer depends on recent or changing facts (news, prices, versions, laws, schedules) or you are not "
+            "sure; prefer official and recent sources and say where the information came from.")
     if runner.allow_computer:
         parts.append("COMPUTER: open_program opens an app/file/folder; open_in_chrome opens a URL or runs a Google search in the user's own Chrome.")
     if runner.terminal_ok:
@@ -3445,6 +3517,1113 @@ def clean_todos(items):
     return clean
 
 
+# ---------------------------------------------------------------- DeepSeek extras: live model list, news, web search, files, speech
+DS_API = "https://api.deepseek.com"
+DS_KEY = ""  # the API key, set by the app: used by the DeepSeek tools that run outside a chat request (file parsing, OCR, speech)
+DS_MODELS_PATH = os.path.join(DATA_DIR, "ds_models.json")
+DS_NEWS_URL = "https://api-docs.deepseek.com/updates"
+MODEL_INFO = {}  # model id -> {"name", "context", "max_out", "vision"} from GET /models
+WEB_SEARCH_USD = 0.00075  # per web search or page fetch (DeepSeek pricing page, Nov 2026)
+WEB_TOOLS = [{"type": "deepseek_web_search"}, {"type": "deepseek_read_url"}]
+TTS_VOICES = {"stella": "ستيلا (صوت أنثوي)", "tide": "تايد (صوت رجالي)"}
+
+
+def ds_models_apply(items):
+    """Merge DeepSeek's live model list into MODELS / VISION_MODELS. Returns the ids that were not known before."""
+    new = []
+    ids = []
+    for it in items or []:
+        mid = str((it or {}).get("id") or "").strip()
+        if not mid or not re.match(r"^[\w.\-]{2,60}$", mid):
+            continue
+        ids.append(mid)
+        mods = it.get("input_modalities") or []
+        if "image" in mods:
+            VISION_MODELS.add(mid)
+        elif mods:
+            VISION_MODELS.discard(mid)
+        MODEL_INFO[mid] = {"name": str(it.get("name") or mid)[:60], "context": int(it.get("context_window") or 0),
+                           "max_out": int(it.get("max_output_tokens") or 0), "vision": "image" in mods}
+        if mid not in MODELS:
+            MODELS.append(mid)
+            new.append(mid)
+    if ids:
+        # a model DeepSeek no longer lists is retired: drop it so no chat keeps calling it
+        MODELS[:] = [m for m in MODELS if m in ids] or MODELS
+    return new
+
+
+def ds_load_cached_models():
+    d = load_json(DS_MODELS_PATH, {})
+    if isinstance(d, dict) and isinstance(d.get("data"), list):
+        ds_models_apply(d["data"])
+
+
+def ds_fetch_models(key):
+    """GET /models (free). Saves the list so the app starts with it next time. Returns (new ids, list)."""
+    req = urllib.request.Request(DS_API + "/models", headers={"Authorization": "Bearer " + key, "User-Agent": "5belan"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        data = json.loads(r.read().decode("utf-8", errors="replace")).get("data") or []
+    known = set(load_json(DS_MODELS_PATH, {}).get("ids") or [])
+    new = [str(x.get("id")) for x in data if x.get("id") and known and x.get("id") not in known]
+    ds_models_apply(data)
+    save_json(DS_MODELS_PATH, {"t": time.time(), "data": data, "ids": [x.get("id") for x in data]})
+    return new, data
+
+
+def ds_fetch_news():
+    """The newest entries of DeepSeek's API change log: [(date, text)], newest first."""
+    req = urllib.request.Request(DS_NEWS_URL, headers={"User-Agent": "Mozilla/5.0 (5belan)"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        h = r.read().decode("utf-8", errors="replace")
+    out = []
+    parts = re.split(r"<h2[^>]*>", h)[1:]
+    for p in parts[:6]:
+        head, _, rest = p.partition("</h2>")
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", re.sub(r"<[^>]+>", "", head))
+        if not m:
+            continue
+        body = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", rest, flags=re.S)
+        body = re.sub(r"</(p|li|h3|h4|div)>", "\n", body)
+        body = html.unescape(re.sub(r"<[^>]+>", "", body)).replace("\u200b", "")
+        body = "\n".join(x.strip() for x in body.splitlines() if x.strip())
+        out.append((m.group(1), body[:1500]))
+    return out
+
+
+def _ds_post_json(path, body, key=None, timeout=120, raw=False):
+    key = key or DS_KEY
+    if not key:
+        raise RuntimeError("no DeepSeek API key")
+    req = urllib.request.Request(DS_API + path, data=json.dumps(body).encode("utf-8"),
+                                 headers={"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "5belan"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("DeepSeek HTTP %s: %s" % (e.code, e.read().decode("utf-8", errors="replace")[:300]))
+    return data if raw else json.loads(data.decode("utf-8", errors="replace"))
+
+
+def _ds_post_file(path, file_path, fields=None, key=None, timeout=300):
+    key = key or DS_KEY
+    if not key:
+        raise RuntimeError("no DeepSeek API key")
+    b = uuid.uuid4().hex
+    body = b""
+    for k, v in (fields or {}).items():
+        body += ('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (b, k, v)).encode("utf-8")
+    import mimetypes
+    ct = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    fname = os.path.basename(file_path).replace('"', "_")
+    with open(file_path, "rb") as f:
+        data = f.read()
+    body += ('--%s\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\nContent-Type: %s\r\n\r\n' % (b, fname, ct)).encode("utf-8")
+    body += data + ("\r\n--%s--\r\n" % b).encode("ascii")
+    req = urllib.request.Request(DS_API + path, data=body, headers={"Authorization": "Bearer " + key, "User-Agent": "5belan",
+                                                                   "Content-Type": "multipart/form-data; boundary=" + b})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("DeepSeek HTTP %s: %s" % (e.code, e.read().decode("utf-8", errors="replace")[:300]))
+
+
+DS_PARSE_MAX = 50 * 1024 * 1024
+
+
+def ds_parse_file(path, layout=False):
+    """DeepSeek file parsing / OCR: text of an image, a scanned PDF or an Office file (doc, ppt, xls, odt, rtf...)."""
+    if os.path.getsize(path) > DS_PARSE_MAX:
+        raise RuntimeError("the file is too big to parse (limit 50 MB)")
+    d = _ds_post_file("/v1/tools/ocr", path, {"purpose": "rich_layout_recognition" if layout else "text_recognition"})
+    pages = d.get("pages") or []
+    txt = "\n\n".join(("[page %d]\n" % (i + 1) if len(pages) > 1 else "") + str(p.get("text") or "") for i, p in enumerate(pages))
+    if layout:
+        txt = re.sub(r"<｜ref｜>.*?<｜/ref｜><｜box｜>.*?<｜/box｜>\s*", "", txt)
+    elif not txt.strip():
+        return ds_parse_file(path, layout=True)  # the plain reader sometimes returns nothing: try the layout reader once
+    return txt.strip()
+
+
+def ds_tts(text, voice="stella"):
+    """Text to speech (WAV bytes, 24 kHz mono). Markdown, code and tables are filtered by DeepSeek."""
+    return _ds_post_json("/v1/tools/tts", {"text": text, "voice_id": voice if voice in TTS_VOICES else "stella",
+                                           "format": "wav", "filter_markdown": True}, timeout=180, raw=True)
+
+
+def ds_asr(wav_path):
+    """Speech to text: WAV (mono 16-bit) or Ogg Opus, up to 120 s / 8 MB."""
+    return str(_ds_post_file("/v1/tools/asr", wav_path, timeout=180).get("text") or "").strip()
+
+
+def ds_web_search(query, key=None):
+    d = _ds_post_json("/v1/tools/search", {"query": str(query)[:400]}, key=key, timeout=90)
+    return d.get("results") or []
+
+
+def ds_web_fetch(url, key=None):
+    d = _ds_post_json("/v1/tools/fetch", {"url": str(url)}, key=key, timeout=120)
+    return str(d.get("content") or "")
+
+
+def speech_text(body):
+    """The part of a reply worth reading aloud: no code, no file blocks, no links, shortened."""
+    t = FILE_BLOCK_RE.sub(" ", body or "")
+    t = re.sub(r"```.*?```", " ", t, flags=re.S)
+    t = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", t)
+    t = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", t)
+    t = re.sub(r"https?://\S+", " ", t)
+    t = re.sub(r"[*_`#>|]+", " ", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{2,}", "\n", t).strip()
+    return t[:4000]
+
+
+# Web search / page reading as ordinary tools (used when thinking is off, where DeepSeek's built-in web tools
+# cannot be combined with the app's own tools).
+WEB_FN_TOOLS = [
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the web (DeepSeek search). Returns titles, links and summaries of the best results. Use it for anything "
+                       "current or that you are not sure about (news, prices, versions, people, places). Cite the links you used.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "The search query, in the best language for the topic."}},
+                       "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "read_url",
+        "description": "Read a web page (or an online PDF) and return its main text. Use it on links from web_search or links the user gave.",
+        "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
+]
+
+
+# ---------------------------------------------------------------- image generation (Pollinations) and Arabic text on images
+IMAGE_FREE_URL = "https://image.pollinations.ai/prompt/"
+IMAGE_KEY_URL = "https://gen.pollinations.ai/image/"
+IMAGE_MODELS = [  # (id, label) for the settings; all work with a free Pollinations key ("pollen")
+    ("zimage", "Z-Image Turbo (سريع وجميل)"),
+    ("flux", "FLUX.1 schnell"),
+    ("black-forest-labs/flux.1.1-pro", "FLUX 1.1 Pro (أعلى جودة)"),
+    ("microsoft/mai-image-2.6-flash", "MAI Image 2.6 Flash"),
+    ("microsoft/mai-image-2.6", "MAI Image 2.6"),
+    ("black-forest-labs/flux.2-klein-4b", "FLUX.2 Klein"),
+]
+IMAGE_STYLES = {
+    "photo": "photorealistic photograph, natural lighting, sharp focus, high detail, 50mm lens",
+    "cinematic": "cinematic film still, dramatic lighting, shallow depth of field, rich color grading",
+    "illustration": "detailed digital illustration, clean lines, vibrant colors",
+    "anime": "anime style illustration, cel shading, expressive",
+    "3d": "3D render, octane render, soft global illumination, high detail",
+    "watercolor": "watercolor painting, soft washes, paper texture",
+    "oil": "oil painting, visible brush strokes, classical composition",
+    "logo": "minimal flat vector logo, simple shapes, centered, plain background",
+    "icon": "app icon, flat design, rounded square, centered, clean",
+    "sketch": "pencil sketch, hand drawn, cross hatching",
+    "pixel": "pixel art, 16-bit, crisp pixels",
+    "islamic": "islamic geometric art, arabesque patterns, gold and deep blue",
+}
+IMAGE_TOOLS = [
+    {"type": "function", "function": {
+        "name": "generate_image",
+        "description": (
+            "Create real AI pictures (photos, illustrations, logos, posters, wallpapers, product shots...). The picture is saved in the chat's "
+            "work folder and shown to the user right away. Write the prompt in ENGLISH even when the user writes Arabic, and make it rich: "
+            "subject, details, setting, composition/camera angle, lighting, colors, mood, style. Never ask the model to draw Arabic words "
+            "(it cannot spell Arabic): generate the picture without text, then put the text on it with add_text_to_image."),
+        "parameters": {"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "Detailed English description of the picture."},
+            "style": {"type": "string", "enum": sorted(IMAGE_STYLES), "description": "Optional style preset added to the prompt."},
+            "width": {"type": "integer", "description": "Pixels, 256-2048 (default 1024). Wide: 1344x768, tall/story: 768x1344, square: 1024x1024."},
+            "height": {"type": "integer", "description": "Pixels, 256-2048 (default 1024)."},
+            "count": {"type": "integer", "description": "How many variations, 1-4 (default 1)."},
+            "seed": {"type": "integer", "description": "Optional seed to repeat or vary a result."},
+            "negative": {"type": "string", "description": "Optional: what must NOT appear (English)."},
+            "name": {"type": "string", "description": "Optional file name without extension (Latin letters, digits, - or _)."},
+        }, "required": ["prompt"]}}},
+    {"type": "function", "function": {
+        "name": "add_text_to_image",
+        "description": ("Write Arabic or English text on a picture with correct Arabic shaping and right-to-left order (posters, cards, "
+                        "captions, memes, thumbnails). Saves a new PNG next to it and shows it to the user."),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "The picture (a file from generate_image, the work folder or an allowed folder)."},
+            "text": {"type": "string", "description": "The text; use \\n for a new line."},
+            "position": {"type": "string", "enum": ["top", "center", "bottom", "top-right", "top-left", "bottom-right", "bottom-left"],
+                         "description": "Where to put it (default bottom)."},
+            "size": {"type": "integer", "description": "Font size in pixels (default: about 7% of the picture height)."},
+            "color": {"type": "string", "description": "Text color, e.g. #ffffff (default white)."},
+            "outline": {"type": "string", "description": "Outline color (default black); use 'none' for no outline."},
+            "box": {"type": "string", "description": "Optional background band color behind the text, e.g. #000000aa (with alpha)."},
+            "font": {"type": "string", "enum": ["bold", "regular", "naskh", "kufi", "elegant"], "description": "Font look (default bold)."},
+        }, "required": ["path", "text"]}}},
+]
+
+
+def image_generate(prompt, out_dir, width=1024, height=1024, count=1, seed=None, style="", negative="", name="",
+                   key="", model="", stop_event=None):
+    """Make pictures with Pollinations. With a key (free at enter.pollinations.ai) the better models are used; without one the
+    open free endpoint is used. Returns a list of saved paths."""
+    prompt = " ".join(str(prompt or "").split())
+    if not prompt:
+        raise ToolError("prompt is empty")
+    if style and style in IMAGE_STYLES:
+        prompt += ", " + IMAGE_STYLES[style]
+    if negative:
+        prompt += ". Avoid: " + " ".join(str(negative).split())
+    prompt = prompt[:1800]
+    w = max(256, min(2048, int(width or 1024)))
+    h = max(256, min(2048, int(height or 1024)))
+    n = max(1, min(4, int(count or 1)))
+    os.makedirs(out_dir, exist_ok=True)
+    stem = re.sub(r"[^A-Za-z0-9_\-]+", "_", str(name or "")).strip("_")[:40] or ("image_%s" % time.strftime("%H%M%S"))
+    base_seed = int(seed) if seed not in (None, "") else random.randint(1, 2 ** 31 - 1)
+    saved, errors = [], []
+    for i in range(n):
+        if stop_event is not None and stop_event.is_set():
+            break
+        sd = base_seed + i
+        q = urllib.parse.quote(prompt, safe="")
+        tries = []
+        if key:
+            tries.append((IMAGE_KEY_URL + q + "?" + urllib.parse.urlencode(
+                {"model": model or "zimage", "width": w, "height": h, "seed": sd, "nologo": "true", "enhance": "false"}),
+                {"Authorization": "Bearer " + key}))
+        tries.append((IMAGE_FREE_URL + q + "?" + urllib.parse.urlencode({"width": w, "height": h, "seed": sd, "nologo": "true"}), {}))
+        for url, hdr in tries:
+            data, ctype = None, ""
+            for attempt in range(3):
+                try:
+                    req = urllib.request.Request(url, headers=dict(hdr, **{"User-Agent": "5belan"}))
+                    with urllib.request.urlopen(req, timeout=180) as r:
+                        data = r.read()
+                        ctype = r.headers.get("Content-Type", "")
+                    break
+                except urllib.error.HTTPError as e:
+                    errors.append("HTTP %s %s" % (e.code, e.read()[:160].decode("utf-8", "replace")))
+                    if e.code in (400, 401, 402, 403):
+                        break
+                    time.sleep(2 + attempt * 3)
+                except Exception as e:
+                    errors.append(str(e)[:160])
+                    time.sleep(2 + attempt * 3)
+            if data and ctype.startswith("image/") and len(data) > 1000:
+                ext = ".png" if "png" in ctype else (".webp" if "webp" in ctype else ".jpg")
+                p = os.path.join(out_dir, stem + ("_%d" % (i + 1) if n > 1 else "") + ext)
+                k = 2
+                while os.path.exists(p):
+                    p = os.path.join(out_dir, stem + ("_%d" % (i + 1) if n > 1 else "") + "_v%d" % k + ext)
+                    k += 1
+                with open(p, "wb") as f:
+                    f.write(data)
+                saved.append(p)
+                break
+    if not saved:
+        raise ToolError("the image service did not return a picture (%s)" % ("; ".join(errors[-3:]) or "no answer"))
+    return saved, base_seed
+
+
+IMAGE_FONTS = {  # look -> Windows font files, first one found wins
+    "bold": ["segoeuib.ttf", "tahomabd.ttf", "arialbd.ttf"],
+    "regular": ["segoeui.ttf", "tahoma.ttf", "arial.ttf"],
+    "naskh": ["trado.ttf", "majalla.ttf", "arabtype.ttf", "tahoma.ttf"],
+    "kufi": ["tahomabd.ttf", "segoeuib.ttf", "arialbd.ttf"],
+    "elegant": ["majallab.ttf", "tradbdo.ttf", "majalla.ttf", "segoeuib.ttf"],
+}
+
+
+def _font_path(look):
+    dirs = [os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts"), "/Library/Fonts", "/System/Library/Fonts/Supplemental",
+            "/usr/share/fonts/truetype/dejavu", os.path.expanduser("~/.fonts")]
+    for f in IMAGE_FONTS.get(look, IMAGE_FONTS["bold"]) + ["arial.ttf", "Arial.ttf", "DejaVuSans-Bold.ttf", "DejaVuSans.ttf"]:
+        for d in dirs:
+            p = os.path.join(d, f)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def _shape_line(s):
+    """Arabic letters joined and put in visual order (Pillow without libraqm cannot do it itself)."""
+    if not ARABIC_RE.search(s):
+        return s
+    try:
+        import arabic_reshaper
+        try:
+            from bidi import get_display
+        except ImportError:
+            from bidi.algorithm import get_display
+        return get_display(arabic_reshaper.reshape(s))
+    except Exception:
+        return s
+
+
+def _rgba(c, default):
+    c = str(c or "").strip().lstrip("#")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}([0-9a-fA-F]{2})?", c):
+        return default
+    v = tuple(int(c[i:i + 2], 16) for i in range(0, len(c), 2))
+    return v if len(v) == 4 else v + (255,)
+
+
+def image_add_text(src, out, text, position="bottom", size=0, color="", outline="", box="", font="bold"):
+    from PIL import Image, ImageDraw, ImageFont
+    im = Image.open(src).convert("RGBA")
+    W, H = im.size
+    fs = int(size or 0) or max(18, int(H * 0.07))
+    fp = _font_path(font)
+    fnt = ImageFont.truetype(fp, fs) if fp else ImageFont.load_default()
+    lines = [_shape_line(x) for x in str(text).replace("\\n", "\n").split("\n")]
+    layer = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    dr = ImageDraw.Draw(layer)
+    sw = 0 if str(outline).lower() == "none" else max(1, fs // 14)
+    sizes = [dr.textbbox((0, 0), ln or " ", font=fnt, stroke_width=sw) for ln in lines]
+    lh = [b[3] - b[1] for b in sizes]
+    lw = [b[2] - b[0] for b in sizes]
+    gap = int(fs * 0.25)
+    th = sum(lh) + gap * (len(lines) - 1)
+    tw = max(lw) if lw else 0
+    pad = int(min(W, H) * 0.05)
+    pos = position or "bottom"
+    y0 = pad if pos.startswith("top") else (H - th - pad if pos.startswith("bottom") else (H - th) // 2)
+    if box:
+        bc = _rgba(box, (0, 0, 0, 150))
+        if pos in ("top", "bottom", "center"):
+            dr.rectangle([0, y0 - pad // 2, W, y0 + th + pad // 2], fill=bc)
+        else:
+            x_b = pad // 2 if pos.endswith("left") else W - tw - pad - pad // 2
+            dr.rounded_rectangle([x_b, y0 - pad // 2, x_b + tw + pad, y0 + th + pad // 2], radius=pad // 3, fill=bc)
+    y = y0
+    for ln, w_, h_, b in zip(lines, lw, lh, sizes):
+        if pos.endswith("left"):
+            x = pad
+        elif pos.endswith("right"):
+            x = W - w_ - pad
+        else:
+            x = (W - w_) // 2
+        dr.text((x - b[0], y - b[1]), ln, font=fnt, fill=_rgba(color, (255, 255, 255, 255)),
+                stroke_width=sw, stroke_fill=_rgba(outline, (0, 0, 0, 255)) if sw else None)
+        y += h_ + gap
+    Image.alpha_composite(im, layer).convert("RGB").save(out, "PNG")
+    return out
+
+
+# ---------------------------------------------------------------- translation (Arabic <-> English and more)
+GLOSSARY_PATH = os.path.join(DATA_DIR, "glossary.json")
+TRANSLATE_EXTS = (".docx", ".xlsx", ".pptx", ".pdf", ".txt", ".md", ".srt", ".vtt", ".html", ".htm", ".csv", ".json", ".po",
+                  ".doc", ".rtf", ".odt", ".xml", ".tsv", ".ass")
+TR_STYLES = {
+    "msa": "Modern Standard Arabic (فصحى) that reads naturally, not word-for-word",
+    "saudi": "natural Saudi (Najdi/Hijazi everyday) dialect, as a Saudi would actually say it",
+    "formal": "formal, official register (government / business letters)",
+    "simple": "simple, clear language for a general reader",
+    "technical": "precise technical register; keep standard terms, and on first use add the English term in parentheses",
+    "legal": "precise legal register, faithful to every condition and term",
+    "marketing": "persuasive marketing copy adapted to the culture (transcreation), keep the brand voice",
+    "literary": "literary register that keeps tone, rhythm and imagery",
+    "subtitles": "short natural subtitle lines that fit the timing",
+}
+LANG_NAMES = {"ar": "Arabic", "en": "English", "fr": "French", "es": "Spanish", "de": "German", "tr": "Turkish", "ur": "Urdu",
+              "fa": "Persian", "hi": "Hindi", "id": "Indonesian", "zh": "Chinese", "ja": "Japanese", "ko": "Korean", "ru": "Russian",
+              "it": "Italian", "pt": "Portuguese", "bn": "Bengali", "tl": "Filipino"}
+
+TRANSLATE_TOOLS = [
+    {"type": "function", "function": {
+        "name": "translate",
+        "description": (
+            "Professional translation between Arabic and English (and other languages) with a translate -> review pipeline, the user's "
+            "glossary and consistent terms. Give 'text' for text, or 'path' for a FILE: Word .docx comes back as a Word file with the same "
+            "formatting (Arabic gets right-to-left paragraphs), Excel .xlsx as Excel, PowerPoint .pptx as PowerPoint, subtitles .srt/.vtt keep "
+            "their timings, .md/.txt/.html/.csv/.json/.po keep their structure; PDF, .doc, .rtf, .odt become a Word file. "
+            "ALWAYS use this tool for anything longer than a few sentences or for any file. Files the user attached are in the "
+            "chat's attachments folder (the path is in the message)."),
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "Text to translate (use this OR path)."},
+            "path": {"type": "string", "description": "File to translate (absolute path)."},
+            "target": {"type": "string", "description": "Target language code: ar or en (also fr, es, de, tr, ur, ...). Default: the other one of ar/en."},
+            "style": {"type": "string", "enum": sorted(TR_STYLES), "description": "Register / tone (default msa for Arabic, simple for English)."},
+            "glossary": {"type": "object", "description": "Extra fixed terms for this job: {\"source term\": \"translation\"}.", "additionalProperties": {"type": "string"}},
+            "notes": {"type": "string", "description": "Context for the translator: audience, domain, what the document is."},
+            "review": {"type": "boolean", "description": "Second pass that checks accuracy and fixes the wording (default true)."},
+            "quality": {"type": "string", "enum": ["fast", "best"], "description": "best uses the stronger model (default best for files)."},
+        }}}},
+    {"type": "function", "function": {
+        "name": "dictionary_lookup",
+        "description": ("Look a word or short term up in open dictionaries (Wiktionary, Free Dictionary API): meanings, part of speech, "
+                        "pronunciation, examples, synonyms and Arabic/English equivalents. Use it to choose the exact word."),
+        "parameters": {"type": "object", "properties": {"word": {"type": "string"}}, "required": ["word"]}}},
+    {"type": "function", "function": {
+        "name": "arabic_text_tools",
+        "description": ("Arabic text utilities (PyArabic): strip_tashkeel (remove diacritics), normalize (unify alef/yaa/taa marbuta for "
+                        "search), number_to_words (a number written in Arabic words, for cheques and contracts), add_tashkeel "
+                        "(full diacritics), digits_to_arabic (٠١٢), digits_to_latin (012), count (letters/words)."),
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["strip_tashkeel", "normalize", "number_to_words", "add_tashkeel", "digits_to_arabic",
+                                                  "digits_to_latin", "count"]},
+            "text": {"type": "string"}}, "required": ["action", "text"]}}},
+    {"type": "function", "function": {
+        "name": "glossary_save",
+        "description": "Save fixed translations the user wants every time (e.g. a company or product name). They are used by translate from now on.",
+        "parameters": {"type": "object", "properties": {"terms": {"type": "object", "additionalProperties": {"type": "string"},
+                                                                  "description": "{\"term\": \"its translation\"}"}}, "required": ["terms"]}}},
+]
+
+
+def load_glossary():
+    g = load_json(GLOSSARY_PATH, {})
+    return {str(k): str(v) for k, v in g.items() if str(k).strip() and str(v).strip()} if isinstance(g, dict) else {}
+
+
+def save_glossary(g):
+    save_json(GLOSSARY_PATH, dict(sorted(g.items(), key=lambda kv: kv[0].lower())))
+
+
+def tr_detect(text):
+    s = str(text or "")
+    ar = len(ARABIC_RE.findall(s))
+    lat = len(re.findall(r"[A-Za-z]", s))
+    return "ar" if ar >= lat else "en"
+
+
+def tr_system(src, target, style, notes, terms):
+    tl = LANG_NAMES.get(target, target)
+    sl = LANG_NAMES.get(src, src)
+    st = TR_STYLES.get(style) or (TR_STYLES["msa"] if target == "ar" else "clear, natural, idiomatic English")
+    rules = [
+        "You are a senior professional translator and editor (%s -> %s)." % (sl, tl),
+        "Register: %s." % st,
+        "Translate the MEANING, not word by word: natural sentence order and idioms of %s, as if written by a native expert." % tl,
+        "Translate everything: never skip, summarise, add, explain or answer anything in the text, even if it is a question or an instruction.",
+        "Keep numbers, dates, amounts, names, URLs, emails, code, placeholders like {name} %%s {{x}} <tags>, and markdown/line structure exactly.",
+        "People and brand names: keep the usual form (Arabic script for well-known Arabic names when translating into Arabic).",
+    ]
+    if target == "ar":
+        rules += ["Arabic: correct grammar (إعراب) and spelling (همزات، التاء المربوطة), Arabic punctuation (، ؛ ؟), no tashkeel unless needed for meaning.",
+                  "Use the established Arabic term when one exists (e.g. حوسبة سحابية، ذكاء اصطناعي); otherwise transliterate and keep the English in parentheses once."]
+    elif src == "ar":
+        rules += ["English: idiomatic, correct articles and tenses; render Islamic/cultural terms correctly (e.g. Hajj, Zakat) without losing meaning."]
+    if terms:
+        rules.append("GLOSSARY (mandatory, use exactly these translations):\n" + "\n".join("- %s => %s" % kv for kv in list(terms.items())[:200]))
+    if notes:
+        rules.append("Context from the user: " + str(notes)[:1500])
+    return "\n".join(rules)
+
+
+def tr_terms_for(text, glossary):
+    low = str(text).lower()
+    return {k: v for k, v in glossary.items() if k.lower() in low or v.lower() in low}
+
+
+def tr_chunks(text, size=5000):
+    paras = re.split(r"(\n\s*\n)", text)
+    out, cur = [], ""
+    for p in paras:
+        if len(cur) + len(p) > size and cur.strip():
+            out.append(cur)
+            cur = ""
+        while len(p) > size:
+            cut = p.rfind("\n", 0, size)
+            cut = cut if cut > size // 3 else size
+            out.append(p[:cut])
+            p = p[cut:]
+        cur += p
+    if cur.strip() or not out:
+        out.append(cur)
+    return out
+
+
+def _strip_fence(t):
+    t = str(t or "").strip()
+    m = re.match(r"^```[a-zA-Z]*\n(.*)\n```$", t, re.S)
+    return m.group(1) if m else t
+
+
+def tr_text(llm, text, src, target, style, notes, glossary, review=True, model=None, stop_event=None):
+    """Translate free text in chunks (4 at a time), each chunk translated then reviewed against its source."""
+    terms = tr_terms_for(text, glossary)
+    system = tr_system(src, target, style, notes, terms)
+    chunks = tr_chunks(text)
+
+    def one(ch):
+        if not ch.strip() or (stop_event is not None and stop_event.is_set()):
+            return ch
+        lead = re.match(r"^\s*", ch).group(0)
+        tail = re.search(r"\s*$", ch).group(0)
+        draft = _strip_fence(llm([{"role": "system", "content": system},
+                                  {"role": "user", "content": "Translate. Output ONLY the translation.\n\n" + ch.strip()}], model))
+        if review:
+            fixed = _strip_fence(llm([{"role": "system", "content": system + "\nYou are now the REVIEWER."},
+                                      {"role": "user", "content": (
+                                          "Compare the draft with the source line by line. Fix mistranslations, omissions, additions, wrong terms "
+                                          "(follow the glossary), grammar and unnatural wording. Output ONLY the corrected final translation, "
+                                          "no comments.\n\nSOURCE:\n" + ch.strip() + "\n\nDRAFT:\n" + draft)}], model))
+            if fixed.strip() and len(fixed) > len(draft) * 0.5:
+                draft = fixed
+        return lead + draft.strip() + tail
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        return "".join(ex.map(one, chunks))
+
+
+def tr_segments(llm, segs, src, target, style, notes, glossary, review=True, model=None, stop_event=None):
+    """Translate a list of short strings (cells, paragraphs, slide texts) keeping their order: sent as numbered JSON in batches."""
+    uniq = []
+    for s in segs:
+        if s.strip() and s not in uniq and not re.fullmatch(r"[\d\s.,:;%+\-/()$#*=]+", s):
+            uniq.append(s)
+    done = {}
+    batches, cur, size = [], [], 0
+    for s in uniq:
+        if cur and (size + len(s) > 5000 or len(cur) >= 60):
+            batches.append(cur)
+            cur, size = [], 0
+        cur.append(s)
+        size += len(s)
+    if cur:
+        batches.append(cur)
+
+    ctx = "\n".join(uniq)[:4000] if len(uniq) > 1 else ""
+
+    def run(batch):
+        if stop_event is not None and stop_event.is_set():
+            return {}
+        terms = tr_terms_for("\n".join(batch), glossary)
+        system = tr_system(src, target, style, notes, terms)
+        if ctx:
+            system += ("\nThe segments come from ONE document. Its text (for context only, to pick the right meaning of words with "
+                       "several meanings, e.g. 'dates' next to coffee is the fruit تمر) is:\n<<<\n" + ctx + "\n>>>")
+        src_obj = {str(i + 1): s for i, s in enumerate(batch)}
+        ask = ("Translate every value of this JSON object. Each value is one segment of the same document (keep it as ONE segment, "
+               "keep its line breaks). Return ONLY a JSON object with exactly the same keys.\n\n" + json.dumps(src_obj, ensure_ascii=False))
+        for attempt in range(2):
+            out = _strip_fence(llm([{"role": "system", "content": system}, {"role": "user", "content": ask}], model))
+            try:
+                d = json.loads(out[out.find("{"): out.rfind("}") + 1])
+                if review:
+                    rv = _strip_fence(llm([{"role": "system", "content": system + "\nYou are now the REVIEWER."},
+                                           {"role": "user", "content": (
+                                               "SOURCE and DRAFT are JSON objects with the same keys. Fix mistranslations, omissions, wrong terms, "
+                                               "grammar and unnatural wording in the draft. Return ONLY the corrected JSON object with the same keys."
+                                               "\n\nSOURCE:\n" + json.dumps(src_obj, ensure_ascii=False) + "\n\nDRAFT:\n" + json.dumps(d, ensure_ascii=False))}], model))
+                    try:
+                        d2 = json.loads(rv[rv.find("{"): rv.rfind("}") + 1])
+                        if isinstance(d2, dict) and len(d2) >= len(d) * 0.9:
+                            d.update({k: v for k, v in d2.items() if isinstance(v, str) and v.strip()})
+                    except Exception:
+                        pass
+                return {batch[int(k) - 1]: str(v) for k, v in d.items() if str(k).isdigit() and 0 < int(k) <= len(batch) and isinstance(v, (str, int, float))}
+            except Exception:
+                continue
+        return {s: tr_text(llm, s, src, target, style, notes, glossary, False, model) for s in batch}
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for part in ex.map(run, batches):
+            done.update(part)
+    return [done.get(s, s) for s in segs]
+
+
+def _docx_rtl(par, on):
+    """Right-to-left paragraph (w:bidi) and runs (w:rtl) so Arabic Word documents read correctly."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    ppr = par._p.get_or_add_pPr()
+    b = ppr.find(qn("w:bidi"))
+    if on and b is None:
+        ppr.insert(0, OxmlElement("w:bidi"))
+    elif not on and b is not None:
+        ppr.remove(b)
+    for r in par.runs:
+        rpr = r._r.get_or_add_rPr()
+        x = rpr.find(qn("w:rtl"))
+        if on and x is None:
+            rpr.append(OxmlElement("w:rtl"))
+        elif not on and x is not None:
+            rpr.remove(x)
+
+
+def _docx_pars(doc):
+    """Every paragraph of a Word file: body, tables (nested too), headers and footers."""
+    out = []
+
+    def walk(container):
+        for p in container.paragraphs:
+            out.append(p)
+        for t in getattr(container, "tables", []):
+            for row in t.rows:
+                for cell in row.cells:
+                    walk(cell)
+    walk(doc)
+    for s in doc.sections:
+        for part in (s.header, s.footer):
+            try:
+                walk(part)
+            except Exception:
+                pass
+    seen, uniq = set(), []
+    for p in out:
+        if id(p._p) not in seen:
+            seen.add(id(p._p))
+            uniq.append(p)
+    return uniq
+
+
+def _set_par_text(par, text):
+    """Put new text in a paragraph and keep the formatting of its first run (the rest of the runs are emptied)."""
+    runs = [r for r in par.runs if r.text]
+    if not runs:
+        par.add_run(text)
+        return
+    runs[0].text = text
+    for r in runs[1:]:
+        r.text = ""
+
+
+def tr_file(llm, path, out_dir, src, target, style, notes, glossary, review=True, model=None, stop_event=None, read_text=None):
+    """Translate a file into the same format where possible. Returns the new file's path."""
+    ext = os.path.splitext(path)[1].lower()
+    stem = os.path.splitext(os.path.basename(path))[0]
+    os.makedirs(out_dir, exist_ok=True)
+    rtl = target in ("ar", "fa", "ur", "he")
+    args = (src, target, style, notes, glossary, review, model, stop_event)
+
+    def out_path(e):
+        p = os.path.join(out_dir, "%s_%s%s" % (stem, target, e))
+        k = 2
+        while os.path.exists(p):
+            p = os.path.join(out_dir, "%s_%s_%d%s" % (stem, target, k, e))
+            k += 1
+        return p
+
+    if ext == ".docx":
+        import docx
+        d = docx.Document(path)
+        pars = [p for p in _docx_pars(d) if p.text.strip()]
+        new = tr_segments(llm, [p.text for p in pars], *args)
+        for p, t in zip(pars, new):
+            _set_par_text(p, t)
+            _docx_rtl(p, rtl)
+            if rtl and p.alignment in (None, 0):
+                from docx.enum.text import WD_ALIGN_PARAGRAPH
+                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            elif not rtl and p.alignment == 2:
+                p.alignment = None
+        out = out_path(".docx")
+        d.save(out)
+        return out
+    if ext == ".xlsx":
+        import openpyxl
+        wb = openpyxl.load_workbook(path)
+        cells = [c for ws in wb.worksheets for row in ws.iter_rows() for c in row
+                 if isinstance(c.value, str) and c.value.strip() and not c.value.startswith("=")]
+        titles = [ws.title for ws in wb.worksheets]
+        new = tr_segments(llm, [c.value for c in cells] + titles, *args)
+        for c, t in zip(cells, new):
+            c.value = t
+        for ws, t in zip(wb.worksheets, new[len(cells):]):
+            try:
+                ws.title = re.sub(r"[\[\]:*?/\\]", " ", t)[:31] or ws.title
+            except Exception:
+                pass
+            if rtl:
+                ws.sheet_view.rightToLeft = True
+        out = out_path(".xlsx")
+        wb.save(out)
+        return out
+    if ext == ".pptx":
+        try:
+            import pptx
+        except ImportError:
+            raise ToolError("PowerPoint needs the python-pptx package: call pip_install with python-pptx, then try again")
+        pr = pptx.Presentation(path)
+        pars = []
+
+        def shapes(sh_list):
+            for sh in sh_list:
+                if getattr(sh, "shape_type", None) == 6 and hasattr(sh, "shapes"):  # group
+                    shapes(sh.shapes)
+                if getattr(sh, "has_text_frame", False) and sh.has_text_frame:
+                    pars.extend(p for p in sh.text_frame.paragraphs if "".join(r.text for r in p.runs).strip())
+                if getattr(sh, "has_table", False) and sh.has_table:
+                    for row in sh.table.rows:
+                        for cell in row.cells:
+                            pars.extend(p for p in cell.text_frame.paragraphs if "".join(r.text for r in p.runs).strip())
+        for sl in pr.slides:
+            shapes(sl.shapes)
+            if sl.has_notes_slide:
+                pars.extend(p for p in sl.notes_slide.notes_text_frame.paragraphs if "".join(r.text for r in p.runs).strip())
+        new = tr_segments(llm, ["".join(r.text for r in p.runs) for p in pars], *args)
+        for p, t in zip(pars, new):
+            runs = [r for r in p.runs if r.text]
+            runs[0].text = t
+            for r in runs[1:]:
+                r.text = ""
+            if rtl:
+                try:
+                    p._p.get_or_add_pPr().set("rtl", "1")
+                    from pptx.enum.text import PP_ALIGN
+                    if p.alignment in (None, PP_ALIGN.LEFT):
+                        p.alignment = PP_ALIGN.RIGHT
+                except Exception:
+                    pass
+        out = out_path(".pptx")
+        pr.save(out)
+        return out
+    if ext in (".srt", ".vtt", ".ass"):
+        with open(path, "rb") as f:
+            raw = decode_text(f.read())
+        lines = raw.splitlines()
+        idx = [i for i, ln in enumerate(lines) if ln.strip() and not re.match(r"^\d+$", ln.strip()) and "-->" not in ln
+               and not ln.startswith(("WEBVTT", "NOTE", "[", "Style:", "Format:", "ScriptType", "PlayRes"))]
+        if ext == ".ass":
+            segs = []
+            for i in idx:
+                if lines[i].startswith("Dialogue:"):
+                    segs.append(lines[i].split(",", 9)[-1])
+            new = tr_segments(llm, segs, src, target, "subtitles", notes, glossary, review, model, stop_event)
+            k = 0
+            for i in idx:
+                if lines[i].startswith("Dialogue:"):
+                    head = lines[i].split(",", 9)
+                    head[-1] = new[k]
+                    lines[i] = ",".join(head)
+                    k += 1
+        else:
+            new = tr_segments(llm, [lines[i] for i in idx], src, target, "subtitles", notes, glossary, review, model, stop_event)
+            for i, t in zip(idx, new):
+                lines[i] = (("\u202b" + t) if rtl else t)
+        out = out_path(ext)
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return out
+    if ext == ".json":
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        strs = []
+
+        def collect(o):
+            if isinstance(o, str):
+                strs.append(o)
+            elif isinstance(o, list):
+                for x in o:
+                    collect(x)
+            elif isinstance(o, dict):
+                for v in o.values():
+                    collect(v)
+        collect(data)
+        mp = dict(zip(strs, tr_segments(llm, strs, *args)))
+
+        def rebuild(o):
+            if isinstance(o, str):
+                return mp.get(o, o)
+            if isinstance(o, list):
+                return [rebuild(x) for x in o]
+            if isinstance(o, dict):
+                return {k: rebuild(v) for k, v in o.items()}
+            return o
+        out = out_path(".json")
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(rebuild(data), f, ensure_ascii=False, indent=2)
+        return out
+    if ext in (".csv", ".tsv"):
+        import csv
+        with open(path, "rb") as f:
+            raw = decode_text(f.read())
+        dl = "\t" if ext == ".tsv" else (csv.Sniffer().sniff(raw[:4000], ",;\t").delimiter if raw.strip() else ",")
+        rows = list(csv.reader(io.StringIO(raw), delimiter=dl))
+        flat = [c for r in rows for c in r]
+        mp = dict(zip(flat, tr_segments(llm, flat, *args)))
+        out = out_path(ext)
+        with open(out, "w", encoding="utf-8-sig", newline="") as f:
+            csv.writer(f, delimiter=dl).writerows([[mp.get(c, c) for c in r] for r in rows])
+        return out
+    if ext == ".po":
+        with open(path, "rb") as f:
+            raw = decode_text(f.read())
+        ids = re.findall(r'^msgid "(.+)"$', raw, re.M)
+        mp = dict(zip(ids, tr_segments(llm, [x.encode().decode("unicode_escape", "ignore") if "\\" in x else x for x in ids], *args)))
+
+        def fill(m):
+            return 'msgid "%s"\nmsgstr "%s"' % (m.group(1), mp.get(m.group(1), "").replace('"', '\\"').replace("\n", "\\n"))
+        out = out_path(".po")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(re.sub(r'^msgid "(.+)"\nmsgstr ""$', fill, raw, flags=re.M))
+        return out
+    if ext in (".html", ".htm", ".xml"):
+        with open(path, "rb") as f:
+            raw = decode_text(f.read())
+        parts = re.split(r"(<script.*?</script>|<style.*?</style>|<[^>]+>)", raw, flags=re.S | re.I)
+        idx = [i for i, p in enumerate(parts) if p and not p.startswith("<") and p.strip()]
+        new = tr_segments(llm, [html.unescape(parts[i]) for i in idx], *args)
+        for i, t in zip(idx, new):
+            lead = re.match(r"^\s*", parts[i]).group(0)
+            tail = re.search(r"\s*$", parts[i]).group(0)
+            parts[i] = lead + html.escape(t, quote=False) + tail
+        res = "".join(parts)
+        if rtl and ext != ".xml":
+            res = re.sub(r"<html(?![^>]*\bdir=)", '<html dir="rtl" lang="%s"' % target, res, count=1, flags=re.I)
+        out = out_path(ext)
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(res)
+        return out
+    if ext in (".txt", ".md", ".markdown", ".log", ".rst"):
+        with open(path, "rb") as f:
+            raw = decode_text(f.read())
+        out = out_path(ext)
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(tr_text(llm, raw, *args))
+        return out
+    # PDF, .doc, .rtf, .odt and anything else readable: the text is translated into a new Word file
+    text = read_text(path) if read_text else read_document(path)
+    if not text.strip():
+        raise ToolError("no text could be read from this file")
+    tr = tr_text(llm, text, *args)
+    import docx
+    from docx.shared import Pt
+    d = docx.Document()
+    st = d.styles["Normal"]
+    st.font.name = "Arial"
+    st.font.size = Pt(12)
+    for block in tr.split("\n"):
+        h = re.match(r"^(#{1,3})\s+(.*)$", block)
+        p = d.add_heading(h.group(2), level=len(h.group(1))) if h else d.add_paragraph(block)
+        _docx_rtl(p, rtl)
+        if rtl:
+            from docx.enum.text import WD_ALIGN_PARAGRAPH
+            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    out = out_path(".docx")
+    d.save(out)
+    return out
+
+
+def dictionary_lookup(word):
+    """Wiktionary (meanings + Arabic/English equivalents) and the Free Dictionary API (English pronunciation, examples, synonyms)."""
+    w = " ".join(str(word or "").split())[:60]
+    if not w:
+        raise ToolError("word is empty")
+    hdr = {"User-Agent": "5belan/2 (desktop assistant; dictionary lookup)"}
+    out = []
+
+    def get(url):
+        with urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=20) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+    is_ar = bool(ARABIC_RE.search(w))
+    if not is_ar:
+        try:
+            d = get("https://api.dictionaryapi.dev/api/v2/entries/en/" + urllib.parse.quote(w.lower()))
+            for ent in d[:2]:
+                if ent.get("phonetic"):
+                    out.append("Pronunciation: " + ent["phonetic"])
+                for mn in ent.get("meanings", [])[:4]:
+                    for df in mn.get("definitions", [])[:3]:
+                        line = "- (%s) %s" % (mn.get("partOfSpeech", ""), df.get("definition", ""))
+                        if df.get("example"):
+                            line += "  e.g. " + df["example"]
+                        out.append(line)
+                    if mn.get("synonyms"):
+                        out.append("  synonyms: " + ", ".join(mn["synonyms"][:8]))
+        except Exception:
+            pass
+        ar = []
+        for page in (w, w.lower(), w + "/translations", w.lower() + "/translations"):
+            try:
+                wt = get("https://en.wiktionary.org/w/api.php?action=parse&format=json&prop=wikitext&page=" + urllib.parse.quote(page))
+                txt = ((wt.get("parse") or {}).get("wikitext") or {}).get("*") or ""
+                gloss = None
+                for ln in txt.splitlines():
+                    m = re.match(r"\{\{trans-top\|(.+?)\}\}", ln)
+                    if m:
+                        gloss = m.group(1)
+                    if re.match(r"\*\s*Arabic:", ln):
+                        terms = re.findall(r"\{\{t\+?\|ar\|([^|}]+)", ln)
+                        if terms:
+                            ar.append("- %s: %s" % (gloss or "", "، ".join(dict.fromkeys(terms))))
+                if ar:
+                    break
+            except Exception:
+                continue
+        if ar:
+            out.append("Arabic equivalents (Wiktionary, by sense):")
+            out.extend(ar[:12])
+    else:
+        try:
+            d = get("https://en.wiktionary.org/api/rest_v1/page/definition/" + urllib.parse.quote(w))
+            for lang_entries in d.values():
+                for ent in lang_entries:
+                    if "Arabic" not in str(ent.get("language", "")):
+                        continue
+                    for df in ent.get("definitions", [])[:4]:
+                        t = html.unescape(re.sub(r"<[^>]+>", "", df.get("definition", ""))).strip()
+                        if t:
+                            out.append("- [%s, %s] %s" % (ent.get("language"), ent.get("partOfSpeech", ""), t[:200]))
+        except Exception:
+            pass
+    if not out:
+        return "Nothing found in the open dictionaries for «%s». Use your own knowledge and say so." % w
+    return "Dictionary results for «%s»:\n%s" % (w, "\n".join(out[:40]))
+
+
+TASHKEEL_RE = re.compile("[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed]")
+
+
+def arabic_tools(action, text, llm=None):
+    t = str(text or "")
+    if action == "strip_tashkeel":
+        try:
+            import pyarabic.araby as araby
+            return araby.strip_tashkeel(t)
+        except Exception:
+            return TASHKEEL_RE.sub("", t)
+    if action == "normalize":
+        t = TASHKEEL_RE.sub("", t).replace("\u0640", "")
+        t = re.sub("[إأآٱ]", "ا", t)
+        return t.replace("ى", "ي").replace("ة", "ه").replace("ؤ", "و").replace("ئ", "ي")
+    if action == "digits_to_arabic":
+        return t.translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩"))
+    if action == "digits_to_latin":
+        return t.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
+    if action == "count":
+        return "letters (no spaces): %d, Arabic letters: %d, words: %d, lines: %d" % (
+            len(re.sub(r"\s", "", t)), len(ARABIC_RE.findall(TASHKEEL_RE.sub("", t))), len(t.split()), t.count("\n") + 1)
+    if action == "number_to_words":
+        num = arabic_tools("digits_to_latin", t).replace(",", "").strip()
+        try:
+            import pyarabic.number as arnum
+            if "." in num:
+                a, b = num.split(".", 1)
+                return arnum.ArNumbers().int2str(a) + " فاصلة " + arnum.ArNumbers().int2str(b)
+            return arnum.ArNumbers().int2str(num)
+        except ImportError:
+            if llm is None:
+                raise ToolError("pyarabic is not installed (pip_install pyarabic)")
+            return llm([{"role": "user", "content": "Write this number in correct Arabic words (فصحى), output only the words: " + num}])
+    if action == "add_tashkeel":
+        if llm is None:
+            raise ToolError("not available here")
+        return llm([{"role": "system", "content": "You are an expert in Arabic grammar. Add full, correct diacritics (تشكيل كامل) to the text. "
+                                                  "Do not change any letter or word. Output only the text."}, {"role": "user", "content": t}])
+    raise ToolError("unknown action")
+
+
+# ---------------------------------------------------------------- recording from the microphone (voice input)
+class MicRecorder:
+    """Records 16 kHz mono 16-bit audio from the default microphone with QtMultimedia, into memory."""
+
+    def __init__(self):
+        self.src = None
+        self.dev = None
+        self.buf = bytearray()
+        self.t0 = 0
+
+    @staticmethod
+    def available():
+        try:
+            from PySide6.QtMultimedia import QMediaDevices
+            return not QMediaDevices.defaultAudioInput().isNull()
+        except Exception:
+            return False
+
+    def start(self):
+        from PySide6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices
+        fmt = QAudioFormat()
+        fmt.setSampleRate(16000)
+        fmt.setChannelCount(1)
+        fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+        dev = QMediaDevices.defaultAudioInput()
+        if dev.isNull():
+            raise RuntimeError("ما لقيت مايك")
+        self.src = QAudioSource(dev, fmt)
+        self.buf = bytearray()
+        self.dev = self.src.start()
+        self.dev.readyRead.connect(self._read)
+        self.t0 = time.time()
+
+    def _read(self):
+        try:
+            self.buf += bytes(self.dev.readAll().data())
+        except Exception:
+            pass
+
+    def seconds(self):
+        return time.time() - self.t0 if self.src else 0
+
+    def stop(self, path):
+        if not self.src:
+            return None
+        self._read()
+        self.src.stop()
+        self.src = None
+        import wave
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(bytes(self.buf[: 16000 * 2 * 119]))
+        return path
+
+
+
+try:
+    ds_load_cached_models()
+except Exception:
+    pass
+
+
+def chat_handoff_md(chat, project=None, memory=""):
+    """One chat as a self-contained Markdown file for another AI agent: what it is, the context, every message, the tools used,
+    sources and files, and where things stand."""
+    msgs = chat.get("msgs") or []
+    out = ["# Conversation hand-off: %s" % chat.get("title", ""), "",
+           "> Exported from 5belan (a desktop AI assistant on DeepSeek) on %s. It contains the WHOLE conversation between the user "
+           "and the assistant, oldest first. Read it all, then continue the work from where it stopped. The user writes mostly in "
+           "Saudi Arabic; answer in the same language." % time.strftime("%Y-%m-%d %H:%M"), "",
+           "- Messages: %d" % len(msgs),
+           "- Last activity: %s" % time.strftime("%Y-%m-%d %H:%M", time.localtime(chat.get("updated") or time.time()))]
+    st = chat.get("settings") or {}
+    if st.get("model"):
+        out.append("- Model used: %s (thinking: %s)" % (st.get("model"), st.get("thinking", "")))
+    if st.get("dirs"):
+        out.append("- Folders the assistant was allowed to use: " + ", ".join(st.get("dirs") or []))
+    if project and str(project.get("instructions", "")).strip():
+        out += ["", "## Project «%s» instructions" % project.get("name", ""), "", project["instructions"].strip()]
+    if str(memory or "").strip():
+        out += ["", "## What the assistant remembers about the user", "", memory.strip()]
+    if chat.get("todos"):
+        out += ["", "## Open task list", ""] + ["- [%s] %s" % ("x" if t.get("status") == "completed" else " ", t.get("content", ""))
+                                               for t in chat["todos"]]
+    out += ["", "## Conversation", ""]
+    for i, m in enumerate(msgs, 1):
+        if m.get("role") == "user":
+            out.append("### %d. User" % i)
+            for q in m.get("quotes") or []:
+                out.append("> " + str(q.get("q", "")).replace("\n", "\n> "))
+                if q.get("c"):
+                    out.append(str(q["c"]))
+            if m.get("names"):
+                out.append("*(attached: %s)*" % ", ".join(m["names"]))
+            body = m.get("content") if isinstance(m.get("content"), str) else m.get("shown", "")
+            out.append(str(body or m.get("shown") or ""))
+        else:
+            out.append("### %d. Assistant" % i)
+            tools = [x for x in (m.get("activity") or []) if x.get("k") == "tool"]
+            if tools:
+                out.append("*(work done: %s)*" % "; ".join(
+                    ("✗ " if not x.get("ok", True) else "") + " ".join(str(x.get("text", "")).split())[:140] for x in tools[-25:]))
+            out.append(clean_reply(str(m.get("content") or "")))
+            if m.get("images"):
+                out.append("*(pictures made: %s)*" % ", ".join(os.path.basename(p) for p in m["images"]))
+            if m.get("sources"):
+                out.append("Sources: " + " · ".join("[%s](%s)" % (x.get("title") or x["url"], x["url"]) for x in m["sources"] if x.get("url")))
+        out.append("")
+    return "\n".join(out)
+
+
+def strong_model():
+    """The strongest DeepSeek model available (the Pro one), for jobs where quality matters more than speed."""
+    for m in MODELS:
+        if "pro" in m:
+            return m
+    return MODELS[0]
+
+
 class ToolRunner:
     """Runs the file tools. Reading is limited to roots; writing is limited to writable (a subset of roots)."""
 
@@ -3473,6 +4652,12 @@ class ToolRunner:
         self.terminal_ok = False       # the user allowed opening their own terminal and running commands in it
         self.terminal_preapprove = False  # pre-approval: open and run without asking each time (the window is visible; admin still prompts via the OS)
         self.last_diff = ""  # unified diff of the last file change (for the details view)
+        self.image_cfg = {}     # {"key", "model"} for generate_image (Pollinations); empty key = the free service
+        self.show_image = None  # callable(path): show a picture in the chat right away
+        self.web_builtin = False  # DeepSeek's own web search / URL reading is on for this request (thinking on)
+        self.web_fn = False       # the same through ordinary tools (thinking off)
+        self.on_cost = None       # callable(n): n paid web searches/reads were made by a tool
+        self.found_sources = []   # (title, url) of pages a tool read, for the sources list under the reply
         self.backup = bool(backup)
         self.cache = {}
         self.changes = []
@@ -3516,7 +4701,11 @@ class ToolRunner:
         if self.shell_mode != "off":
             out += SHELL_TOOLS + BG_TOOLS
         if self.work_dir:
-            out += PYTHON_TOOLS
+            out += PYTHON_TOOLS + IMAGE_TOOLS
+        if self.llm is not None:
+            out += TRANSLATE_TOOLS
+        if self.web_fn:
+            out += WEB_FN_TOOLS
         if self.allow_computer:
             out += COMPUTER_TOOLS
         if self.terminal_ok:
@@ -3621,6 +4810,23 @@ class ToolRunner:
             a = json.loads(args_text) if args_text.strip() else {}
         except Exception:
             a = {}
+        if name == "generate_image":
+            return "رسم صورة: %s" % str(a.get("prompt", ""))[:160]
+        if name == "add_text_to_image":
+            return "كتابة على الصورة: %s" % str(a.get("text", ""))[:80]
+        if name == "translate":
+            return "ترجمة %s%s" % (("الملف " + os.path.basename(str(a.get("path")))) if a.get("path") else "نص (%d حرف)" % len(str(a.get("text", ""))),
+                                    (" إلى " + {"ar": "العربي", "en": "الإنجليزي"}.get(str(a.get("target")), str(a.get("target")))) if a.get("target") else "")
+        if name == "dictionary_lookup":
+            return "بحث في القاموس: %s" % a.get("word", "")
+        if name == "arabic_text_tools":
+            return "أداة نصوص عربية: %s" % a.get("action", "")
+        if name == "glossary_save":
+            return "حفظ مصطلحات في القاموس: %s" % "، ".join(list((a.get("terms") or {}).keys())[:5])
+        if name == "web_search":
+            return "بحث في الويب: %s" % a.get("query", "")
+        if name == "read_url":
+            return "قراءة صفحة: %s" % a.get("url", "")
         if name == "list_folder":
             return "عرض محتويات: %s" % a.get("path", "")
         if name == "read_file":
@@ -3863,6 +5069,14 @@ class ToolRunner:
         if self.work_dir:
             mapping["run_python"] = self.run_python
             mapping["pip_install"] = self.pip_install
+            mapping["generate_image"] = self.generate_image
+            mapping["add_text_to_image"] = self.add_text_to_image
+        if self.llm is not None:
+            mapping.update({"translate": self.translate, "dictionary_lookup": lambda a: dictionary_lookup(a.get("word")),
+                            "arabic_text_tools": lambda a: arabic_tools(a.get("action"), a.get("text"), self.llm),
+                            "glossary_save": self.glossary_save})
+        if self.web_fn:
+            mapping.update({"web_search": self.web_search, "read_url": self.read_url})
         if self.allow_computer:
             mapping["open_program"] = self.open_program
             mapping["open_in_chrome"] = self.open_in_chrome
@@ -3895,6 +5109,149 @@ class ToolRunner:
         if len(out) > TOOL_MAX_OUTPUT:
             out = out[:TOOL_MAX_OUTPUT] + "\n[output truncated]"
         return out
+
+    # ----- pictures, translation, web
+    def _any_file(self, p):
+        """A file the model may read: inside the chat's work folder (pictures, attachments) or an allowed folder."""
+        p = str(p or "").strip().strip('"')
+        if not p:
+            raise ToolError("path is missing")
+        if self.work_dir and not os.path.isabs(p):
+            cand = os.path.join(self.work_dir, p)
+            if os.path.exists(cand):
+                p = cand
+        full = os.path.abspath(os.path.expanduser(p))
+        if self.work_dir and _inside(os.path.abspath(self.work_dir), full):
+            if not os.path.isfile(full):
+                raise ToolError("file not found: " + full)
+            return full
+        full = self.resolve(p)
+        if not os.path.isfile(full):
+            raise ToolError("file not found: " + full)
+        return full
+
+    def generate_image(self, a):
+        if self.progress:
+            self.progress("أرسم الصورة…")
+        cfg = self.image_cfg or {}
+        paths, seed = image_generate(a.get("prompt"), self.work_dir, a.get("width") or 1024, a.get("height") or 1024,
+                                     a.get("count") or 1, a.get("seed"), a.get("style") or "", a.get("negative") or "",
+                                     a.get("name") or "", cfg.get("key") or "", cfg.get("model") or "", self.stop_event)
+        for p in paths:
+            if self.show_image:
+                self.show_image(p)
+        return ("Created %d picture(s): %s (seed %d). They are already shown to the user in the chat: do not paste links or markdown "
+                "for them; name the file(s) in your reply so they also appear in the attachments. To improve it, call generate_image "
+                "again with a refined prompt (the same seed keeps a similar composition)."
+                % (len(paths), ", ".join(os.path.basename(p) for p in paths), seed))
+
+    def add_text_to_image(self, a):
+        src = self._any_file(a.get("path"))
+        out_dir = self.work_dir or os.path.dirname(src)
+        os.makedirs(out_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(src))[0]
+        out = os.path.join(out_dir, stem + "_text.png")
+        k = 2
+        while os.path.exists(out):
+            out = os.path.join(out_dir, "%s_text%d.png" % (stem, k))
+            k += 1
+        image_add_text(src, out, a.get("text") or "", a.get("position") or "bottom", a.get("size") or 0, a.get("color") or "",
+                       a.get("outline") or "", a.get("box") or "", a.get("font") or "bold")
+        if self.show_image:
+            self.show_image(out)
+        return "Saved %s with the text and showed it to the user. Name it in your reply." % os.path.basename(out)
+
+    def _tr_llm(self):
+        def call(messages, model=None):
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise ToolError("stopped by the user")
+            try:
+                return self.llm(messages, model)
+            except TypeError:
+                return self.llm(messages)
+        return call
+
+    def translate(self, a):
+        text = str(a.get("text") or "")
+        path = str(a.get("path") or "").strip()
+        if not text.strip() and not path:
+            raise ToolError("give text or path")
+        gl = load_glossary()
+        if isinstance(a.get("glossary"), dict):
+            gl.update({str(k): str(v) for k, v in a["glossary"].items() if str(k).strip()})
+        review = a.get("review", True) is not False
+        quality = a.get("quality") or ("best" if path or len(text) > 1500 else "fast")
+        model = strong_model() if quality == "best" else None
+        style = a.get("style") or ""
+        notes = a.get("notes") or ""
+        llm = self._tr_llm()
+        if path:
+            full = self._any_file(path)
+            if self.progress:
+                self.progress("أترجم الملف %s…" % os.path.basename(full))
+            try:
+                sample = read_document(full)[:6000]
+            except Exception:
+                sample = ""
+            src = tr_detect(sample)
+            target = (a.get("target") or ("en" if src == "ar" else "ar")).lower()[:5]
+            out_dir = self.work_dir or os.path.dirname(full)
+            out = tr_file(llm, full, out_dir, src, target, style, notes, gl, review, model, self.stop_event)
+            return ("Translated %s (%s -> %s, %s, %s) into: %s\nThe user gets it when your reply names the file %s. Tell them in one or "
+                    "two lines what you translated; do not paste the whole translation." % (
+                        os.path.basename(full), src, target, "reviewed" if review else "single pass", model or MODELS[0],
+                        out, os.path.basename(out)))
+        src = tr_detect(text)
+        target = (a.get("target") or ("en" if src == "ar" else "ar")).lower()[:5]
+        if self.progress and len(text) > 3000:
+            self.progress("أترجم النص…")
+        out = tr_text(llm, text, src, target, style, notes, gl, review, model, self.stop_event)
+        if len(out) > 60000 and self.work_dir:
+            os.makedirs(self.work_dir, exist_ok=True)
+            fp = os.path.join(self.work_dir, "translation_%s_%s.md" % (target, time.strftime("%H%M%S")))
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(out)
+            return "The translation is long, saved as %s (name it in your reply). Start of it:\n%s" % (os.path.basename(fp), out[:3000])
+        return ("Translation (%s -> %s, %s). Give it to the user exactly as it is, without changing it:\n\n%s"
+                % (src, target, "reviewed" if review else "single pass", out))
+
+    def glossary_save(self, a):
+        terms = a.get("terms") if isinstance(a.get("terms"), dict) else {}
+        terms = {str(k).strip(): str(v).strip() for k, v in terms.items() if str(k).strip() and str(v).strip()}
+        if not terms:
+            raise ToolError("no terms")
+        g = load_glossary()
+        g.update(terms)
+        save_glossary(g)
+        return "Saved %d term(s) in the user's glossary (%d in total)." % (len(terms), len(g))
+
+    def web_search(self, a):
+        q = " ".join(str(a.get("query") or "").split())
+        if not q:
+            raise ToolError("query is empty")
+        res = ds_web_search(q)
+        if self.on_cost:
+            self.on_cost(1)
+        lines = []
+        for i, r in enumerate(res[:8], 1):
+            lines.append("%d. %s\n   %s\n   %s" % (i, r.get("title", ""), r.get("url", ""),
+                                                  re.sub(r"\s+", " ", str(r.get("summary") or r.get("snippet") or "")).strip()[:1500]))
+        for r in res[:3]:
+            if r.get("url"):
+                self.found_sources.append((str(r.get("title") or r["url"])[:120], r["url"]))
+        return ("Web results for «%s»:\n%s" % (q, "\n".join(lines))) if lines else "No results for «%s»." % q
+
+    def read_url(self, a):
+        url = str(a.get("url") or "").strip()
+        if not re.match(r"^https?://", url, re.I):
+            raise ToolError("give a full http(s) link")
+        txt = ds_web_fetch(url)
+        if self.on_cost:
+            self.on_cost(1)
+        if not txt.strip():
+            return "The page returned no text."
+        self.found_sources.append((url[:120], url))
+        return "Content of %s:\n%s" % (url, txt[:60000])
 
     # ----- read tools
     def list_folder(self, a):
@@ -4956,6 +6313,9 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
     QTextBrowser,
     QToolButton,
     QVBoxLayout,
@@ -5017,6 +6377,16 @@ TOOL_GROUPS = {
     "browser_type": ("browser", "التصفّح"),
     "browser_back": ("browser", "التصفّح"),
     "submit_plan": ("plan", "الخطة"),
+    "deepseek_web_search": ("web", "البحث في الويب"),
+    "deepseek_read_url": ("web", "البحث في الويب"),
+    "web_search": ("web", "البحث في الويب"),
+    "read_url": ("web", "البحث في الويب"),
+    "generate_image": ("image", "صنع الصور"),
+    "add_text_to_image": ("image", "صنع الصور"),
+    "translate": ("translate", "الترجمة"),
+    "dictionary_lookup": ("translate", "الترجمة"),
+    "arabic_text_tools": ("translate", "الترجمة"),
+    "glossary_save": ("translate", "الترجمة"),
     "analyze_file": ("read", "قراءة واستعراض الملفات"),
     "save_notes": ("write", "إنشاء وتعديل الملفات"),
     "schedule_followup": ("followup", "متابعة مجدولة"),
@@ -5243,7 +6613,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.39.0"
+APP_VERSION = "2.40.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -6847,13 +8217,23 @@ CHAT_WIDTHS = {
 class AppSettingsDialog(QDialog):
     """Application-wide settings (like the Settings page in the Claude app): account, appearance, updates."""
 
-    def __init__(self, parent, key, remember, theme, update_url, width="wide", suggest=True, auto_update=False, skill_offers=True, khaled=False, rea=True, net_mode="auto", net_url="", api_key=""):
+    def __init__(self, parent, key, remember, theme, update_url, width="wide", suggest=True, auto_update=False, skill_offers=True, khaled=False, rea=True, net_mode="auto", net_url="", api_key="", extra=None):
         super().__init__(parent)
         self.setWindowTitle("إعدادات التطبيق")
-        self.resize(600, 560)
+        self.resize(760, 700)
         self.check_requested = False
         self.import_requested = False
-        lay = QVBoxLayout(self)
+        self.ds_sync_requested = False
+        extra = extra or {}
+        outer = QVBoxLayout(self)
+        scroll_ = QScrollArea()
+        scroll_.setWidgetResizable(True)
+        scroll_.setFrameShape(QFrame.NoFrame)
+        inner_ = QWidget()
+        scroll_.setWidget(inner_)
+        outer.addWidget(scroll_, 1)
+        self._outer = outer
+        lay = QVBoxLayout(inner_)
         h = QLabel("الحساب")
         h.setObjectName("h2")
         lay.addWidget(h)
@@ -6917,6 +8297,61 @@ class AppSettingsDialog(QDialog):
         self.rea_box = QCheckBox("الهندسة العكسية (REA): لما تطلب تحليل برنامج أو لعبة أو تطبيق، خبيلان يجهّز الأداة ويشتغل على طول")
         self.rea_box.setChecked(bool(rea))
         lay.addWidget(self.rea_box)
+        hd = QLabel("DeepSeek")
+        hd.setObjectName("h2")
+        lay.addWidget(hd)
+        self.web_box = QCheckBox("بحث الويب المدمج من DeepSeek (يبحث ويقرأ الروابط ويعطيك المصادر)")
+        self.web_box.setToolTip("كل بحث أو قراءة صفحة تقريباً 0.003 ريال")
+        self.web_box.setChecked(extra.get("ds_web_search", True) is not False)
+        lay.addWidget(self.web_box)
+        rowv = QHBoxLayout()
+        rowv.addWidget(QLabel("صوت «🔊 اسمع» تحت الردود:"))
+        self.voice_box = QComboBox()
+        for k_, lbl_ in TTS_VOICES.items():
+            self.voice_box.addItem(lbl_, k_)
+        self.voice_box.setCurrentIndex(max(0, self.voice_box.findData(extra.get("tts_voice") or "stella")))
+        rowv.addWidget(self.voice_box, 1)
+        lay.addLayout(rowv)
+        rowd = QHBoxLayout()
+        self.ds_label = QLabel("الموديلات المتاحة: " + "، ".join(MODELS) + "\nالموديلات الجديدة تنضاف لحالها، ويوصلك تنبيه إذا DeepSeek نزّلت شي جديد.")
+        self.ds_label.setWordWrap(True)
+        rowd.addWidget(self.ds_label, 1)
+        bd = QPushButton("تحقّق من DeepSeek الحين")
+        bd.clicked.connect(self._ds_sync)
+        rowd.addWidget(bd)
+        lay.addLayout(rowd)
+        hi = QLabel("صنع الصور")
+        hi.setObjectName("h2")
+        lay.addWidget(hi)
+        ni = QLabel("خبيلان يرسم صور حقيقية. بدون مفتاح يستخدم الخدمة المجانية المفتوحة (جودة عادية). لجودة أعلى خذ مفتاح مجاني من "
+                    "enter.pollinations.ai وحطه هنا، واختر الموديل.")
+        ni.setWordWrap(True)
+        ni.setObjectName("chip")
+        lay.addWidget(ni)
+        rowi = QHBoxLayout()
+        self.img_key = QLineEdit(extra.get("img_key") or "")
+        self.img_key.setEchoMode(QLineEdit.Password)
+        self.img_key.setLayoutDirection(Qt.LeftToRight)
+        self.img_key.setPlaceholderText("Pollinations key (اختياري)")
+        rowi.addWidget(self.img_key, 1)
+        self.img_model = QComboBox()
+        for k_, lbl_ in IMAGE_MODELS:
+            self.img_model.addItem(lbl_, k_)
+        self.img_model.setCurrentIndex(max(0, self.img_model.findData(extra.get("img_model") or "zimage")))
+        rowi.addWidget(self.img_model, 1)
+        lay.addLayout(rowi)
+        ht = QLabel("الترجمة")
+        ht.setObjectName("h2")
+        lay.addWidget(ht)
+        rowt = QHBoxLayout()
+        self.gl_label = QLabel()
+        self.gl_label.setWordWrap(True)
+        rowt.addWidget(self.gl_label, 1)
+        bg = QPushButton("قاموس المصطلحات…")
+        bg.clicked.connect(self._glossary)
+        rowt.addWidget(bg)
+        lay.addLayout(rowt)
+        self._count_glossary()
         hn = QLabel("الشبكة")
         hn.setObjectName("h2")
         lay.addWidget(hn)
@@ -6965,13 +8400,40 @@ class AppSettingsDialog(QDialog):
         b2.clicked.connect(self._import)
         row2.addWidget(b2)
         lay.addLayout(row2)
+        row3 = QHBoxLayout()
+        nk = QLabel("المحادثات والذاكرة والمهارات محفوظة على جهازك، مو في حساب DeepSeek: لو غيّرت المفتاح تكمل بنفس كل شي.")
+        nk.setWordWrap(True)
+        row3.addWidget(nk, 1)
+        b3 = QPushButton("حفظ كل المحادثات…")
+        b3.clicked.connect(self._export_all)
+        row3.addWidget(b3)
+        lay.addLayout(row3)
         lay.addStretch(1)
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         box.button(QDialogButtonBox.StandardButton.Ok).setText("حفظ")
         box.button(QDialogButtonBox.StandardButton.Cancel).setText("إلغاء")
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
-        lay.addWidget(box)
+        self._outer.addWidget(box)
+
+    def _ds_sync(self):
+        self.ds_sync_requested = True
+        self.accept()
+
+    def _export_all(self):
+        try:
+            self.parent().export_all_chats()
+        except Exception as e:
+            QMessageBox.warning(self, "حفظ", str(e))
+
+    def _count_glossary(self):
+        n = len(load_glossary())
+        self.gl_label.setText("الترجمة تمر على مترجم ثم مراجع، وتلتزم بقاموسك. عندك %d مصطلح محفوظ. ملف الوورد يرجع وورد، والإكسل إكسل، "
+                              "والبوربوينت بوربوينت، والترجمات بنفس التوقيت." % n)
+
+    def _glossary(self):
+        GlossaryDialog(self).exec()
+        self._count_glossary()
 
     def _import(self):
         self.import_requested = True
@@ -7030,7 +8492,60 @@ class AppSettingsDialog(QDialog):
             "rea": self.rea_box.isChecked(),
             "net_mode": self.net_box.currentData() or "auto",
             "net_url": self.net_url.text().strip(),
+            "extra": {"ds_web_search": self.web_box.isChecked(), "tts_voice": self.voice_box.currentData() or "stella",
+                      "img_key": self.img_key.text().strip(), "img_model": self.img_model.currentData() or "zimage"},
         }
+
+
+class GlossaryDialog(QDialog):
+    """The user's fixed translations (a company name, product names, preferred terms), used by every translation."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("قاموس المصطلحات")
+        self.resize(560, 520)
+        lay = QVBoxLayout(self)
+        n = QLabel("كل مصطلح هنا يترجمه خبيلان بنفس الطريقة دايماً. تقدر بعد تقول له بالمحادثة «احفظ إن X يترجم Y».")
+        n.setWordWrap(True)
+        lay.addWidget(n)
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["المصطلح", "ترجمته"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for k, v in load_glossary().items():
+            self._row(k, v)
+        lay.addWidget(self.table, 1)
+        row = QHBoxLayout()
+        ba = QPushButton("إضافة سطر")
+        ba.clicked.connect(lambda: (self._row("", ""), self.table.editItem(self.table.item(self.table.rowCount() - 1, 0))))
+        row.addWidget(ba)
+        bd = QPushButton("حذف المحدد")
+        bd.clicked.connect(lambda: [self.table.removeRow(r) for r in sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)])
+        row.addWidget(bd)
+        row.addStretch(1)
+        lay.addLayout(row)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        box.button(QDialogButtonBox.StandardButton.Ok).setText("حفظ")
+        box.button(QDialogButtonBox.StandardButton.Cancel).setText("إلغاء")
+        box.accepted.connect(self._save)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+
+    def _row(self, k, v):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self.table.setItem(r, 0, QTableWidgetItem(k))
+        self.table.setItem(r, 1, QTableWidgetItem(v))
+
+    def _save(self):
+        g = {}
+        for r in range(self.table.rowCount()):
+            k = (self.table.item(r, 0).text() if self.table.item(r, 0) else "").strip()
+            v = (self.table.item(r, 1).text() if self.table.item(r, 1) else "").strip()
+            if k and v:
+                g[k] = v
+        save_glossary(g)
+        self.accept()
 
 
 KHALED_IDLE = 60      # seconds without mouse/keyboard before «زر خالد» flashes
@@ -12043,6 +13558,15 @@ class App(QMainWindow):
         self.plus_btn.setToolTip("إرفاق ملفات أو صور")
         self.plus_btn.clicked.connect(self.pick_files)
         brow.addWidget(self.plus_btn)
+        self.mic_btn = QToolButton()
+        self.mic_btn.setText("🎤")
+        self.mic_btn.setObjectName("flat")
+        self.mic_btn.setToolTip("تكلّم بدل ما تكتب (اضغط وابدأ الكلام، واضغط مرة ثانية إذا خلصت). عربي أو إنجليزي، لين دقيقتين.")
+        self.mic_btn.clicked.connect(self.toggle_mic)
+        brow.addWidget(self.mic_btn)
+        self.mic = None
+        self.mic_timer = QTimer(self)
+        self.mic_timer.timeout.connect(self._mic_tick)
         self.access_btn = QPushButton()
         self.access_btn.setObjectName("flat")
         self.access_btn.clicked.connect(self.open_tools_dialog)
@@ -12132,6 +13656,10 @@ class App(QMainWindow):
         self.apply_width()
         QTimer.singleShot(900, self.recover_after_crash)
         QTimer.singleShot(4000, lambda: self.check_updates(silent=True))
+        QTimer.singleShot(7000, lambda: self.ds_sync(manual=False))
+        self.ds_timer = QTimer(self)
+        self.ds_timer.timeout.connect(lambda: self.ds_sync(manual=False))
+        self.ds_timer.start(6 * 3600 * 1000)
         self._upd_applying = False
         self._upd_restart = False
         self._auto_upd = False
@@ -12808,10 +14336,12 @@ class App(QMainWindow):
                                 self.cfg.get("suggest", True) is not False, False,
                                 self.cfg.get("skill_offers", True) is not False, bool(self.cfg.get("khaled_button")),
                                 self.cfg.get("rea_enabled", True) is not False, self.cfg.get("net_proxy_mode") or "auto",
-                                self.cfg.get("net_proxy_url") or "", self.key_edit.text().strip())
+                                self.cfg.get("net_proxy_url") or "", self.key_edit.text().strip(),
+                                extra={k_: self.cfg.get(k_) for k_ in ("ds_web_search", "tts_voice", "img_key", "img_model")})
         if not dlg.exec():
             return
         v = dlg.values()
+        self.cfg.update(v.get("extra") or {})
         self.cfg["suggest"] = bool(v["suggest"])
         self.cfg["auto_update"] = False  # never automatic
         self.cfg["skill_offers"] = bool(v["skill_offers"])
@@ -12838,6 +14368,8 @@ class App(QMainWindow):
         self.refresh_balance()
         if dlg.check_requested:
             self.check_updates(silent=False)
+        if dlg.ds_sync_requested:
+            self.ds_sync(manual=True)
         if dlg.import_requested:
             self.import_chats()
 
@@ -13068,6 +14600,7 @@ class App(QMainWindow):
         for p_ in self.cfg.get("projects") or []:
             pm_.addAction(p_["name"], lambda pid=p_["id"]: self.move_to_project(pid))
         m.addSeparator()
+        m.addAction("حفظ للإرسال لإيجنت ثاني…", self.export_handoff)
         m.addAction("تصدير Markdown", lambda: self.export_chat("md"))
         m.addAction("تصدير PDF", lambda: self.export_chat("pdf"))
         m.addSeparator()
@@ -13688,7 +15221,7 @@ class App(QMainWindow):
                 steps = m.get("activity")
                 if not steps and m.get("reasoning"):
                     steps = [{"k": "think", "text": m["reasoning"]}]  # chats saved before the Thinking block existed
-                self.render_reply(steps or [], clean_reply(m["content"]), "m%d" % i, False, (), m.get("dur"), m.get("cost"), m.get("sources"))
+                self.render_reply(steps or [], clean_reply(m["content"]), "m%d" % i, False, (), m.get("dur"), m.get("cost"), m.get("sources"), m.get("images"))
                 if m.get("skill_offer"):
                     self._insert_skill_offer(m["skill_offer"], i)
                 if i == len(all_msgs) - 1 and m.get("sugg") and not self.busy:
@@ -13702,7 +15235,7 @@ class App(QMainWindow):
             self.append_bot_label()
             self.reply_start = self._end_cursor().position()
             L = self.live
-            self.render_reply(L["steps"], L["body"], "live", True, L["warns"])
+            self.render_reply(L["steps"], L["body"], "live", True, L["warns"], images=L.get("images"))
             self.live_dirty = False
         else:
             self.show_files(last_reply)
@@ -13751,7 +15284,44 @@ class App(QMainWindow):
         m, r = divmod(sec, 60)
         return ("%dد %dث" % (m, r)) if m else ("%dث" % r)
 
-    def render_reply(self, steps, body, act_id, live, warns, dur=None, cost=None, sources=None):
+    def _insert_gen_image(self, c, path):
+        """A picture made by generate_image, with open / save as / folder links under it."""
+        cache = self.__dict__.setdefault("_img_cache", {})
+        img = cache.get(path)
+        if img is None:
+            img = QImage(path)
+            if img.isNull():
+                c.insertText("[الصورة %s ما عادت موجودة]\n" % os.path.basename(path), self.fmt["dim"])
+                return
+            if img.width() > 560:
+                img = img.scaledToWidth(560, Qt.SmoothTransformation)
+            if img.height() > 640:
+                img = img.scaledToHeight(640, Qt.SmoothTransformation)
+            cache[path] = img
+        res = "genimg:%d" % (abs(hash(path)) % 10 ** 9)
+        self.view.document().addResource(QTextDocument.ImageResource, QUrl(res), img)
+        c.insertBlock(QTextBlockFormat(), QTextCharFormat())
+        f = QTextImageFormat()
+        f.setName(res)
+        f.setWidth(img.width())
+        f.setHeight(img.height())
+        c.insertImage(f)
+        c.insertBlock(QTextBlockFormat(), QTextCharFormat())
+        key = "img%d" % (abs(hash(path)) % 10 ** 9)
+        self.copy_store[key] = path
+        a = QTextCharFormat()
+        a.setAnchor(True)
+        a.setForeground(QColor(THEMES[self.theme]["accent"]))
+        for i_, (lbl, act) in enumerate((("فتح", "imgopen"), ("حفظ باسم…", "imgsave"), ("المجلد", "imgdir"))):
+            if i_:
+                c.insertText("   ·   ", self.fmt["dim"])
+            r = QTextCharFormat(a)
+            r.setAnchorHref("%s:%s" % (act, key))
+            c.insertText(lbl, r)
+        c.insertText("   " + os.path.basename(path), self.fmt["dim"])
+        c.insertBlock(QTextBlockFormat(), QTextCharFormat())
+
+    def render_reply(self, steps, body, act_id, live, warns, dur=None, cost=None, sources=None, images=None):
         """Write one reply at the end of the view: Thinking line, optional details, then the answer.
 
         steps: list of {"k": think|say|tool|note, ...}; details are grouped under a heading per kind of work.
@@ -13785,6 +15355,9 @@ class App(QMainWindow):
             c.insertBlock(QTextBlockFormat(), QTextCharFormat())
         for w in warns:
             c.insertText("[" + w + "]\n", self.fmt["file"])
+        for ip in (images or [])[:12]:
+            self._insert_gen_image(c, ip)
+            c = self._end_cursor()
         if body:
             r0 = c.position()
             self.insert_rich_body(c, body, act_id)
@@ -14175,6 +15748,10 @@ class App(QMainWindow):
         a.setAnchorHref("copyreply:" + mid)
         a.setForeground(QColor(THEMES[self.theme]["accent"]))
         c.insertText("⧉ نسخ", a)
+        sp_ = QTextCharFormat(a)
+        sp_.setAnchorHref("speak:" + mid)
+        c.insertText("    ", self.fmt["dim"])
+        c.insertText("⏹ إيقاف" if getattr(self, "_speaking", "") == mid else "🔊 اسمع", sp_)
         try:
             idx = int(mid[1:])
             is_last = bool(self.current) and idx == len(self.current["msgs"]) - 1 and idx > 0 and not self.current.get("room")
@@ -14218,7 +15795,7 @@ class App(QMainWindow):
         c.removeSelectedText()
         c.setBlockFormat(QTextBlockFormat())
         c.setCharFormat(QTextCharFormat())
-        self.render_reply(L["steps"], L["body"], "live", True, L["warns"])
+        self.render_reply(L["steps"], L["body"], "live", True, L["warns"], images=L.get("images"))
         self.live_dirty = False
         sb.setValue(sb.maximum() if at_bottom else keep)
 
@@ -14445,6 +16022,29 @@ class App(QMainWindow):
         if s.startswith("src:"):
             self.open_source(s[4:])
             return
+        if s.startswith("speak:"):
+            self.speak_reply(s[6:])
+            return
+        if s.startswith(("imgopen:", "imgsave:", "imgdir:")):
+            act, _, k_ = s.partition(":")
+            p_ = self.copy_store.get(k_, "")
+            if not p_ or not os.path.exists(p_):
+                self.statusBar().showMessage("الصورة ما عادت موجودة", 5000)
+                return
+            if act == "imgopen":
+                open_path(p_)
+            elif act == "imgdir":
+                if IS_WIN:
+                    subprocess.Popen(["explorer", "/select," + os.path.normpath(p_)])
+                else:
+                    open_path(os.path.dirname(p_))
+            else:
+                dst, _ = QFileDialog.getSaveFileName(self, "حفظ الصورة", os.path.join(self.default_dir(), os.path.basename(p_)),
+                                                     "صور (*%s)" % os.path.splitext(p_)[1])
+                if dst:
+                    shutil.copyfile(p_, dst)
+                    self.statusBar().showMessage("تم الحفظ: " + dst, 6000)
+            return
         if s.startswith("regen:"):
             self.regenerate()
             return
@@ -14570,12 +16170,228 @@ class App(QMainWindow):
         self.send()
 
     # ---------- background tasks, schedule, folder watch, activity, sources ----------
+    # ---------- staying in step with DeepSeek: new models, new features ----------
+    def ds_sync(self, manual=False):
+        key = self.key_edit.text().strip()
+        if not key or getattr(self, "_ds_busy", False):
+            return
+        global DS_KEY
+        DS_KEY = key
+        self._ds_busy = True
+
+        def work():
+            new, news, err = [], [], ""
+            try:
+                new, _data = ds_fetch_models(key)
+            except Exception as e:
+                err = str(e)
+            try:
+                news = ds_fetch_news()
+            except Exception:
+                pass
+            self.q.put(("dssync", (new, news, manual, err)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_ds_sync(self, new, news, manual, err):
+        self._ds_busy = False
+        cur = self.model_box.currentText()
+        for m in MODELS:
+            if self.model_box.findText(m) < 0:
+                self.model_box.addItem(m)
+        for i in range(self.model_box.count() - 1, -1, -1):
+            t = self.model_box.itemText(i)
+            if t not in MODELS and t != cur:
+                self.model_box.removeItem(i)
+        self.cfg["ds_synced"] = time.time()
+        msgs = []
+        if new:
+            msgs.append("DeepSeek نزّلت موديل جديد: %s — أضفته لقائمة الموديلات تحت." % "، ".join(new))
+        seen = self.cfg.get("ds_news_seen") or ""
+        fresh = [n for n in news if n[0] > seen]
+        if news:
+            self.cfg["ds_news_seen"] = news[0][0]
+        self.save_cfg()
+        if fresh and seen:
+            msgs.append("\n\n".join("📅 %s\n%s" % (d, t[:900]) for d, t in fresh[:3]))
+        if msgs:
+            box = QMessageBox(self)
+            box.setWindowTitle("جديد من DeepSeek")
+            box.setText("\n\n".join(msgs) + "\n\nالموديلات الجديدة تنضاف لحالها. الميزات الجديدة توصلك مع تحديث خبيلان القادم.")
+            box.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            box.setModal(False)
+            box.show()
+            self._ds_box = box
+        elif manual:
+            QMessageBox.information(self, "DeepSeek", ("ما قدرت أوصل لـ DeepSeek: " + err) if err else
+                                    "خبيلان محدّث مع DeepSeek. الموديلات المتاحة: " + "، ".join(MODELS))
+
+    # ---------- listen to a reply (DeepSeek text to speech) ----------
+    def speak_reply(self, mid):
+        if getattr(self, "_speaking", ""):
+            stop_ = self._speaking == mid
+            self.stop_speech()
+            if stop_:
+                return
+        text = speech_text(self.copy_store.get("reply:" + mid, ""))
+        key = self.key_edit.text().strip()
+        if not text or not key:
+            return
+        global DS_KEY
+        DS_KEY = key
+        self._speaking = mid
+        self.statusBar().showMessage("أجهّز الصوت…", 8000)
+        voice = self.cfg.get("tts_voice") or "stella"
+        gen = self.__dict__.setdefault("_speech_gen", [0])
+        gen[0] += 1
+        my = gen[0]
+
+        def work():
+            try:
+                wav = ds_tts(text, voice)
+                d = os.path.join(DATA_DIR, "speech")
+                os.makedirs(d, exist_ok=True)
+                p = os.path.join(d, "reply_%d.wav" % my)
+                with open(p, "wb") as f:
+                    f.write(wav)
+                self.q.put(("speech", (my, mid, p, "")))
+            except Exception as e:
+                self.q.put(("speech", (my, mid, "", str(e))))
+        threading.Thread(target=work, daemon=True).start()
+        self.redraw_keep()
+
+    def on_speech_ready(self, val):
+        my, mid, p, err = val
+        if my != self.__dict__.get("_speech_gen", [0])[0] or self._speaking != mid:
+            return
+        if err:
+            self._speaking = ""
+            self.statusBar().showMessage("ما قدرت أجهّز الصوت: " + err[:200], 8000)
+            self.redraw_keep()
+            return
+        try:
+            if IS_WIN:
+                import winsound
+                threading.Thread(target=lambda: winsound.PlaySound(p, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT),
+                                 daemon=True).start()
+            else:
+                self._speech_proc = subprocess.Popen(["afplay" if IS_MAC else "aplay", p])
+            import wave
+            with wave.open(p) as w_:
+                secs = w_.getnframes() / float(w_.getframerate() or 24000)
+            QTimer.singleShot(int(secs * 1000) + 400, lambda m_=my: self._speech_ended(m_))
+            self.statusBar().showMessage("🔊 يقرأ الرد… (اضغط «إيقاف» تحت الرد عشان توقفه)", int(secs * 1000))
+        except Exception as e:
+            self._speaking = ""
+            self.statusBar().showMessage("ما قدرت أشغّل الصوت: %s" % e, 8000)
+            self.redraw_keep()
+
+    def _speech_ended(self, my):
+        if my == self.__dict__.get("_speech_gen", [0])[0] and getattr(self, "_speaking", ""):
+            self._speaking = ""
+            self.redraw_keep()
+
+    def stop_speech(self):
+        self._speaking = ""
+        self.__dict__.setdefault("_speech_gen", [0])[0] += 1
+        try:
+            if IS_WIN:
+                import winsound
+                winsound.PlaySound(None, 0)
+            elif getattr(self, "_speech_proc", None):
+                self._speech_proc.terminate()
+        except Exception:
+            pass
+        self.redraw_keep()
+
+    def redraw_keep(self):
+        """Redraw the chat (the listen/stop link changed) without moving the scroll."""
+        try:
+            if not self.busy:
+                self.render_chat(keep_scroll=True)
+        except Exception:
+            pass
+
+    # ---------- voice input (DeepSeek speech to text) ----------
+    def toggle_mic(self):
+        if self.mic is not None:
+            self._mic_finish()
+            return
+        if not self.key_edit.text().strip():
+            QMessageBox.warning(self, "5belan", "اكتب مفتاح API أول.")
+            return
+        try:
+            self.mic = MicRecorder()
+            self.mic.start()
+        except Exception as e:
+            self.mic = None
+            QMessageBox.warning(self, "المايك", "ما قدرت أشغّل المايك: %s\nتأكد إن فيه مايك وإن ويندوز سامح للبرامج تستخدمه." % e)
+            return
+        self.mic_btn.setText("⏺ 0:00")
+        self.mic_btn.setToolTip("يسجّل… اضغط عشان توقف ويتحوّل كلامك لنص")
+        self.mic_timer.start(250)
+
+    def _mic_tick(self):
+        if self.mic is None:
+            self.mic_timer.stop()
+            return
+        s_ = int(self.mic.seconds())
+        self.mic_btn.setText("⏺ %d:%02d" % (s_ // 60, s_ % 60))
+        if s_ >= 118:
+            self._mic_finish()
+
+    def _mic_finish(self):
+        self.mic_timer.stop()
+        mic, self.mic = self.mic, None
+        self.mic_btn.setText("…")
+        self.mic_btn.setEnabled(False)
+        try:
+            d = os.path.join(DATA_DIR, "speech")
+            os.makedirs(d, exist_ok=True)
+            p = mic.stop(os.path.join(d, "voice_input.wav"))
+        except Exception as e:
+            self.q.put(("asr", ("", str(e))))
+            return
+        if mic.seconds() < 0.6 and len(mic.buf) < 16000:
+            self.q.put(("asr", ("", "التسجيل قصير جداً")))
+            return
+        global DS_KEY
+        DS_KEY = self.key_edit.text().strip()
+
+        def work():
+            try:
+                self.q.put(("asr", (ds_asr(p), "")))
+            except Exception as e:
+                self.q.put(("asr", ("", str(e))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_asr_done(self, val):
+        text, err = val
+        self.mic_btn.setEnabled(True)
+        self.mic_btn.setText("🎤")
+        self.mic_btn.setToolTip("تكلّم بدل ما تكتب")
+        if err:
+            self.statusBar().showMessage("ما قدرت أحوّل الصوت لنص: " + err[:200], 8000)
+            return
+        if not text:
+            self.statusBar().showMessage("ما سمعت كلام واضح", 5000)
+            return
+        cur = self.inp.toPlainText()
+        self.inp.setPlainText((cur.rstrip() + " " if cur.strip() else "") + text)
+        self.inp.moveCursor(QTextCursor.End)
+        self.inp.setFocus()
+
     def make_llm(self, key, usage_cb=None):
-        def call(messages):
-            msg, u = api_chat(key, MODELS[0], messages)
+        def call(messages, model=None):
+            m_ = model if model in MODELS else MODELS[0]
+            msg, u = api_chat(key, m_, messages, timeout=240)
             if u and usage_cb:
                 try:
-                    usage_cb(u)
+                    usage_cb(u, m_)
+                except TypeError:
+                    try:
+                        usage_cb(u)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             return msg.get("content") or ""
@@ -15991,6 +17807,84 @@ class App(QMainWindow):
             out.append("")
         return "\n".join(out)
 
+    def export_handoff(self):
+        """The chat as one file another agent (Claude, ChatGPT, another 5belan) can read and continue: Markdown with everything,
+        plus a ZIP with the chat's files when it has any."""
+        if not self.current:
+            return
+        ch = self.current
+        base = re.sub(r'[\\/:*?"<>|]+', "_", ch["title"]).strip()[:50] or "chat"
+        wdir = os.path.join(self.chat_dir(), "work")
+        has_files = os.path.isdir(wdir) and any(fn for _r, _d, fns in os.walk(wdir) for fn in fns if not fn.startswith("_run_"))
+        flt = "ملف واحد للإيجنت (*.md)" + (";;المحادثة مع ملفاتها (*.zip)" if has_files else "")
+        path, chosen = QFileDialog.getSaveFileName(self, "حفظ المحادثة للإرسال", os.path.join(self.default_dir(), base + "_handoff.md"), flt)
+        if not path:
+            return
+        try:
+            md = chat_handoff_md(ch, self.get_project(ch.get("project")), load_memory())
+            if path.lower().endswith(".zip") or "zip" in (chosen or ""):
+                if not path.lower().endswith(".zip"):
+                    path = os.path.splitext(path)[0] + ".zip"
+                with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+                    z.writestr("conversation.md", md)
+                    z.writestr("conversation.json", json.dumps({"title": ch["title"], "msgs": [strip_for_save(m) for m in ch["msgs"]]},
+                                                               ensure_ascii=False, indent=1))
+                    for r_, _d, fns in os.walk(wdir):
+                        for fn in fns:
+                            if fn.startswith("_run_"):
+                                continue
+                            fp = os.path.join(r_, fn)
+                            if os.path.getsize(fp) < 100 * 1024 * 1024:
+                                z.write(fp, "files/" + os.path.relpath(fp, wdir).replace("\\", "/"))
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(md)
+            self.statusBar().showMessage("انحفظت: " + path, 8000)
+            if IS_WIN:
+                subprocess.Popen(["explorer", "/select," + os.path.normpath(path)])
+        except Exception as e:
+            QMessageBox.warning(self, "حفظ", "تعذّر الحفظ: %s" % e)
+
+    def export_all_chats(self):
+        """Every chat in one ZIP: a Markdown hand-off per chat, chats.json (can be imported back), the memory and the glossary."""
+        path, _ = QFileDialog.getSaveFileName(self, "حفظ كل المحادثات", os.path.join(self.default_dir(), "5belan_chats_%s.zip" % time.strftime("%Y-%m-%d")),
+                                              "ZIP (*.zip)")
+        if not path:
+            return
+        if not path.lower().endswith(".zip"):
+            path += ".zip"
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            mem = load_memory()
+            used = set()
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+                for ch in self.chats:
+                    if not ch.get("msgs"):
+                        continue
+                    nm = re.sub(r'[\\/:*?"<>|]+', "_", ch.get("title") or "chat").strip()[:60] or "chat"
+                    k = 2
+                    while nm.lower() in used:
+                        nm = "%s (%d)" % (nm[:55], k)
+                        k += 1
+                    used.add(nm.lower())
+                    z.writestr("chats/%s.md" % nm, chat_handoff_md(ch, self.get_project(ch.get("project")), ""))
+                if os.path.exists(CHATS_PATH):
+                    z.write(CHATS_PATH, "chats.json")
+                if mem.strip():
+                    z.writestr("memory.md", mem)
+                if os.path.exists(GLOSSARY_PATH):
+                    z.write(GLOSSARY_PATH, "glossary.json")
+                z.writestr("README.txt", "5belan export %s\n\nchats/: every conversation as Markdown (give one to any AI agent to continue it).\n"
+                                         "chats.json: import it back in 5belan (Settings > Chats > import).\nmemory.md: what 5belan remembers about you.\n"
+                           % time.strftime("%Y-%m-%d %H:%M"))
+            self.statusBar().showMessage("انحفظت كل المحادثات: " + path, 8000)
+            if IS_WIN:
+                subprocess.Popen(["explorer", "/select," + os.path.normpath(path)])
+        except Exception as e:
+            QMessageBox.warning(self, "حفظ", "تعذّر الحفظ: %s" % e)
+        finally:
+            QApplication.restoreOverrideCursor()
+
     def export_chat(self, fmt):
         if not self.current:
             return
@@ -16181,7 +18075,7 @@ class App(QMainWindow):
             self,
             "إرفاق ملفات",
             self.default_dir(),
-            "الملفات المدعومة (*.png *.jpg *.jpeg *.gif *.webp *.pdf *.docx *.xlsx *.txt *.md *.csv *.json *.py *.js *.html *.css *.xml *.log *.sql);;كل الملفات (*.*)",
+            "كل الملفات (*.*);;مستندات (*.pdf *.docx *.doc *.xlsx *.xls *.pptx *.ppt *.odt *.rtf *.txt *.md *.csv *.srt);;صور (*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif);;صوت (*.wav *.ogg *.opus);;مضغوط (*.zip *.rar *.7z)",
         )
         for p in paths:
             if p not in self.attachments:
@@ -16305,6 +18199,25 @@ class App(QMainWindow):
         out.append("(If the user needs exact text from a specific part, tell them the part number and ask them to attach or quote it.)")
         return "\n\n".join(out)
 
+    def keep_attachment(self, path):
+        """A copy of an attached file in the chat's work folder, so the tools (translate, run_python) can open the original."""
+        try:
+            if os.path.getsize(path) > 200 * 1024 * 1024:
+                return ""
+            if self.current:
+                cdir = self.chat_dir()
+            else:  # the chat is created right after this message is built: reserve its id now
+                cdir = os.path.join(DATA_DIR, "files", self.__dict__.setdefault("_pending_cid", uuid.uuid4().hex))
+            d = os.path.join(cdir, "work", "attachments")
+            os.makedirs(d, exist_ok=True)
+            dst = os.path.join(d, os.path.basename(path))
+            if os.path.abspath(dst) != os.path.abspath(path):
+                if not (os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(path)):
+                    shutil.copy2(path, dst)
+            return dst
+        except Exception:
+            return ""
+
     def build_user_content(self, text, model):
         """Returns (content, shown_names). content is str or list of blocks."""
         doc_parts = []
@@ -16313,9 +18226,31 @@ class App(QMainWindow):
         for path in self.attachments:
             name = os.path.basename(path)
             ext = os.path.splitext(path)[1].lower()
+            if ext in IMAGE_MIME and model not in VISION_MODELS:
+                try:
+                    QApplication.setOverrideCursor(Qt.WaitCursor)
+                    otext = ds_parse_file(path)
+                except Exception as e:
+                    raise RuntimeError("الموديل %s ما يشوف الصور، وحاولت أقرأ النص اللي فيها وما قدرت (%s). استخدم موديل يشوف الصور." % (model, e))
+                finally:
+                    QApplication.restoreOverrideCursor()
+                kept = self.keep_attachment(path)
+                doc_parts.append("--- Image: %s (you cannot see it; this is the text read from it by OCR)%s ---\n%s\n--- End of %s ---"
+                                 % (name, (" saved at " + kept) if kept else "", otext or "(no text found in the picture)", name))
+                names.append(name)
+                continue
+            if ext in (".wav", ".ogg", ".opus", ".oga"):
+                try:
+                    QApplication.setOverrideCursor(Qt.WaitCursor)
+                    atext = ds_asr(path)
+                except Exception as e:
+                    raise RuntimeError("ما قدرت أفرّغ الصوت %s (%s). الحد دقيقتين و8 ميغا." % (name, e))
+                finally:
+                    QApplication.restoreOverrideCursor()
+                doc_parts.append("--- Audio: %s (transcript) ---\n%s\n--- End of %s ---" % (name, atext, name))
+                names.append(name)
+                continue
             if ext in IMAGE_MIME:
-                if model not in VISION_MODELS:
-                    raise RuntimeError("الموديل %s ما يقرأ الصور. استخدم deepseek-flash." % model)
                 if os.path.getsize(path) > MAX_IMAGE_BYTES:
                     raise RuntimeError("الصورة كبيرة (الحد 20 ميغا): " + name)
                 with open(path, "rb") as f:
@@ -16332,7 +18267,9 @@ class App(QMainWindow):
                     raise RuntimeError("تعذّرت قراءة %s: %s" % (name, e))
                 if len(body) > DOC_INLINE_MAX:
                     body = self.digest_big(path, name, body, text)
-                doc_parts.append("--- File: %s ---\n%s\n--- End of %s ---" % (name, body, name))
+                kept = self.keep_attachment(path)
+                doc_parts.append("--- File: %s%s ---\n%s\n--- End of %s ---"
+                                 % (name, (" (original saved at %s — use this path with translate or run_python)" % kept) if kept else "", body, name))
             names.append(name)
         full_text = text
         if doc_parts:
@@ -16380,7 +18317,7 @@ class App(QMainWindow):
 
         if self.current is None:
             title = text.replace("\n", " ")[:40] if text else (names[0] if names else (quotes[0]["q"].replace("\n", " ")[:40] if quotes else "محادثة جديدة"))
-            self.current = {"id": uuid.uuid4().hex, "title": title or "محادثة جديدة", "updated": time.time(), "msgs": [],
+            self.current = {"id": self.__dict__.pop("_pending_cid", None) or uuid.uuid4().hex, "title": title or "محادثة جديدة", "updated": time.time(), "msgs": [],
                             "settings": self.collect_settings(), "project": self.selected_project_id()}
             self.chats.append(self.current)
         else:
@@ -16468,10 +18405,18 @@ class App(QMainWindow):
             runner.progress = lambda t_, r_=run: self.q.put(("note", t_, r_))
             runner.terminal_ok = bool(getattr(self, "terminal_ok", False))
             runner.terminal_preapprove = bool(getattr(self, "terminal_preapprove", False))
+            runner.image_cfg = {"key": self.cfg.get("img_key") or "", "model": self.cfg.get("img_model") or "zimage"}
+            runner.show_image = lambda p_, r_=run: self.q.put(("image", p_, r_))
+            web_ = self.cfg.get("ds_web_search", True) is not False
+            runner.web_builtin = web_ and think != "off"
+            runner.web_fn = web_ and think == "off"
+            runner.on_cost = lambda n_, r_=run, m_=model: self.q.put(
+                ("usage", (m_, {"prompt_tokens": 0, "completion_tokens": 0, "server_tool_use": {"tool_search": n_}}, time.time()), r_))
         if runner is not None:
-            runner.llm = self.make_llm(key, lambda u: self.q.put(("usage", (MODELS[0], u, time.time()), run)))
+            runner.llm = self.make_llm(key, lambda u, m_=None: self.q.put(("usage", (m_ or MODELS[0], u, time.time()), run)))
         system = SYSTEM_PROMPT + "\n" + memory_prompt() + (tools_prompt(runner) if runner else "")
         system += skills_prompt(getattr(self, "chat_skills", []), offers=self.cfg.get("skill_offers", True) is not False)
+        system += "\nToday's date: %s." % time.strftime("%A %Y-%m-%d")
         if roots:
             system += "\n" + folder_notes_prompt(roots)
             rules = project_rules_prompt(roots)
@@ -16500,6 +18445,26 @@ class App(QMainWindow):
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
         )
         content, reasoning, calls = [], [], {}
+        srv, cites, found = {}, [], []
+
+        def srv_emit(cl):
+            act = cl.get("action") or {}
+            typ = str(cl.get("type") or "")
+            what = act.get("queries") or act.get("query") or act.get("url") or act.get("pattern") or ""
+            if isinstance(what, list):
+                what = " | ".join(str(x).split("|")[0] for x in what[:4])
+            kind_ = str(act.get("type") or cl.get("kind") or "")
+            if kind_ in ("open", "fetch", "read", "open_page") or typ == "deepseek_read_url" or str(what).startswith("http"):
+                text_ = "قراءة صفحة: %s" % what
+            elif kind_ == "image_search":
+                text_ = "بحث صور: %s" % what
+            elif kind_ == "find":
+                text_ = "بحث داخل الصفحة: %s" % what
+            else:
+                text_ = "بحث في الويب: %s" % what
+            ok_ = str(cl.get("status") or "completed") != "failed"
+            put("tool", {"k": "tool", "name": typ or "deepseek_web_search", "text": text_, "ok": ok_, "err": "" if ok_ else "failed"})
+
         with urllib.request.urlopen(req, timeout=600) as resp:
             for raw in resp:
                 if run.stop_event.is_set():
@@ -16522,6 +18487,27 @@ class App(QMainWindow):
                     delta = obj["choices"][0]["delta"]
                 except Exception:
                     continue
+                for sv in delta.get("server_tool_calls") or []:
+                    rc = sv.get("reasoning_content")
+                    if rc:
+                        reasoning.append(rc)
+                        put("think", rc)
+                    for cl in sv.get("calls") or []:
+                        cid_ = cl.get("id") or "%s/%s" % (sv.get("index"), cl.get("index"))
+                        slot_ = srv.setdefault(cid_, {"done": False})
+                        for k_, v_ in cl.items():
+                            if v_ not in (None, "", []):
+                                slot_[k_] = v_
+                        for so in cl.get("sources") or []:
+                            if so.get("url"):
+                                found.append((str(so.get("title") or so["url"])[:120], so["url"]))
+                        if not slot_["done"] and slot_.get("status") in ("completed", "failed"):
+                            slot_["done"] = True
+                            srv_emit(slot_)
+                for an in delta.get("annotations") or []:
+                    uc = an.get("url_citation") or {}
+                    if uc.get("url"):
+                        cites.append((str(uc.get("title") or uc["url"])[:120], uc["url"]))
                 t = delta.get("reasoning_content")
                 if t:
                     reasoning.append(t)
@@ -16547,6 +18533,13 @@ class App(QMainWindow):
                                 put("todo", lst)
                         except Exception:
                             pass
+        for slot_ in srv.values():
+            if not slot_["done"]:
+                slot_["done"] = True
+                srv_emit(slot_)
+        for title_, url_ in (cites or found[:6]):
+            if len(run.srcs) < 10 and all(x["url"] != url_ for x in run.srcs):
+                run.srcs.append({"title": title_, "url": url_})
         return "".join(content), "".join(reasoning), [calls[i] for i in sorted(calls)]
 
     def worker(self, key, model, think, messages, runner, run):
@@ -16562,6 +18555,7 @@ class App(QMainWindow):
         retried = False
         rounds = 0
         seen = {}
+        web_on = bool(runner is not None and getattr(runner, "web_builtin", False))
         net_retries = 0
         ctx_retried = False
         wrap_up = ""
@@ -16584,6 +18578,8 @@ class App(QMainWindow):
                     payload["reasoning_effort"] = think
                 if use_tools:
                     payload["tools"] = runner.tools()
+                if web_on and think != "off":
+                    payload["tools"] = list(WEB_TOOLS) + (payload.get("tools") or [])
                 try:
                     run.finish_reason = ""
                     content, reasoning, calls = self.stream_once(key, payload, run)
@@ -16625,6 +18621,10 @@ class App(QMainWindow):
                         retried = True
                         use_tools = False
                         put("warn", "هذي المحادثة قديمة وما تدعم ملفات الجهاز، فأرسلت الطلب بدونها. ابدأ محادثة جديدة لو تبيها.")
+                        continue
+                    if e.code == 400 and web_on and re.search(r"deepseek_web|deepseek_read|server tool|tools", detail, re.I):
+                        web_on = False  # this model or account cannot use DeepSeek's web tools: go on without them
+                        put("warn", "بحث الويب المدمج ما اشتغل مع هذا الطلب، كمّلت بدونه.")
                         continue
                     if e.code == 400 and not ctx_retried and re.search(r"context|length|too long|maximum", detail, re.I):
                         ctx_retried = True
@@ -16687,6 +18687,10 @@ class App(QMainWindow):
                             mm = re.match(r"opened[^:]*:\s*(.*?)\s+—\s+(https?://\S+)", result)
                             if mm and all(x["url"] != mm.group(2) for x in run.srcs):
                                 run.srcs.append({"title": mm.group(1)[:120], "url": mm.group(2)})
+                        for t_, u_ in getattr(runner, "found_sources", [])[:]:
+                            if len(run.srcs) < 10 and all(x["url"] != u_ for x in run.srcs):
+                                run.srcs.append({"title": t_, "url": u_})
+                        runner.found_sources = []
                     except Exception:
                         pass
                     put(
@@ -16864,6 +18868,16 @@ class App(QMainWindow):
                 if L is not None:
                     L["warns"].append(val)
                     R.live_dirty = True
+            elif kind == "image":
+                if L is not None:
+                    L.setdefault("images", []).append(val)
+                    R.live_dirty = True
+            elif kind == "dssync":
+                self.on_ds_sync(*val)
+            elif kind == "speech":
+                self.on_speech_ready(val)
+            elif kind == "asr":
+                self.on_asr_done(val)
             elif kind == "demote":
                 if L is not None:
                     L["cur_think"] = None
@@ -17068,6 +19082,8 @@ class App(QMainWindow):
                     R.srcs = []
                 if L is not None and L["steps"]:
                     msg["activity"] = L["steps"]
+                if L is not None and L.get("images"):
+                    msg["images"] = list(L["images"])
                 if L is not None and L.get("t0"):
                     msg["dur"] = int(time.time() - L["t0"])
                 ch_["msgs"].append(msg)

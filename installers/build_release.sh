@@ -54,7 +54,7 @@ if [ "${1:-}" = "--publish" ]; then
   git_push() { git push -q "$@" || env -u GH_TOKEN git push -q "$@"; }
   (cd "$ROOT" && "$PY" publish.py --repo "$REPO" --pip PySide6-WebEngine --notes "$NOTES")   # writes update.json, does NOT push
   # HANDOFF.md is private (ignored by .gitignore), so `add -A` can never publish it
-  (cd "$ROOT" && git add -A && git -c user.name=not-sal -c user.email=saleh96881@gmail.com commit -q -m "$VER: $NOTES" && git_push origin HEAD:main)
+  (cd "$ROOT" && git add -A && git commit -q -m "$VER: $NOTES" && git_push origin HEAD:main)
   echo "pushed. verify: curl -s https://raw.githubusercontent.com/$REPO/main/update.json | grep version"
   # The program itself goes to GitHub Releases: one release per version with the three installers attached.
   if command -v gh >/dev/null 2>&1; then
