@@ -2390,7 +2390,8 @@ def tools_prompt(runner):
         parts.append(
             "ANDROID APPS: an attached .apk/.xapk/.apks already comes with its summary (package, version, permissions, components, framework, "
             "manifest). When the user wants to see or study the code, call decompile_apk with the saved path: it turns the app into readable "
-            "Java + resources and opens a code browser for the user; then read the folder with read_file/grep/find_files.")
+            "Java + resources and opens a code browser for the user; then read the folder with read_file/grep/find_files "
+            "(prefer them; run_python only for bulk analysis).")
     if runner.llm is not None:
         parts.append(
             "TRANSLATION: for any translation longer than a couple of sentences, and for EVERY file, use the translate tool (translator + "
@@ -4668,6 +4669,7 @@ class ToolRunner:
         self.found_sources = []   # (title, url) of pages a tool read, for the sources list under the reply
         self.add_root = None      # callable(path): remember a read-only folder for this chat (a decompiled app)
         self.show_apk = None      # callable(folder, title): open the code browser
+        self.python_free = False  # a chat about a decompiled app: analysis code runs without asking (OS protection still applies)
         self.ask_dest = None      # callable(apk name) -> parent folder for the decompiled code, or None when the user cancels
         self.apk_job = None       # callable(job, title, kind, pct, text, cancel_event): the progress window
         self.backup = bool(backup)
@@ -6071,7 +6073,7 @@ class ToolRunner:
 
     def _guard_python(self, title, detail):
         # python runs with the user's own rights, so it is always confirmed unless the user gave full freedom
-        if self.shell_mode == "free" or self.confirm is None:
+        if self.shell_mode == "free" or self.confirm is None or self.python_free:
             return
         try:
             ok = bool(self.confirm(title, detail))
@@ -6681,7 +6683,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.43.0"
+APP_VERSION = "2.43.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -16128,6 +16130,7 @@ class App(QMainWindow):
                     "archived": bool(c.get("archived")),
                     "todos": (c.get("todos") or [])[:40],
                     "extra_roots": (c.get("extra_roots") or [])[-10:],
+                    "apk_chat": bool(c.get("apk_chat")),
                     "msgs": [strip_for_save(m) for m in c["msgs"]],
                 }
             )
@@ -17293,6 +17296,7 @@ class App(QMainWindow):
             return
         self.new_chat()
         self._pending_extra_roots = [out]
+        self._pending_apk_chat = True  # this chat analyses the app freely: reading and running analysis code without asking
         self.inp.setPlainText(
             "فكّيت تطبيق «%s» وحفظت كوده في هذا المجلد:\n%s\n\nاقرأ الكود (ابدأ بـ resources/AndroidManifest.xml وأهم حزم التطبيق في sources) "
             "وعطني ملخص: وش يسوي التطبيق، بأي تقنية مبني، أهم الشاشات والملفات، وين يتصل بالسيرفر وبأي روابط، والصلاحيات الحساسة. "
@@ -19479,6 +19483,7 @@ class App(QMainWindow):
             title = text.replace("\n", " ")[:40] if text else (names[0] if names else (quotes[0]["q"].replace("\n", " ")[:40] if quotes else "محادثة جديدة"))
             self.current = {"id": self.__dict__.pop("_pending_cid", None) or uuid.uuid4().hex, "title": title or "محادثة جديدة", "updated": time.time(), "msgs": [],
                             "extra_roots": self.__dict__.pop("_pending_extra_roots", None) or [],
+                            "apk_chat": bool(self.__dict__.pop("_pending_apk_chat", False)),
                             "settings": self.collect_settings(), "project": self.selected_project_id()}
             self.chats.append(self.current)
         else:
@@ -19572,8 +19577,9 @@ class App(QMainWindow):
             runner.show_apk = lambda p_, t_, r_=run: self.q.put(("apkview", (p_, t_), r_))
             runner.ask_dest = lambda n_, r_=run: self.ask_apk_dest_from_thread(n_, r_)
             runner.apk_job = lambda j_, t_, k_, p_, x_, c_: self.q.put(("apkprog", (j_, t_, k_, p_, x_, c_), None))
-            runner.add_root = lambda p_, ch_=self.current: (ch_.setdefault("extra_roots", []).append(p_)
+            runner.add_root = lambda p_, ch_=self.current: (ch_.__setitem__("apk_chat", True), ch_.setdefault("extra_roots", []).append(p_)
                                                             if p_ not in (ch_.get("extra_roots") or []) else None)
+            runner.python_free = bool(self.current.get("apk_chat") or self.current.get("extra_roots"))  # chats made before 2.43.1 only have extra_roots
             web_ = self.cfg.get("ds_web_search", True) is not False
             runner.web_builtin = web_ and think != "off"
             runner.web_fn = web_ and think == "off"
