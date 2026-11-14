@@ -2066,7 +2066,7 @@ def _http_json(url):
         return json.loads(r.read().decode("utf-8"))
 
 
-def _download(url, dest, sha256, progress=None, stop=None, label=""):
+def _download(url, dest, sha256, progress=None, stop=None, label="", pct=None):
     """Download to dest and check its SHA-256 (refuses a file that does not match)."""
     req = urllib.request.Request(url, headers={"User-Agent": "5belan"})
     h = hashlib.sha256()
@@ -2083,6 +2083,8 @@ def _download(url, dest, sha256, progress=None, stop=None, label=""):
             f.write(chunk)
             h.update(chunk)
             got += len(chunk)
+            if pct:
+                pct(got, total)
             if progress and got >= nxt:
                 nxt += step
                 progress("أنزّل %s… %d ميغا%s" % (label, got // 1048576, (" من %d" % (total // 1048576)) if total else ""))
@@ -2173,13 +2175,13 @@ def engine_installed(engine):
     return False
 
 
-def install_engine(engine, plan, progress=None, stop=None):
+def install_engine(engine, plan, progress=None, stop=None, pct=None):
     """Download one engine (already approved), verify it and record where it is for REA. Returns a short report."""
     base = os.path.join(DATA_DIR, "tools")
     os.makedirs(base, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="belan_eng_", dir=base)
     try:
-        arc = _download(plan["url"], os.path.join(tmp, plan["name"]), plan["sha"], progress, stop, engine)
+        arc = _download(plan["url"], os.path.join(tmp, plan["name"]), plan["sha"], progress, stop, engine, pct)
         if progress:
             progress("أفك وأجهّز %s…" % engine)
         if engine == "java":
@@ -4666,6 +4668,8 @@ class ToolRunner:
         self.found_sources = []   # (title, url) of pages a tool read, for the sources list under the reply
         self.add_root = None      # callable(path): remember a read-only folder for this chat (a decompiled app)
         self.show_apk = None      # callable(folder, title): open the code browser
+        self.ask_dest = None      # callable(apk name) -> parent folder for the decompiled code, or None when the user cancels
+        self.apk_job = None       # callable(job, title, kind, pct, text, cancel_event): the progress window
         self.backup = bool(backup)
         self.cache = {}
         self.changes = []
@@ -5176,6 +5180,12 @@ class ToolRunner:
         src = self._any_file(a.get("path"))
         if not src.lower().endswith((".apk", ".xapk", ".apks", ".aab", ".apkm")):
             raise ToolError("this is not an Android app file (.apk, .xapk, .apks, .aab)")
+        name = os.path.basename(src)
+        parent = None
+        if self.ask_dest is not None:
+            parent = self.ask_dest(name)
+            if not parent:
+                raise ToolError("the user cancelled (did not choose where to save the decompiled app). Ask what they want instead.")
         need = apk_needed_downloads()
         if need:
             total = sum(pl["mb"] for _e, pl in need)
@@ -5186,17 +5196,34 @@ class ToolRunner:
                     "عشان أفك التطبيق وتشوف كوده أحتاج أنزّل مرة وحدة بس:\n%s\n\nمن المصدر الرسمي، وأتأكد من بصمته، في مجلد بيانات خبيلان. "
                     "المجموع تقريباً %d ميغا. أنزّلها؟" % (lines, total)):
                 raise ToolError("the user said no to downloading jadx/Java; give them the apk summary you can read without it")
-            apk_install_needed(need, self.progress, self.stop_event)
-        stem = re.sub(r"[^\w.\-]+", "_", os.path.splitext(os.path.basename(src))[0])[:50] or "app"
-        out = os.path.join(self.work_dir or os.path.dirname(src), stem + "_decompiled")
-        decompile_apk_to(src, out, bool(a.get("deobfuscate")), self.progress, self.stop_event)
+        job = uuid.uuid4().hex[:8]
+        cancel = threading.Event()
+        stop = AnyStop(self.stop_event, cancel)
+        rep_ = (lambda kind, p, t: self.apk_job(job, name, kind, p, t, cancel)) if self.apk_job else None
+        stem = re.sub(r"[^\w.\-]+", "_", os.path.splitext(name)[0])[:50] or "app"
+        out = unique_dir(parent or self.work_dir or os.path.dirname(src), stem + "_decompiled")
+        try:
+            if need:
+                apk_install_needed(need, self.progress, stop, (lambda p, t: rep_("dl", p, t)) if rep_ else None)
+            if rep_:
+                rep_("dec", 0, "أبدأ…")
+            os.makedirs(out, exist_ok=True)
+            decompile_apk_to(src, out, bool(a.get("deobfuscate")), self.progress, stop, (lambda p, t: rep_("dec", p, t)) if rep_ else None)
+        except Exception as e:
+            if rep_:
+                rep_("err", 0, str(e))
+            if cancel.is_set():
+                raise ToolError("the user cancelled the decompiling")
+            raise
+        if rep_:
+            rep_("done", 100, out + "|" + src)
         if out not in self.roots:
             self.roots.append(out)
         if self.add_root:
             self.add_root(out)
-        if self.show_apk:
+        if self.show_apk and not self.apk_job:
             self.show_apk(out, os.path.basename(src))
-        return (decompiled_overview(out) + "\n\nThe code browser window is open for the user (tree, code view, search in all files). "
+        return (decompiled_overview(out) + "\n\nThe user sees a window with the result and buttons for the code browser, the folder and a new chat about it. "
                 "You can now read this folder with read_file, grep and find_files. Explain briefly what the app is and where its main "
                 "logic is, then offer to dig into something specific (network calls, API keys, permissions, a screen).")
 
@@ -6654,7 +6681,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.42.0"
+APP_VERSION = "2.43.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -13250,12 +13277,12 @@ def jadx_cli_path():
     return p if p and os.path.isfile(p) else ""
 
 
-def install_jadx_cli(plan, progress=None, stop=None):
+def install_jadx_cli(plan, progress=None, stop=None, pct=None):
     base = os.path.join(DATA_DIR, "tools")
     os.makedirs(base, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="belan_eng_", dir=base)
     try:
-        arc = _download(plan["url"], os.path.join(tmp, plan["name"]), plan["sha"], progress, stop, "jadx")
+        arc = _download(plan["url"], os.path.join(tmp, plan["name"]), plan["sha"], progress, stop, "jadx", pct)
         dest = os.path.join(base, "jadx-cli")
         shutil.rmtree(dest, ignore_errors=True)
         os.makedirs(dest)
@@ -13281,15 +13308,27 @@ def apk_needed_downloads():
     return need
 
 
-def apk_install_needed(need, progress=None, stop=None):
+def apk_install_needed(need, progress=None, stop=None, pct=None):
+    """Install what decompiling still needs. pct(percent, text) reports the whole download (all files together)."""
+    total = sum(max(1, pl["mb"]) for _e, pl in need) * 1048576
+    done = [0]
     for e, pl in need:
+        label = "Java 21" if e == "java" else "jadx"
+        cb = None
+        if pct:
+            def cb(got, tot, label=label, base=done[0]):
+                allg = base + got
+                pct(min(99, allg * 100 // max(1, total)), "أنزّل %s… %d من %d ميغا" % (label, allg // 1048576, total // 1048576))
         if e == "java":
-            install_engine("java", pl, progress, stop)
+            install_engine("java", pl, progress, stop, cb)
         else:
-            install_jadx_cli(pl, progress, stop)
+            install_jadx_cli(pl, progress, stop, cb)
+        done[0] += max(1, pl["mb"]) * 1048576
+        if pct:
+            pct(min(99, done[0] * 100 // max(1, total)), "%s جاهز ✓" % label)
 
 
-def decompile_apk_to(path, out_dir, deobf=False, progress=None, stop=None):
+def decompile_apk_to(path, out_dir, deobf=False, progress=None, stop=None, pct=None):
     """Run jadx: Java sources in out_dir/sources, decoded resources (manifest, layouts, strings) in out_dir/resources."""
     exe = jadx_cli_path()
     if not exe:
@@ -13311,8 +13350,9 @@ def decompile_apk_to(path, out_dir, deobf=False, progress=None, stop=None):
         env["JAVA_HOME"] = jh
         env["PATH"] = os.path.join(jh, "bin") + os.pathsep + env.get("PATH", "")
     env["JAVA_OPTS"] = "-Xmx%dm" % 3072
-    shutil.rmtree(out_dir, ignore_errors=True)
-    cmd = [exe, "-d", out_dir, "--show-bad-code", "-j", str(max(2, min(8, (os.cpu_count() or 4)))), "--log-level", "ERROR"]
+    if os.path.isdir(out_dir) and os.listdir(out_dir):
+        raise ToolError("the output folder is not empty: " + out_dir)
+    cmd = [exe, "-d", out_dir, "--show-bad-code", "-j", str(max(2, min(8, (os.cpu_count() or 4)))), "--log-level", "progress"]
     if deobf:
         cmd.append("--deobf")
     cmd.append(src)
@@ -13333,6 +13373,19 @@ def decompile_apk_to(path, out_dir, deobf=False, progress=None, stop=None):
                     ToolRunner._kill_tree(proc)
                     raise ToolError("decompiling took more than 30 minutes and was stopped")
                 time.sleep(0.5)
+                if pct:
+                    try:  # jadx writes «progress: 4017 of 8803 (45%)» lines
+                        with open(log_path, "rb") as fh:
+                            fh.seek(max(0, os.path.getsize(log_path) - 600))
+                            tail = fh.read().decode("utf-8", "replace")
+                        m_ = re.findall(r"progress: (\d+) of (\d+) \((\d+)%\)", tail)
+                        if m_:
+                            a_, b_, p_ = m_[-1]
+                            pct(int(p_), "%s من %s جزء من الكود" % (format(int(a_), ","), format(int(b_), ",")))
+                        elif "loading" in tail or "processing" in tail:
+                            pct(0, "أقرأ ملف التطبيق…")
+                    except Exception:
+                        pass
         with open(log_path, "rb") as fh:
             log = fh.read()[-3000:].decode("utf-8", "replace")
     finally:
@@ -13553,6 +13606,188 @@ class ApkBrowser(QDialog):
             pass
 
 
+class AnyStop:
+    """is_set() is true when any of the events is set (the reply's stop button or the progress window's cancel)."""
+
+    def __init__(self, *events):
+        self.events = [e for e in events if e is not None]
+
+    def is_set(self):
+        return any(e.is_set() for e in self.events)
+
+
+def unique_dir(parent, name):
+    """A new folder name inside parent that does not exist yet (never reuses or wipes a folder of the user)."""
+    base = os.path.join(parent, name)
+    p, k = base, 2
+    while os.path.exists(p):
+        p = "%s_%d" % (base, k)
+        k += 1
+    return p
+
+
+def apk_default_parent():
+    docs = os.path.join(os.path.expanduser("~"), "Documents")
+    return os.path.join(docs if os.path.isdir(docs) else os.path.expanduser("~"), "5belan APK")
+
+
+class ApkDestDialog(QDialog):
+    """Where to put the decompiled code: a folder; the app's own new sub-folder is made inside it."""
+
+    def __init__(self, parent, apk_name, start=""):
+        super().__init__(parent)
+        self.setWindowTitle("وين أحفظ الكود المفكوك؟")
+        self.resize(560, 190)
+        lay = QVBoxLayout(self)
+        t = QLabel("بفك «%s» وأحط كوده في مجلد جديد داخل هذا المكان:" % apk_name)
+        t.setWordWrap(True)
+        lay.addWidget(t)
+        row = QHBoxLayout()
+        self.path = QLineEdit(start or apk_default_parent())
+        self.path.setLayoutDirection(Qt.LeftToRight)
+        row.addWidget(self.path, 1)
+        b = QPushButton("تغيير…")
+        b.clicked.connect(self._pick)
+        row.addWidget(b)
+        lay.addLayout(row)
+        n = QLabel("المجلد الجديد يكون باسم التطبيق، وما ألمس أي ملف ثاني في المكان اللي تختاره.")
+        n.setWordWrap(True)
+        n.setObjectName("chip")
+        lay.addWidget(n)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        box.button(QDialogButtonBox.StandardButton.Ok).setText("فكّه هنا")
+        box.button(QDialogButtonBox.StandardButton.Cancel).setText("إلغاء")
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+
+    def _pick(self):
+        d = QFileDialog.getExistingDirectory(self, "اختر المكان", self.path.text() or os.path.expanduser("~"))
+        if d:
+            self.path.setText(d)
+
+    def folder(self):
+        return os.path.abspath(os.path.expanduser(self.path.text().strip() or apk_default_parent()))
+
+
+class ApkJobDialog(QDialog):
+    """Progress of one app: downloading the tools (bar + MB), decompiling (bar + %), then what to do with the result."""
+
+    def __init__(self, app, job, title, cancel_event):
+        super().__init__(app)
+        from PySide6.QtWidgets import QProgressBar
+        self.app = app
+        self.job = job
+        self.cancel_event = cancel_event
+        self.out = ""
+        self.apk = ""
+        self.setWindowTitle("فك التطبيق — " + title)
+        self.resize(600, 320)
+        self.setMaximumWidth(900)
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        lay = QVBoxLayout(self)
+        self.head = QLabel("أجهّز…")
+        f = self.head.font()
+        f.setBold(True)
+        f.setPointSize(f.pointSize() + 1)
+        self.head.setFont(f)
+        lay.addWidget(self.head)
+        self.dl_lbl = QLabel("١. تنزيل أدوات الفك (مرة وحدة بس)")
+        self.dl_bar = QProgressBar()
+        self.dl_bar.setRange(0, 100)
+        self.dl_bar.setFormat("%p%")
+        self.dl_info = QLabel("")
+        self.dl_info.setObjectName("chip")
+        for w in (self.dl_lbl, self.dl_bar, self.dl_info):
+            w.setVisible(False)
+            lay.addWidget(w)
+        self.dec_lbl = QLabel("٢. فك التطبيق")
+        self.dec_bar = QProgressBar()
+        self.dec_bar.setRange(0, 100)
+        self.dec_bar.setFormat("%p%")
+        self.dec_info = QLabel("بانتظار…")
+        self.dec_info.setObjectName("chip")
+        self.dec_info.setWordWrap(True)
+        self.dec_info.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)  # a long path must not stretch the window
+        self.dec_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.dl_info.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        for w in (self.dec_lbl, self.dec_bar, self.dec_info):
+            lay.addWidget(w)
+        lay.addStretch(1)
+        row = QHBoxLayout()
+        self.b_browse = QPushButton("افتح متصفح الكود")
+        self.b_browse.clicked.connect(lambda: self.app.open_apk_browser(self.out, os.path.basename(self.apk)))
+        self.b_folder = QPushButton("افتح المجلد")
+        self.b_folder.clicked.connect(lambda: open_path(self.out))
+        self.b_chat = QPushButton("ابدأ محادثة عنه")
+        self.b_chat.setObjectName("primary")
+        self.b_chat.setToolTip("محادثة جديدة: خبيلان يقرأ الكود المفكوك ويعطيك ملخص، وتكمل معه عليه")
+        self.b_chat.clicked.connect(self._chat)
+        for b in (self.b_chat, self.b_browse, self.b_folder):
+            b.setVisible(False)
+            row.addWidget(b)
+        row.addStretch(1)
+        self.b_cancel = QPushButton("إلغاء")
+        self.b_cancel.clicked.connect(self._cancel)
+        row.addWidget(self.b_cancel)
+        lay.addLayout(row)
+        self.done_ = False
+
+    def _cancel(self):
+        if self.done_:
+            self.close()
+            return
+        self.cancel_event.set()
+        self.head.setText("أوقف…")
+        self.b_cancel.setEnabled(False)
+
+    def closeEvent(self, e):
+        if not self.done_:
+            self.cancel_event.set()
+        super().closeEvent(e)
+
+    def _chat(self):
+        self.app.start_apk_chat(self.out, self.apk)
+        self.close()
+
+    def update_state(self, kind, pct, text):
+        if kind == "dl":
+            for w in (self.dl_lbl, self.dl_bar, self.dl_info):
+                w.setVisible(True)
+            self.head.setText("أنزّل أدوات الفك…")
+            self.dl_bar.setValue(int(pct))
+            self.dl_info.setText(text)
+        elif kind == "dec":
+            if self.dl_bar.isVisible():
+                self.dl_bar.setValue(100)
+                self.dl_info.setText("جاهزة ✓")
+            self.head.setText("أفك التطبيق…")
+            self.dec_bar.setValue(int(pct))
+            self.dec_info.setText(text)
+        elif kind == "note":
+            self.dec_info.setText(text)
+
+    def finish(self, out, apk, err):
+        self.done_ = True
+        self.out, self.apk = out, apk
+        self.b_cancel.setEnabled(True)
+        self.b_cancel.setText("إغلاق")
+        if err:
+            self.head.setText("ما انفك التطبيق")
+            self.dec_info.setText(err[:700])
+            return
+        self.dec_bar.setValue(100)
+        self.head.setText("انفك التطبيق ✓")
+        try:
+            self.dec_info.setText("انحفظ في: %s\n%s" % (out, decompiled_overview(out).split("\n", 1)[1].split("\nThe app's", 1)[0].strip()))
+        except Exception:
+            self.dec_info.setText("انحفظ في: " + out)
+        for b in (self.b_chat, self.b_browse, self.b_folder):
+            b.setVisible(True)
+        self.raise_()
+        self.activateWindow()
+
+
 # ---------------------------------------------------------------- the welcome tour (every feature, one spot at a time)
 # target: attribute of the App window (a widget, or a callable returning one); "" = a card in the middle with no spotlight.
 # A new step id is shown once to people who already took the tour, so new features get their own short tour after an update.
@@ -13608,7 +13843,7 @@ TOUR_STEPS = [
              "• مهمة سريعة بالخلفية\n• سجل: كل اللي سواه على جهازك\n• غرفة نقاش: كذا خبيلان يتناقشون ويشتغلون كفريق"},
     {"id": "apk", "target": "nav:الأدوات", "title": "فك تطبيقات أندرويد",
      "body": "أرفق ملف APK وخبيلان يقولك على طول: اسم التطبيق، إصداره، صلاحياته، شاشاته، وبأي تقنية انبنى.\n"
-             "وإذا تبي تشوف الكود: قل له «فكه»، أو من «الأدوات ← فك تطبيق APK». يحوّله لكود Java مقروء ويفتح لك متصفح فيه شجرة الملفات وبحث في كل الكود."},
+             "وإذا تبي تشوف الكود: قل له «فكه»، أو من «الأدوات ← فك تطبيق APK». يسألك وين تحفظه، ويوريك شريط التحميل والفك بالنسبة، وبعدها تفتح الكود أو تبدأ محادثة عنه يقرأ فيها الكود ويكمل معك."},
     {"id": "account", "target": "nav:حسابي", "title": "حسابي",
      "body": "• ذاكرة: أشياء عنك يتذكرها في كل محادثة (قل له «تذكّر إن…»)\n• صرف: كم صرفت اليوم والأسبوع وأغلى المحادثات"},
     {"id": "connect", "target": "nav:الربط والدعم", "title": "الربط والدعم",
@@ -16969,17 +17204,22 @@ class App(QMainWindow):
         dlg.show()
 
     def open_apk_tool(self, path=None):
-        """«الأدوات ← فك تطبيق APK»: pick an app, (once, after asking) get jadx, decompile in the background, open the code browser."""
+        """«الأدوات ← فك تطبيق APK»: pick an app, choose where to save, (once, after asking) download jadx with a progress bar,
+        decompile with a progress bar, then open the code / the folder / a new chat about it."""
         if not path:
             path, _ = QFileDialog.getOpenFileName(self, "اختر تطبيق أندرويد", self.default_dir(),
                                                   "تطبيقات أندرويد (*.apk *.xapk *.apks *.aab *.apkm);;كل الملفات (*.*)")
         if not path:
             return
-        h = hashlib.sha1(("%s|%s" % (os.path.abspath(path), os.path.getmtime(path))).encode()).hexdigest()[:8]
-        out = os.path.join(DATA_DIR, "apk", "%s_%s" % (re.sub(r"[^\w.\-]+", "_", os.path.splitext(os.path.basename(path))[0])[:40], h))
-        if os.path.isdir(os.path.join(out, "sources")) or os.path.isdir(os.path.join(out, "resources")):
-            self.open_apk_browser(out, os.path.basename(path))
+        name = os.path.basename(path)
+        dd = ApkDestDialog(self, name, self.cfg.get("apk_dest") or "")
+        if not dd.exec():
             return
+        parent = dd.folder()
+        self.cfg["apk_dest"] = parent
+        self.save_cfg()
+        stem = re.sub(r"[^\w.\-]+", "_", os.path.splitext(name)[0])[:50] or "app"
+        out = unique_dir(parent, stem + "_decompiled")
         self.statusBar().showMessage("أجهّز فك التطبيق…", 5000)
 
         def go(need, err):
@@ -16992,25 +17232,73 @@ class App(QMainWindow):
                                         "عشان أفك التطبيق أحتاج أنزّل مرة وحدة بس:\n%s\n\nمن المصدر الرسمي مع فحص البصمة، تقريباً %d ميغا. أنزّلها؟"
                                         % ("\n".join("- " + pl["name"] for _e, pl in need), total)) != YES:
                     return
-            self.statusBar().showMessage("أفك التطبيق بالخلفية… أعلمك أول ما يخلص", 0)
+            job = uuid.uuid4().hex[:8]
+            cancel = threading.Event()
+            self.on_apk_progress(job, name, "dec", 0, "أبدأ…", cancel)
+            rep_ = lambda kind, p, t: self.q.put(("apkprog", (job, name, kind, p, t, cancel), None))
 
             def work():
                 try:
-                    apk_install_needed(need)
-                    decompile_apk_to(path, out)
-                    self.q.put(("apkdone", (out, os.path.basename(path), "")))
+                    if need:
+                        apk_install_needed(need, None, cancel, lambda p, t: rep_("dl", p, t))
+                    os.makedirs(out, exist_ok=True)
+                    decompile_apk_to(path, out, False, None, cancel, lambda p, t: rep_("dec", p, t))
+                    rep_("done", 100, out + "|" + path)
                 except Exception as e:
-                    self.q.put(("apkdone", (out, os.path.basename(path), str(e))))
+                    rep_("err", 0, "أوقفته بطلبك." if cancel.is_set() else str(e))
             threading.Thread(target=work, daemon=True).start()
         run_later(self, apk_needed_downloads, go)
+
+    def on_apk_progress(self, job, title, kind, pct, text, cancel):
+        jobs = self.__dict__.setdefault("_apk_jobs", {})
+        dlg = jobs.get(job)
+        if dlg is None:
+            if kind in ("done", "err") and not text:
+                return
+            dlg = ApkJobDialog(self, job, title, cancel)
+            jobs[job] = dlg
+            dlg.show()
+        if kind == "done":
+            out, _, apk = text.partition("|")
+            dlg.finish(out, apk, "")
+            self.statusBar().showMessage("انفك التطبيق: " + title, 8000)
+        elif kind == "err":
+            dlg.finish("", "", text or "صار خطأ")
+        else:
+            dlg.update_state(kind, pct, text)
 
     def on_apk_done(self, out, title, err):
         self.statusBar().clearMessage()
         if err:
             QMessageBox.warning(self, "فك التطبيق", "ما قدرت أفك التطبيق: %s" % err[:600])
             return
-        self.statusBar().showMessage("انفك التطبيق: " + title, 8000)
         self.open_apk_browser(out, title)
+
+    def ask_apk_dest_from_thread(self, name, run=None):
+        """From the worker thread: ask (on the UI thread) where to put the decompiled app. None = cancelled."""
+        slot = {"dir": None, "event": threading.Event()}
+        self.q.put(("apkdest", (name, slot), run))
+        stop = run.stop_event if run is not None else self.stop_event
+        end = time.time() + 900
+        while time.time() < end and not slot["event"].wait(0.3):
+            if stop.is_set():
+                return None
+        if slot["dir"]:
+            self.cfg["apk_dest"] = slot["dir"]
+        return slot["dir"]
+
+    def start_apk_chat(self, out, apk):
+        """A new chat that knows the decompiled folder (read-only) and starts by reading it."""
+        if not out or not os.path.isdir(out):
+            return
+        self.new_chat()
+        self._pending_extra_roots = [out]
+        self.inp.setPlainText(
+            "فكّيت تطبيق «%s» وحفظت كوده في هذا المجلد:\n%s\n\nاقرأ الكود (ابدأ بـ resources/AndroidManifest.xml وأهم حزم التطبيق في sources) "
+            "وعطني ملخص: وش يسوي التطبيق، بأي تقنية مبني، أهم الشاشات والملفات، وين يتصل بالسيرفر وبأي روابط، والصلاحيات الحساسة. "
+            "وبعدها كمّل معي على أي شي أطلبه فيه." % (os.path.basename(apk) or os.path.basename(out), out))
+        self.activateWindow()
+        self.send()
 
     # ---------- the welcome tour ----------
     def maybe_tour(self):
@@ -19190,6 +19478,7 @@ class App(QMainWindow):
         if self.current is None:
             title = text.replace("\n", " ")[:40] if text else (names[0] if names else (quotes[0]["q"].replace("\n", " ")[:40] if quotes else "محادثة جديدة"))
             self.current = {"id": self.__dict__.pop("_pending_cid", None) or uuid.uuid4().hex, "title": title or "محادثة جديدة", "updated": time.time(), "msgs": [],
+                            "extra_roots": self.__dict__.pop("_pending_extra_roots", None) or [],
                             "settings": self.collect_settings(), "project": self.selected_project_id()}
             self.chats.append(self.current)
         else:
@@ -19281,6 +19570,8 @@ class App(QMainWindow):
             runner.image_cfg = {"key": self.cfg.get("img_key") or "", "model": self.cfg.get("img_model") or "zimage"}
             runner.show_image = lambda p_, r_=run: self.q.put(("image", p_, r_))
             runner.show_apk = lambda p_, t_, r_=run: self.q.put(("apkview", (p_, t_), r_))
+            runner.ask_dest = lambda n_, r_=run: self.ask_apk_dest_from_thread(n_, r_)
+            runner.apk_job = lambda j_, t_, k_, p_, x_, c_: self.q.put(("apkprog", (j_, t_, k_, p_, x_, c_), None))
             runner.add_root = lambda p_, ch_=self.current: (ch_.setdefault("extra_roots", []).append(p_)
                                                             if p_ not in (ch_.get("extra_roots") or []) else None)
             web_ = self.cfg.get("ds_web_search", True) is not False
@@ -19752,6 +20043,13 @@ class App(QMainWindow):
                 self.open_apk_browser(*val)
             elif kind == "apkdone":
                 self.on_apk_done(*val)
+            elif kind == "apkprog":
+                self.on_apk_progress(*val)
+            elif kind == "apkdest":
+                n_, slot_ = val
+                d_ = ApkDestDialog(self, n_)
+                slot_["dir"] = d_.folder() if d_.exec() else None
+                slot_["event"].set()
             elif kind == "dssync":
                 self.on_ds_sync(*val)
             elif kind == "speech":
