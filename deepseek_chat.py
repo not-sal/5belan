@@ -6613,7 +6613,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.40.0"
+APP_VERSION = "2.41.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -13025,6 +13025,258 @@ class CanvasDialog(QDialog):
             self.req.clear()
 
 
+# ---------------------------------------------------------------- the welcome tour (every feature, one spot at a time)
+# target: attribute of the App window (a widget, or a callable returning one); "" = a card in the middle with no spotlight.
+# A new step id is shown once to people who already took the tour, so new features get their own short tour after an update.
+TOUR_STEPS = [
+    {"id": "welcome", "target": "", "title": "هلا والله في خبيلان 👋",
+     "body": "خبيلان مساعدك الذكي على جهازك: يسولف، يكتب، يترجم، يرسم، يبحث في النت، ويشتغل على ملفاتك وبرامجك.\n\n"
+             "خلني آخذك جولة سريعة على كل شي فيه. تقدر تتخطاها الحين، وترجع لها متى ما بغيت من «الربط والدعم ← الجولة التعريفية»."},
+    {"id": "key", "target": "settings_btn", "need_no_key": True, "title": "أول شي: مفتاح DeepSeek",
+     "body": "خبيلان يشتغل بمفتاح API من DeepSeek. افتح «إعدادات التطبيق» وحط المفتاح.\n"
+             "محادثاتك وذاكرتك محفوظة على جهازك، فلو غيّرت المفتاح بعدين تكمل بنفس كل شي."},
+    {"id": "new_chat", "target": "new_btn", "title": "محادثة جديدة",
+     "body": "من هنا تبدأ محادثة جديدة (أو Ctrl+N). كل محادثة لها ملفاتها وإعداداتها، وتقدر تشغّل كذا محادثة بنفس الوقت."},
+    {"id": "chat_list", "target": "listw", "title": "محادثاتك",
+     "body": "كل محادثاتك هنا، والبحث فوقها. اضغط كليك يمين على أي محادثة عشان:\n"
+             "• تثبّتها فوق أو تأرشفها أو تغيّر اسمها\n• تنقلها لمشروع\n• «حفظ للإرسال لإيجنت ثاني»: ملف فيه المحادثة كاملة يكمل منه أي ذكاء اصطناعي\n• تصدّرها PDF أو Markdown"},
+    {"id": "projects", "target": "proj_box", "title": "المشاريع",
+     "body": "المشروع يجمع محادثات تحت تعليمات ومجلدات ثابتة. مثلاً: «شغل الدوام» بتعليماته الخاصة، وكل محادثة فيه تعرفها لحالها."},
+    {"id": "composer", "target": "inp", "title": "صندوق الكتابة",
+     "body": "اكتب طلبك هنا. Enter يرسل و Shift+Enter سطر جديد. تقدر تلصق صورة أو تسحب ملفات على الصندوق.\n"
+             "لو أرسلت وخبيلان لسه يشتغل، يوقف ويقرأ رسالتك ويكمل على أساسها."},
+    {"id": "attach", "target": "plus_btn", "title": "إرفاق أي ملف",
+     "body": "أرفق أي شي: وورد، PDF (حتى الممسوح ضوئياً)، إكسل، بوربوينت، صور، صوت، ملفات مضغوطة zip و rar.\n"
+             "لو أرسلت وورد وطلبت ترجمة، يرجع لك وورد بنفس التنسيق."},
+    {"id": "mic", "target": "mic_btn", "title": "تكلّم بدل الكتابة",
+     "body": "اضغط المايك وتكلّم بالعربي أو الإنجليزي، واضغط مرة ثانية إذا خلصت. كلامك يتحوّل نص في الصندوق (لين دقيقتين)."},
+    {"id": "model", "target": "model_box", "title": "الموديل",
+     "body": "deepseek-flash سريع ورخيص ويشوف الصور. deepseek-v4-pro أقوى للشغل الصعب.\nلو نزّلت DeepSeek موديل جديد، يطلع هنا لحاله."},
+    {"id": "think", "target": "think_box", "title": "مستوى التفكير",
+     "body": "off: رد سريع بدون تفكير.\nlow / high / max: يفكر قبل ما يجاوب. كل ما زاد صار أدق وأبطأ.\n"
+             "مع التفكير، خبيلان يبحث في النت لحاله إذا احتاج معلومة جديدة ويعطيك المصادر."},
+    {"id": "access", "target": "access_btn", "title": "الصلاحيات",
+     "body": "هنا تحدد وش يقدر خبيلان يسوي في جهازك: يقرأ ويعدّل ملفات مجلدات تختارها، يشغّل أوامر (بموافقتك أو بحرية)، يفتح برامج، يتصفح.\n"
+             "كل تعديل على ملف ينقدر يتراجع عنه، وملفات النظام ما يلمسها أبداً."},
+    {"id": "chat", "target": "view", "title": "الردود",
+     "body": "تحت كل رد:\n• «⧉ نسخ» و «🔊 اسمع» (يقرأ لك الرد بصوت)\n• «إعادة توليد» و «كمّل الرد»\n• المصادر لما يبحث في النت\n\n"
+             "حدّد أي جزء من الرد واضغط «رد على المحدد» عشان تسأل عنه بالذات. و«التفكير» فوق الرد يوريك كل خطوة سواها."},
+    {"id": "pictures", "target": "view", "title": "يرسم لك صور",
+     "body": "قل له «ارسم لي…» ويسوي صورة حقيقية تطلع بالمحادثة على طول، ويقدر يكتب عليها بالعربي.\n"
+             "تحت الصورة: فتح، حفظ باسم، المجلد. لجودة أعلى حط مفتاح الصور من الإعدادات."},
+    {"id": "translate", "target": "view", "title": "ترجمة احترافية",
+     "body": "«ترجم هذا» أو أرفق ملف وقل «ترجمه للعربي». يترجم ثم يراجع الترجمة، ويلتزم بقاموس مصطلحاتك.\n"
+             "يرجع الملف بنفس صيغته: وورد ← وورد، إكسل ← إكسل، بوربوينت ← بوربوينت، والترجمات بنفس التوقيت."},
+    {"id": "files", "target": "files_btn", "title": "المرفقات",
+     "body": "كل الملفات اللي أرسلتها أو سوّاها خبيلان في هذي المحادثة: تفتحها، تحفظها، أو توريها في المجلد."},
+    {"id": "browser", "target": "browser_btn", "title": "المتصفح المدمج",
+     "body": "خبيلان يقدر يفتح مواقع ويضغط ويكتب فيها بنفسه، وتشوفه وهو يشتغل هنا. كل محادثة لها تبويبها."},
+    {"id": "chat_settings", "target": "chat_settings_btn", "title": "إعدادات المحادثة",
+     "body": "إعدادات هذي المحادثة بس: المجلدات المسموحة، الأوامر، المهارات، ووضع «خطة أول» اللي يعرض عليك الخطة قبل ما ينفّذ."},
+    {"id": "balance", "target": "balance_btn", "title": "الرصيد والتكلفة",
+     "body": "رصيدك في DeepSeek يتحدث بعد كل رد، وتحت كل رد كم كلّف بالريال. تفاصيل الصرف في «حسابي ← صرف»."},
+    {"id": "tools", "target": "nav:الأدوات", "title": "الأدوات",
+     "body": "• برمجة: يشتغل على مشروع كود كامل\n• لوحة: كود وصفحات مع معاينة\n• مهام: شغل يتكرر بجدول أو لما يوصل ملف جديد\n"
+             "• مهمة سريعة بالخلفية\n• سجل: كل اللي سواه على جهازك\n• غرفة نقاش: كذا خبيلان يتناقشون ويشتغلون كفريق"},
+    {"id": "account", "target": "nav:حسابي", "title": "حسابي",
+     "body": "• ذاكرة: أشياء عنك يتذكرها في كل محادثة (قل له «تذكّر إن…»)\n• صرف: كم صرفت اليوم والأسبوع وأغلى المحادثات"},
+    {"id": "connect", "target": "nav:الربط والدعم", "title": "الربط والدعم",
+     "body": "• تليقرام: كلّم خبيلان من جوالك وتجيك إشعاراته\n• مشكلة: تقرير جاهز تنسخه لو صار خطأ\n• الجولة التعريفية: تعيد هذي الجولة"},
+    {"id": "settings", "target": "settings_btn", "title": "إعدادات التطبيق",
+     "body": "المفتاح والمظهر، بحث الويب، صوت القراءة، مفتاح الصور، قاموس المصطلحات، الشبكة والبروكسي، المهارات، زر خالد، "
+             "و«حفظ كل المحادثات» بملف واحد."},
+    {"id": "skills", "target": "settings_btn", "title": "المهارات",
+     "body": "المهارة طريقة شغل محفوظة (مثلاً: كيف تبي تقاريرك). تضيفها من ملف أو من GitHub، وتختارها لكل محادثة. "
+             "وإذا تعلّم خبيلان طريقة جديدة يقترح يحفظها لك."},
+    {"id": "reverse", "target": "", "title": "وأشياء أكثر",
+     "body": "• هندسة عكسية: «حلل لي هالبرنامج» ويجهّز الأدوات لحاله (يستأذنك قبل أي تحميل)\n"
+             "• يتابع لحاله: يقدر يرجع لك بعد وقت بنتيجة\n• يحدّث نفسه: لما ينزل إصدار جديد يطلع زر برتقالي، وأنت تضغطه"},
+    {"id": "done", "target": "", "title": "جاهز! 🎉",
+     "body": "جرّب الحين، مثلاً:\n«ارسم لي شعار لمقهى اسمه سمرة»\n«ترجم الملف المرفق للعربي»\n«وش أخبار سعر الذهب اليوم؟»\n\n"
+             "وترجع للجولة متى ما بغيت من «الربط والدعم ← الجولة التعريفية»."},
+]
+
+
+class TourOverlay(QWidget):
+    """Dims the window, cuts a lit hole around one widget and shows a card that explains it, with next / back / skip."""
+
+    def __init__(self, app, steps, on_end):
+        super().__init__(app)
+        self.app = app
+        self.steps = steps
+        self.on_end = on_end
+        self.i = 0
+        self.hole = None
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setFocusPolicy(Qt.StrongFocus)
+        col = THEMES.get(getattr(app, "theme", "dark"), THEMES["dark"])
+        self.col = col
+        self.card = QFrame(self)
+        self.card.setObjectName("tourcard")
+        self.card.setLayoutDirection(Qt.RightToLeft)
+        self.card.setStyleSheet(
+            "QFrame#tourcard{background:%s;border:1px solid %s;border-radius:14px}"
+            "QLabel{background:transparent;color:%s}"
+            "QLabel#tourtitle{font-size:16px;font-weight:bold}"
+            "QLabel#tourstep{color:%s}"
+            "QPushButton{border-radius:8px;padding:7px 14px;border:1px solid %s;background:transparent;color:%s}"
+            "QPushButton#tournext{background:%s;border-color:%s;color:#ffffff;font-weight:bold}"
+            % (col["panel"], col["accent"], col["text"], col["dim"], col["border"], col["text"], col["accent"], col["accent"]))
+        cl = QVBoxLayout(self.card)
+        cl.setContentsMargins(18, 16, 18, 14)
+        cl.setSpacing(10)
+        self.step_lbl = QLabel()
+        self.step_lbl.setObjectName("tourstep")
+        cl.addWidget(self.step_lbl)
+        self.title_lbl = QLabel()
+        self.title_lbl.setObjectName("tourtitle")
+        self.title_lbl.setWordWrap(True)
+        cl.addWidget(self.title_lbl)
+        self.body_lbl = QLabel()
+        self.body_lbl.setWordWrap(True)
+        self.body_lbl.setTextFormat(Qt.PlainText)
+        cl.addWidget(self.body_lbl)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.next_btn = QPushButton("أكمل الجولة")
+        self.next_btn.setObjectName("tournext")
+        self.next_btn.setCursor(Qt.PointingHandCursor)
+        self.next_btn.clicked.connect(self.next)
+        row.addWidget(self.next_btn)
+        self.back_btn = QPushButton("السابق")
+        self.back_btn.setCursor(Qt.PointingHandCursor)
+        self.back_btn.clicked.connect(self.back)
+        row.addWidget(self.back_btn)
+        row.addStretch(1)
+        self.skip_btn = QPushButton("تخطّي الجولة")
+        self.skip_btn.setCursor(Qt.PointingHandCursor)
+        self.skip_btn.clicked.connect(lambda: self.finish(skipped=True))
+        row.addWidget(self.skip_btn)
+        cl.addLayout(row)
+        self.card.setFixedWidth(400)
+        app.installEventFilter(self)
+        self.setGeometry(app.rect())
+        self.show()
+        self.raise_()
+        self.setFocus()
+        self.show_step()
+
+    def target(self, step):
+        t = step.get("target") or ""
+        if not t:
+            return None
+        if t.startswith("nav:"):
+            w = (getattr(self.app, "nav_btns", {}) or {}).get(t[4:])
+        else:
+            w = getattr(self.app, t, None)
+            if callable(w) and not isinstance(w, QWidget):
+                w = w()
+        if isinstance(w, QWidget) and w.isVisible() and w.width() > 2:
+            return w
+        return None
+
+    def show_step(self):
+        st = self.steps[self.i]
+        w = self.target(st)
+        if w is not None:
+            p = w.mapTo(self.app, QPoint(0, 0))
+            pad = 6
+            self.hole = QRectF(p.x() - pad, p.y() - pad, w.width() + 2 * pad, w.height() + 2 * pad)
+        else:
+            self.hole = None
+        n = len(self.steps)
+        self.step_lbl.setText("%d من %d" % (self.i + 1, n))
+        self.title_lbl.setText(st["title"])
+        self.body_lbl.setText(st["body"])
+        self.back_btn.setVisible(self.i > 0)
+        last = self.i == n - 1
+        self.next_btn.setText("يلا نبدأ" if last else ("ابدأ الجولة" if self.i == 0 else "أكمل الجولة"))
+        self.skip_btn.setVisible(not last)
+        self.card.adjustSize()
+        self.place_card()
+        self.update()
+
+    def place_card(self):
+        W, H = self.width(), self.height()
+        cw, ch = self.card.width(), self.card.sizeHint().height()
+        self.card.resize(cw, ch)
+        m = 16
+        if self.hole is None:
+            self.card.move(int((W - cw) / 2), int((H - ch) / 2))
+            return
+        h = self.hole
+        cands = []
+        if h.width() < W * 0.55:
+            cands += [(h.right() + m, h.top()), (h.left() - m - cw, h.top())]
+        cands += [(h.left(), h.bottom() + m), (h.left(), h.top() - m - ch)]
+        if h.width() >= W * 0.55 or h.height() >= H * 0.55:
+            cands.append((h.center().x() - cw / 2, h.center().y() - ch / 2))  # a big area: the card sits inside it
+        for x, y in cands:
+            x = min(max(m, x), W - cw - m)
+            y = min(max(m, y), H - ch - m)
+            r = QRectF(x, y, cw, ch)
+            if not r.intersects(h) or (h.width() >= W * 0.55 or h.height() >= H * 0.55):
+                self.card.move(int(x), int(y))
+                return
+        self.card.move(int((W - cw) / 2), int(H - ch - m))
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.setFillRule(Qt.OddEvenFill)
+        path.addRect(QRectF(self.rect()))
+        if self.hole is not None:
+            path.addRoundedRect(self.hole, 10, 10)
+        p.fillPath(path, QColor(0, 0, 0, 165))
+        if self.hole is not None:
+            pen = QPen(QColor(self.col["accent"]))
+            pen.setWidth(2)
+            p.setPen(pen)
+            p.drawRoundedRect(self.hole, 10, 10)
+        p.end()
+
+    def mousePressEvent(self, e):
+        e.accept()  # the rest of the window is not clickable while the tour runs
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k == Qt.Key_Escape:
+            self.finish(skipped=True)
+        elif k in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Left, Qt.Key_Space):
+            self.next()  # RTL: left arrow goes forward
+        elif k == Qt.Key_Right:
+            self.back()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.app and ev.type() == QEvent.Resize:
+            self.setGeometry(self.app.rect())
+            QTimer.singleShot(0, self.show_step)
+        return False
+
+    def next(self):
+        if self.i >= len(self.steps) - 1:
+            self.finish(skipped=False)
+            return
+        self.i += 1
+        self.show_step()
+
+    def back(self):
+        if self.i > 0:
+            self.i -= 1
+            self.show_step()
+
+    def finish(self, skipped):
+        try:
+            self.app.removeEventFilter(self)
+        except Exception:
+            pass
+        self.hide()
+        self.deleteLater()
+        if self.on_end:
+            self.on_end(skipped)
+
+
 class DockFrame(QFrame):
     """A side column with a small close button. Used for the browser, attachments, tasks, memory, usage..."""
     def __init__(self, title, widget, on_close, want_width=380):
@@ -13263,6 +13515,7 @@ class App(QMainWindow):
         b_new.clicked.connect(self.new_chat)
         b_new.setToolTip("Ctrl+N")
         sl.addWidget(b_new)
+        self.new_btn = b_new
         prow_ = QHBoxLayout()
         prow_.setSpacing(4)
         self.proj_box = QComboBox()
@@ -13326,8 +13579,10 @@ class App(QMainWindow):
               ("صرف", "كم صرفت: اليوم، الأسبوع، وأغلى المحادثات", self.open_usage))),
             ("الربط والدعم",
              (("تليقرام", "اربط خبيلان ببوت تليقرام: إشعارات ومحادثة من جوالك", self.open_telegram),
-              ("مشكلة", "تقرير جاهز للنسخ لو صار خطأ", self.open_problem))))
+              ("مشكلة", "تقرير جاهز للنسخ لو صار خطأ", self.open_problem),
+              ("الجولة التعريفية", "جولة سريعة على كل ميزات خبيلان", lambda: self.start_tour()))))
         self.nav_menus = []
+        self.nav_btns = {}
         for gtitle, items in groups:
             gb = QPushButton(gtitle)
             gb.setObjectName("navbtn")
@@ -13344,6 +13599,7 @@ class App(QMainWindow):
             gm.setToolTipsVisible(True)
             gb.setMenu(gm)
             self.nav_menus.append(gm)
+            self.nav_btns[gtitle] = gb
             nbl.addWidget(gb)
         self.settings_btn = QPushButton("إعدادات التطبيق")
         self.settings_btn.setObjectName("navbtn")
@@ -13657,6 +13913,7 @@ class App(QMainWindow):
         QTimer.singleShot(900, self.recover_after_crash)
         QTimer.singleShot(4000, lambda: self.check_updates(silent=True))
         QTimer.singleShot(7000, lambda: self.ds_sync(manual=False))
+        QTimer.singleShot(1500, self.maybe_tour)
         self.ds_timer = QTimer(self)
         self.ds_timer.timeout.connect(lambda: self.ds_sync(manual=False))
         self.ds_timer.start(6 * 3600 * 1000)
@@ -16170,6 +16427,36 @@ class App(QMainWindow):
         self.send()
 
     # ---------- background tasks, schedule, folder watch, activity, sources ----------
+    # ---------- the welcome tour ----------
+    def maybe_tour(self):
+        """First start: the whole tour. After an update: only the steps that are new since the last tour."""
+        if getattr(self, "_tour", None) is not None or not self.isVisible():
+            return
+        seen = self.cfg.get("tour_seen")
+        if seen is None:
+            self.start_tour()
+            return
+        new = [st for st in TOUR_STEPS if st["id"] not in seen and st["id"] not in ("welcome", "done", "key")]
+        if new:
+            intro = {"id": "_new", "target": "", "title": "جديد في خبيلان ✨",
+                     "body": "نزلت ميزات جديدة من آخر مرة. خلني أوريك إياها بسرعة (%d خطوات)." % len(new)}
+            self.start_tour([intro] + new)
+
+    def start_tour(self, steps=None):
+        if getattr(self, "_tour", None) is not None:
+            return
+        key = self.key_edit.text().strip()
+        steps = [st for st in (steps or TOUR_STEPS) if not (st.get("need_no_key") and key)]
+
+        def end(skipped):
+            self._tour = None
+            self.cfg["tour_seen"] = [st["id"] for st in TOUR_STEPS]
+            self.save_cfg()
+            if skipped:
+                self.statusBar().showMessage("تقدر ترجع للجولة متى ما بغيت من «الربط والدعم ← الجولة التعريفية»", 8000)
+            self.inp.setFocus()
+        self._tour = TourOverlay(self, steps, end)
+
     # ---------- staying in step with DeepSeek: new models, new features ----------
     def ds_sync(self, manual=False):
         key = self.key_edit.text().strip()
