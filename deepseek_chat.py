@@ -436,6 +436,8 @@ def read_document(path):
         text = read_xlsx(path)
     elif ext == ".pptx":
         text = read_pptx(path)
+    elif ext in APK_EXTS:
+        text = apk_summary(path)
     elif ext in ARCHIVE_EXTS and ext not in (".apk", ".jar", ".iso"):
         text = read_archive(path)
     elif ext in IMAGE_MIME or ext in OFFICE_PARSE_EXTS:
@@ -2383,6 +2385,10 @@ def tools_prompt(runner):
             "composition, lighting, colors, mood, style) and pick a fitting size (1344x768 wide, 768x1344 story/poster, 1024x1024 square). "
             "Pictures cannot contain correct Arabic writing: make the picture without text, then add the words with add_text_to_image. "
             "After a picture is made, ask nothing; briefly say what you made and offer one or two concrete variations.")
+        parts.append(
+            "ANDROID APPS: an attached .apk/.xapk/.apks already comes with its summary (package, version, permissions, components, framework, "
+            "manifest). When the user wants to see or study the code, call decompile_apk with the saved path: it turns the app into readable "
+            "Java + resources and opens a code browser for the user; then read the folder with read_file/grep/find_files.")
     if runner.llm is not None:
         parts.append(
             "TRANSLATION: for any translation longer than a couple of sentences, and for EVERY file, use the translate tool (translator + "
@@ -4658,6 +4664,8 @@ class ToolRunner:
         self.web_fn = False       # the same through ordinary tools (thinking off)
         self.on_cost = None       # callable(n): n paid web searches/reads were made by a tool
         self.found_sources = []   # (title, url) of pages a tool read, for the sources list under the reply
+        self.add_root = None      # callable(path): remember a read-only folder for this chat (a decompiled app)
+        self.show_apk = None      # callable(folder, title): open the code browser
         self.backup = bool(backup)
         self.cache = {}
         self.changes = []
@@ -4701,7 +4709,7 @@ class ToolRunner:
         if self.shell_mode != "off":
             out += SHELL_TOOLS + BG_TOOLS
         if self.work_dir:
-            out += PYTHON_TOOLS + IMAGE_TOOLS
+            out += PYTHON_TOOLS + IMAGE_TOOLS + APK_TOOLS
         if self.llm is not None:
             out += TRANSLATE_TOOLS
         if self.web_fn:
@@ -4814,6 +4822,8 @@ class ToolRunner:
             return "رسم صورة: %s" % str(a.get("prompt", ""))[:160]
         if name == "add_text_to_image":
             return "كتابة على الصورة: %s" % str(a.get("text", ""))[:80]
+        if name == "decompile_apk":
+            return "فك التطبيق: %s" % os.path.basename(str(a.get("path", "")))
         if name == "translate":
             return "ترجمة %s%s" % (("الملف " + os.path.basename(str(a.get("path")))) if a.get("path") else "نص (%d حرف)" % len(str(a.get("text", ""))),
                                     (" إلى " + {"ar": "العربي", "en": "الإنجليزي"}.get(str(a.get("target")), str(a.get("target")))) if a.get("target") else "")
@@ -5071,6 +5081,7 @@ class ToolRunner:
             mapping["pip_install"] = self.pip_install
             mapping["generate_image"] = self.generate_image
             mapping["add_text_to_image"] = self.add_text_to_image
+            mapping["decompile_apk"] = self.decompile_apk
         if self.llm is not None:
             mapping.update({"translate": self.translate, "dictionary_lookup": lambda a: dictionary_lookup(a.get("word")),
                             "arabic_text_tools": lambda a: arabic_tools(a.get("action"), a.get("text"), self.llm),
@@ -5160,6 +5171,34 @@ class ToolRunner:
         if self.show_image:
             self.show_image(out)
         return "Saved %s with the text and showed it to the user. Name it in your reply." % os.path.basename(out)
+
+    def decompile_apk(self, a):
+        src = self._any_file(a.get("path"))
+        if not src.lower().endswith((".apk", ".xapk", ".apks", ".aab", ".apkm")):
+            raise ToolError("this is not an Android app file (.apk, .xapk, .apks, .aab)")
+        need = apk_needed_downloads()
+        if need:
+            total = sum(pl["mb"] for _e, pl in need)
+            lines = "\n".join("- %s (%s، حوالي %d ميغا)" % ("Java 21" if e == "java" else "jadx (يفك كود التطبيقات)", pl["name"], pl["mb"])
+                              for e, pl in need)
+            if self.confirm is None or not self.confirm(
+                    "تنزيل أداة فك التطبيقات",
+                    "عشان أفك التطبيق وتشوف كوده أحتاج أنزّل مرة وحدة بس:\n%s\n\nمن المصدر الرسمي، وأتأكد من بصمته، في مجلد بيانات خبيلان. "
+                    "المجموع تقريباً %d ميغا. أنزّلها؟" % (lines, total)):
+                raise ToolError("the user said no to downloading jadx/Java; give them the apk summary you can read without it")
+            apk_install_needed(need, self.progress, self.stop_event)
+        stem = re.sub(r"[^\w.\-]+", "_", os.path.splitext(os.path.basename(src))[0])[:50] or "app"
+        out = os.path.join(self.work_dir or os.path.dirname(src), stem + "_decompiled")
+        decompile_apk_to(src, out, bool(a.get("deobfuscate")), self.progress, self.stop_event)
+        if out not in self.roots:
+            self.roots.append(out)
+        if self.add_root:
+            self.add_root(out)
+        if self.show_apk:
+            self.show_apk(out, os.path.basename(src))
+        return (decompiled_overview(out) + "\n\nThe code browser window is open for the user (tree, code view, search in all files). "
+                "You can now read this folder with read_file, grep and find_files. Explain briefly what the app is and where its main "
+                "logic is, then offer to dig into something specific (network calls, API keys, permissions, a screen).")
 
     def _tr_llm(self):
         def call(messages, model=None):
@@ -6315,6 +6354,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QListWidgetItem,
     QHeaderView,
     QTextBrowser,
     QToolButton,
@@ -6382,6 +6422,7 @@ TOOL_GROUPS = {
     "web_search": ("web", "البحث في الويب"),
     "read_url": ("web", "البحث في الويب"),
     "generate_image": ("image", "صنع الصور"),
+    "decompile_apk": ("reverse", "الهندسة العكسية"),
     "add_text_to_image": ("image", "صنع الصور"),
     "translate": ("translate", "الترجمة"),
     "dictionary_lookup": ("translate", "الترجمة"),
@@ -6613,7 +6654,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.41.0"
+APP_VERSION = "2.42.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -13025,6 +13066,493 @@ class CanvasDialog(QDialog):
             self.req.clear()
 
 
+# ---------------------------------------------------------------- Android apps (APK): read without tools, decompile with jadx
+APK_EXTS = (".apk", ".xapk", ".apks", ".aab", ".apkm")
+_AXML_ATTR_IDS = {0x01010003: "name", 0x0101021b: "versionCode", 0x0101021c: "versionName", 0x0101020c: "minSdkVersion",
+                  0x01010270: "targetSdkVersion", 0x01010010: "exported", 0x01010001: "label", 0x01010002: "icon",
+                  0x0101000f: "debuggable", 0x01010280: "allowBackup", 0x010104ec: "usesCleartextTraffic", 0x01010018: "authorities",
+                  0x01010006: "permission", 0x01010024: "value", 0x01010025: "resource", 0x01010000: "theme", 0x0101057a: "compileSdkVersion"}
+
+
+def axml_to_xml(data):
+    """Android binary XML (AndroidManifest.xml inside an APK) -> readable XML text."""
+    import struct
+    if len(data) < 8 or struct.unpack_from("<H", data, 0)[0] != 0x0003:
+        raise ValueError("not a binary Android XML file")
+    strings, resmap, out, depth = [], [], [], 0
+    pos = struct.unpack_from("<H", data, 2)[0]
+    ns_uri = {}
+
+    def s(i):
+        return strings[i] if 0 <= i < len(strings) else ""
+    while pos + 8 <= len(data):
+        ctype, hsize, csize = struct.unpack_from("<HHI", data, pos)
+        if csize < 8:
+            break
+        if ctype == 0x0001:  # string pool
+            count, _styles, flags, sstart, _st = struct.unpack_from("<IIIII", data, pos + 8)
+            utf8 = bool(flags & 0x100)
+            offs = struct.unpack_from("<%dI" % count, data, pos + hsize)
+            base = pos + sstart
+            for o in offs:
+                p = base + o
+                try:
+                    if utf8:
+                        n = data[p]
+                        p += 2 if n & 0x80 else 1
+                        n2 = data[p]
+                        if n2 & 0x80:
+                            n2 = ((n2 & 0x7F) << 8) | data[p + 1]
+                            p += 2
+                        else:
+                            p += 1
+                        strings.append(data[p:p + n2].decode("utf-8", "replace"))
+                    else:
+                        n = struct.unpack_from("<H", data, p)[0]
+                        p += 2
+                        if n & 0x8000:
+                            n = ((n & 0x7FFF) << 16) | struct.unpack_from("<H", data, p)[0]
+                            p += 2
+                        strings.append(data[p:p + 2 * n].decode("utf-16-le", "replace"))
+                except Exception:
+                    strings.append("")
+        elif ctype == 0x0180:  # resource ids of the attribute names
+            resmap = list(struct.unpack_from("<%dI" % ((csize - hsize) // 4), data, pos + hsize))
+        elif ctype == 0x0100:
+            pfx, uri = struct.unpack_from("<II", data, pos + 16)
+            ns_uri[s(uri)] = s(pfx)
+        elif ctype == 0x0102:  # start tag
+            _ns, name, astart, asize, acount = struct.unpack_from("<IIHHH", data, pos + 16)
+            attrs = []
+            for k in range(acount):
+                a = pos + 16 + astart + k * asize
+                ans, aname, raw, _sz, _r0, dtype, val = struct.unpack_from("<IIIHBBI", data, a)
+                nm = s(aname) or _AXML_ATTR_IDS.get(resmap[aname] if aname < len(resmap) else -1, "attr%d" % aname)
+                if not s(aname) and aname < len(resmap) and resmap[aname] in _AXML_ATTR_IDS:
+                    nm = _AXML_ATTR_IDS[resmap[aname]]
+                pre = ns_uri.get(s(ans), "")
+                if dtype == 0x03:
+                    v = s(raw if raw != 0xFFFFFFFF else val)
+                elif dtype == 0x12:
+                    v = "true" if val else "false"
+                elif dtype == 0x10:
+                    v = str(val if val < 0x80000000 else val - 0x100000000)
+                elif dtype == 0x11:
+                    v = "0x%x" % val
+                elif dtype == 0x01:
+                    v = "@0x%08x" % val
+                elif dtype == 0x02:
+                    v = "?0x%08x" % val
+                else:
+                    v = s(raw) if raw != 0xFFFFFFFF else str(val)
+                attrs.append(((pre + ":" if pre else "") + nm, v))
+            out.append("  " * depth + "<%s%s>" % (s(name), "".join(' %s="%s"' % (k, html.escape(v)) for k, v in attrs)))
+            depth += 1
+        elif ctype == 0x0103:
+            depth = max(0, depth - 1)
+            _ns, name = struct.unpack_from("<II", data, pos + 16)
+            out.append("  " * depth + "</%s>" % s(name))
+        pos += csize
+    return "\n".join(out)
+
+
+def _apk_inner(path):
+    """For .xapk/.apks bundles: (zip of the base APK, list of split names). For a plain APK: (its zip, [])."""
+    z = zipfile.ZipFile(path)
+    names = z.namelist()
+    if "AndroidManifest.xml" in names or "base/manifest/AndroidManifest.xml" in names:
+        return z, []
+    apks = [n for n in names if n.lower().endswith(".apk")]
+    if not apks:
+        raise RuntimeError("no APK or AndroidManifest.xml inside")
+    base = next((n for n in apks if os.path.basename(n).lower() in ("base.apk", "base-master.apk")), None) or max(apks, key=lambda n: z.getinfo(n).file_size)
+    return zipfile.ZipFile(io.BytesIO(z.read(base))), [n for n in apks if n != base]
+
+
+def apk_summary(path):
+    """What an Android app is, from the file itself (no Java, no tools): package, versions, permissions, components,
+    native code, framework, the biggest parts."""
+    z, splits = _apk_inner(path)
+    names = z.namelist()
+    xml = axml_to_xml(z.read("AndroidManifest.xml")) if "AndroidManifest.xml" in names else ""
+    if not xml and "base/manifest/AndroidManifest.xml" in names:
+        xml = "(App Bundle .aab: the manifest is protobuf, decompile it to read it)"
+
+    def attr(tag, key):
+        m = re.search(r"<%s\b[^>]*\b(?:android:)?%s=\"([^\"]*)\"" % (tag, key), xml)
+        return html.unescape(m.group(1)) if m else ""
+    perms = sorted(set(re.findall(r"<uses-permission(?:-sdk-23)?\b[^>]*\bname=\"([^\"]+)\"", xml)))
+    comps = {}
+    for kind in ("activity", "activity-alias", "service", "receiver", "provider"):
+        for m in re.finditer(r"<%s\b([^>]*)>" % kind, xml):
+            nm = re.search(r"\bname=\"([^\"]+)\"", m.group(1))
+            ex = re.search(r"\bexported=\"(true)\"", m.group(1))
+            comps.setdefault(kind, []).append((nm.group(1) if nm else "?") + (" (exported)" if ex else ""))
+    launcher = ""
+    for m in re.finditer(r"<activity(?:-alias)?\b([^>]*)>(.*?)</activity(?:-alias)?>", xml, re.S):
+        if "android.intent.category.LAUNCHER" in m.group(2):
+            nm = re.search(r"\bname=\"([^\"]+)\"", m.group(1))
+            launcher = nm.group(1) if nm else ""
+            break
+    abis = sorted({n.split("/")[1] for n in names if n.startswith("lib/") and n.count("/") >= 2})
+    libs = sorted({os.path.basename(n) for n in names if n.startswith("lib/") and n.endswith(".so")})
+    dex = [n for n in names if re.match(r"classes\d*\.dex$", n)]
+    fw = []
+    low = " ".join(names).lower()
+    for key, label in (("libflutter.so", "Flutter (Dart; code in libapp.so)"), ("index.android.bundle", "React Native (JavaScript bundle)"),
+                       ("libunity.so", "Unity (C#; game code in assets/bin/Data or libil2cpp.so)"), ("libil2cpp.so", "Unity IL2CPP"),
+                       ("libmonodroid.so", "Xamarin / .NET MAUI (C# in assemblies)"), ("assets/www/", "Cordova / Ionic (web app in assets/www)"),
+                       ("kotlin/", "Kotlin"), ("libreactnativejni.so", "React Native"), ("libgodot", "Godot"), ("libcocos", "Cocos2d"),
+                       ("assets/flutter_assets/", "Flutter assets"), ("libhermes.so", "React Native Hermes bytecode")):
+        if key in low and label not in fw:
+            fw.append(label)
+    certs = [n for n in names if n.startswith("META-INF/") and n.upper().endswith((".RSA", ".DSA", ".EC"))]
+    sizes = sorted(((z.getinfo(n).file_size, n) for n in names), reverse=True)[:8]
+    lines = ["[Android app: %s]" % os.path.basename(path),
+             "Package: %s" % (attr("manifest", "package") or "?"),
+             "Version: %s (code %s)" % (attr("manifest", "versionName") or "?", attr("manifest", "versionCode") or "?"),
+             "SDK: min %s, target %s" % (attr("uses-sdk", "minSdkVersion") or "?", attr("uses-sdk", "targetSdkVersion") or "?"),
+             "App label: %s" % ((lambda l_: l_ if l_ and not l_.startswith("@") else "(in the resources; shown after decompiling)")(attr("application", "label"))),
+             "Main screen (launcher): %s" % (launcher or "?"),
+             "Debuggable: %s · allowBackup: %s · cleartext HTTP: %s" % (attr("application", "debuggable") or "false",
+                                                                      attr("application", "allowBackup") or "?", attr("application", "usesCleartextTraffic") or "?"),
+             "Built with: %s" % (", ".join(fw) or "Java/Kotlin (standard Android)"),
+             "Code: %d dex file(s) (%s)" % (len(dex), human_size(sum(z.getinfo(n).file_size for n in dex))),
+             "Native code: %s%s" % (", ".join(abis) or "none", (" — " + ", ".join(libs[:25])) if libs else ""),
+             "Signed: %s" % ("yes (" + ", ".join(os.path.basename(c) for c in certs[:3]) + ")" if certs else "v2/v3 block or unsigned"),
+             "Files inside: %d" % len(names)]
+    if splits:
+        lines.append("Bundle splits: " + ", ".join(os.path.basename(x) for x in splits[:12]))
+    lines.append("\nPermissions (%d):\n%s" % (len(perms), "\n".join("- " + p for p in perms) or "- none"))
+    for kind, lst in comps.items():
+        lines.append("\n%s (%d):\n%s" % (kind, len(lst), "\n".join("- " + x for x in lst[:60]) + ("\n- ..." if len(lst) > 60 else "")))
+    lines.append("\nBiggest parts:\n" + "\n".join("- %s (%s)" % (n, human_size(sz)) for sz, n in sizes))
+    if xml and not xml.startswith("("):
+        lines.append("\nAndroidManifest.xml (decoded):\n" + (xml if len(xml) < 30000 else xml[:30000] + "\n..."))
+    lines.append("\n(To see the full source code, the decompile_apk tool turns it into readable Java and opens a code browser.)")
+    return "\n".join(lines)
+
+
+ENGINE_JADX_CLI = "jadx-cli"
+
+
+def jadx_cli_plan():
+    rel = _http_json("https://api.github.com/repos/skylot/jadx/releases/latest")
+    asset = next((x for x in rel.get("assets") or [] if re.fullmatch(r"jadx-[\d.]+\.zip", x["name"])), None)
+    if not asset:
+        raise ToolError("could not find a jadx release")
+    return {"url": asset["browser_download_url"], "sha": (asset.get("digest") or "").replace("sha256:", ""), "name": asset["name"],
+            "mb": max(1, asset["size"] // 1048576)}
+
+
+def jadx_cli_path():
+    p = rea_env().get("JADX_CLI") or ""
+    return p if p and os.path.isfile(p) else ""
+
+
+def install_jadx_cli(plan, progress=None, stop=None):
+    base = os.path.join(DATA_DIR, "tools")
+    os.makedirs(base, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="belan_eng_", dir=base)
+    try:
+        arc = _download(plan["url"], os.path.join(tmp, plan["name"]), plan["sha"], progress, stop, "jadx")
+        dest = os.path.join(base, "jadx-cli")
+        shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(dest)
+        _unzip_keep_modes(arc, dest)
+        exe = os.path.join(dest, "bin", "jadx.bat" if IS_WIN else "jadx")
+        if not os.path.isfile(exe):
+            raise ToolError("jadx was downloaded but bin/jadx was not found inside")
+        if not IS_WIN:
+            os.chmod(exe, 0o755)
+        rea_env_set(JADX_CLI=exe)
+        return exe
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def apk_needed_downloads():
+    """[(engine, plan)] still missing for decompiling: Java 21 and the jadx command line."""
+    need = []
+    if not engine_installed("java"):
+        need.append(("java", engine_plan("java")))
+    if not jadx_cli_path():
+        need.append((ENGINE_JADX_CLI, jadx_cli_plan()))
+    return need
+
+
+def apk_install_needed(need, progress=None, stop=None):
+    for e, pl in need:
+        if e == "java":
+            install_engine("java", pl, progress, stop)
+        else:
+            install_jadx_cli(pl, progress, stop)
+
+
+def decompile_apk_to(path, out_dir, deobf=False, progress=None, stop=None):
+    """Run jadx: Java sources in out_dir/sources, decoded resources (manifest, layouts, strings) in out_dir/resources."""
+    exe = jadx_cli_path()
+    if not exe:
+        raise ToolError("jadx is not installed")
+    src = path
+    tmp = None
+    if path.lower().endswith((".xapk", ".apks", ".apkm")):
+        z, _splits = _apk_inner(path)  # decompile the base APK of a bundle
+        tmp = tempfile.mkdtemp(prefix="belan_apk_")
+        src = os.path.join(tmp, "base.apk")
+        with zipfile.ZipFile(path) as zz:
+            names = [n for n in zz.namelist() if n.lower().endswith(".apk")]
+            base = next((n for n in names if os.path.basename(n).lower() in ("base.apk", "base-master.apk")), None) or max(names, key=lambda n: zz.getinfo(n).file_size)
+            with open(src, "wb") as f:
+                f.write(zz.read(base))
+    env = dict(os.environ)
+    jh = rea_env().get("JAVA_HOME")
+    if jh:
+        env["JAVA_HOME"] = jh
+        env["PATH"] = os.path.join(jh, "bin") + os.pathsep + env.get("PATH", "")
+    env["JAVA_OPTS"] = "-Xmx%dm" % 3072
+    shutil.rmtree(out_dir, ignore_errors=True)
+    cmd = [exe, "-d", out_dir, "--show-bad-code", "-j", str(max(2, min(8, (os.cpu_count() or 4)))), "--log-level", "ERROR"]
+    if deobf:
+        cmd.append("--deobf")
+    cmd.append(src)
+    if progress:
+        progress("أفك ملف التطبيق… (التطبيقات الكبيرة تاخذ دقايق)")
+    kw = {"creationflags": 0x08000000} if IS_WIN else {}
+    os.makedirs(out_dir, exist_ok=True)
+    log_path = os.path.join(out_dir, "jadx.log")  # a file, not a pipe: a full pipe would freeze jadx
+    t0 = time.time()
+    try:
+        with open(log_path, "wb") as logf:
+            proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, **kw)
+            while proc.poll() is None:
+                if stop is not None and stop.is_set():
+                    ToolRunner._kill_tree(proc)
+                    raise ToolError("stopped by the user")
+                if time.time() - t0 > 1800:
+                    ToolRunner._kill_tree(proc)
+                    raise ToolError("decompiling took more than 30 minutes and was stopped")
+                time.sleep(0.5)
+        with open(log_path, "rb") as fh:
+            log = fh.read()[-3000:].decode("utf-8", "replace")
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if not os.path.isdir(os.path.join(out_dir, "sources")) and not os.path.isdir(os.path.join(out_dir, "resources")):
+        raise ToolError("jadx produced nothing: " + log[-800:])
+    return log
+
+
+def decompiled_overview(out_dir):
+    """A short map of a decompiled app: counts, the app's own packages (libraries left out), where to start."""
+    src = os.path.join(out_dir, "sources")
+    files, pk = 0, {}
+    lib = ("android", "androidx", "kotlin", "kotlinx", "com/google", "org/intellij", "org/jetbrains", "okhttp3", "okio", "retrofit2",
+           "io/reactivex", "com/squareup", "dagger", "javax", "java", "com/facebook", "org/apache", "j$", "_COROUTINE")
+    for r, _d, fns in os.walk(src):
+        java = [f for f in fns if f.endswith((".java", ".kt"))]
+        if not java:
+            continue
+        files += len(java)
+        rel = os.path.relpath(r, src).replace("\\", "/")
+        if any(rel == x or rel.startswith(x + "/") for x in lib):
+            continue
+        top = "/".join(rel.split("/")[:3])
+        pk[top] = pk.get(top, 0) + len(java)
+    res = os.path.join(out_dir, "resources")
+    nres = sum(len(f) for _r, _d, f in os.walk(res)) if os.path.isdir(res) else 0
+    tops = sorted(pk.items(), key=lambda kv: -kv[1])[:15]
+    return ("Decompiled into %s\n- sources/: %d Java files\n- resources/: %d files (AndroidManifest.xml, res/layout, res/values/strings.xml...)\n"
+            "The app's own packages (libraries left out), most files first:\n%s"
+            % (out_dir, files, nres, "\n".join("- %s (%d files)" % (k.replace("/", "."), v) for k, v in tops) or "- (none found: the code may be obfuscated or native)"))
+
+
+APK_TOOLS = [
+    {"type": "function", "function": {
+        "name": "decompile_apk",
+        "description": ("Decompile an Android app (.apk, .xapk, .apks) into readable Java source code and decoded resources (manifest, layouts, "
+                        "strings) with jadx, and open the code browser for the user. Asks the user before downloading jadx/Java the first "
+                        "time. After it finishes you can read the output folder with read_file, grep and find_files."),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "The APK (the attachments folder path from the message, or an allowed folder)."},
+            "deobfuscate": {"type": "boolean", "description": "Rename obfuscated short names (a.b.c) to readable unique names (default false)."},
+        }, "required": ["path"]}}},
+]
+
+
+class ApkBrowser(QDialog):
+    """Browse a decompiled app: folder tree, code view with find, search in all files, ask 5belan about a file."""
+
+    def __init__(self, app, root, title=""):
+        super().__init__(app)
+        from PySide6.QtWidgets import QFileSystemModel, QTreeView, QListWidget, QSplitter as _Sp
+        self.app = app
+        self.root = root
+        self.setWindowTitle("متصفح كود التطبيق — " + (title or os.path.basename(root)))
+        self.resize(1200, 780)
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        lay = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.name_filter = QLineEdit()
+        self.name_filter.setPlaceholderText("فلتر أسماء الملفات (مثلاً MainActivity أو strings)")
+        self.name_filter.textChanged.connect(self._filter)
+        top.addWidget(self.name_filter, 1)
+        self.grep_edit = QLineEdit()
+        self.grep_edit.setPlaceholderText("دوّر داخل كل الكود (نص، رابط، مفتاح API…) ثم Enter")
+        self.grep_edit.returnPressed.connect(self._grep)
+        top.addWidget(self.grep_edit, 1)
+        b_open = QPushButton("افتح المجلد")
+        b_open.clicked.connect(lambda: open_path(root))
+        top.addWidget(b_open)
+        lay.addLayout(top)
+        sp = _Sp(Qt.Horizontal)
+        self.model = QFileSystemModel(self)
+        self.model.setRootPath(root)
+        self.model.setNameFilterDisables(False)
+        self.tree = QTreeView()
+        self.tree.setModel(self.model)
+        self.tree.setRootIndex(self.model.index(root))
+        for c in (1, 2, 3):
+            self.tree.hideColumn(c)
+        self.tree.setHeaderHidden(True)
+        self.tree.setLayoutDirection(Qt.LeftToRight)
+        self.tree.clicked.connect(self._open_index)
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.addWidget(self.tree, 3)
+        self.hits = QListWidget()
+        self.hits.setLayoutDirection(Qt.LeftToRight)
+        self.hits.setVisible(False)
+        self.hits.itemClicked.connect(self._open_hit)
+        ll.addWidget(self.hits, 2)
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        bar = QHBoxLayout()
+        self.path_lbl = QLabel("اختر ملف من الشجرة")
+        self.path_lbl.setLayoutDirection(Qt.LeftToRight)
+        bar.addWidget(self.path_lbl, 1)
+        self.find_edit = QLineEdit()
+        self.find_edit.setPlaceholderText("بحث في الملف (Enter)")
+        self.find_edit.setMaximumWidth(220)
+        self.find_edit.returnPressed.connect(self._find)
+        bar.addWidget(self.find_edit)
+        self.ask_btn = QPushButton("اسأل خبيلان عن هذا الملف")
+        self.ask_btn.setEnabled(False)
+        self.ask_btn.clicked.connect(self._ask)
+        bar.addWidget(self.ask_btn)
+        rl.addLayout(bar)
+        self.code = QPlainTextEdit()
+        self.code.setReadOnly(True)
+        self.code.setLayoutDirection(Qt.LeftToRight)
+        self.code.setLineWrapMode(QPlainTextEdit.NoWrap)
+        f = QFont("Consolas")
+        f.setStyleHint(QFont.Monospace)
+        f.setPointSize(10)
+        self.code.setFont(f)
+        rl.addWidget(self.code, 1)
+        sp.addWidget(right)
+        sp.addWidget(left)  # RTL: the tree ends up on the right
+        sp.setSizes([820, 380])
+        lay.addWidget(sp, 1)
+        self.cur = ""
+        start = os.path.join(root, "resources", "AndroidManifest.xml")
+        if os.path.isfile(start):
+            self.show_file(start)
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=lambda: (self.find_edit.setFocus(), self.find_edit.selectAll()))
+
+    def _filter(self, t):
+        t = t.strip()
+        self.model.setNameFilters(["*%s*" % t] if t else [])
+        if t:
+            self.tree.expandAll()
+
+    def _open_index(self, idx):
+        p = self.model.filePath(idx)
+        if os.path.isfile(p):
+            self.show_file(p)
+
+    def show_file(self, p, line=0):
+        try:
+            if os.path.getsize(p) > 4 * 1024 * 1024:
+                txt = "(الملف كبير: %s — افتح المجلد لو تبيه كامل)" % human_size(os.path.getsize(p))
+            else:
+                with open(p, "rb") as fh:
+                    raw = fh.read()
+                txt = "(ملف ثنائي: %s)" % human_size(len(raw)) if b"\x00" in raw[:2048] else raw.decode("utf-8", "replace")
+        except Exception as e:
+            txt = "تعذّرت القراءة: %s" % e
+        self.cur = p
+        self.path_lbl.setText(os.path.relpath(p, self.root))
+        self.code.setPlainText(txt)
+        self.ask_btn.setEnabled(True)
+        if line:
+            blk = self.code.document().findBlockByLineNumber(max(0, line - 1))
+            c = QTextCursor(blk)
+            c.select(QTextCursor.LineUnderCursor)
+            self.code.setTextCursor(c)
+            self.code.centerCursor()
+
+    def _find(self):
+        t = self.find_edit.text()
+        if t and not self.code.find(t):
+            self.code.moveCursor(QTextCursor.Start)
+            self.code.find(t)
+
+    def _grep(self):
+        q = self.grep_edit.text().strip()
+        if not q:
+            self.hits.setVisible(False)
+            return
+        self.hits.clear()
+        self.hits.setVisible(True)
+        n = 0
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ql = q.lower()
+            for r, _d, fns in os.walk(self.root):
+                for fn in fns:
+                    if not fn.endswith((".java", ".kt", ".xml", ".json", ".smali", ".txt", ".js", ".html", ".properties")):
+                        continue
+                    fp = os.path.join(r, fn)
+                    try:
+                        with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                            for i, ln in enumerate(fh, 1):
+                                if ql in ln.lower():
+                                    it = QListWidgetItem("%s:%d   %s" % (os.path.relpath(fp, self.root), i, ln.strip()[:140]))
+                                    it.setData(Qt.UserRole, (fp, i))
+                                    self.hits.addItem(it)
+                                    n += 1
+                                    if n >= 500:
+                                        raise StopIteration
+                    except StopIteration:
+                        raise
+                    except Exception:
+                        continue
+        except StopIteration:
+            pass
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not n:
+            self.hits.addItem("ما لقيت «%s»" % q)
+
+    def _open_hit(self, it):
+        d = it.data(Qt.UserRole)
+        if d:
+            self.show_file(d[0], d[1])
+
+    def _ask(self):
+        if not self.cur:
+            return
+        try:
+            self.app.inp.setPlainText("اشرح لي وش يسوي هذا الملف من التطبيق، وأهم الأشياء فيه:\n%s" % self.cur)
+            self.app.activateWindow()
+            self.app.inp.setFocus()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------- the welcome tour (every feature, one spot at a time)
 # target: attribute of the App window (a widget, or a callable returning one); "" = a card in the middle with no spotlight.
 # A new step id is shown once to people who already took the tour, so new features get their own short tour after an update.
@@ -13078,6 +13606,9 @@ TOUR_STEPS = [
     {"id": "tools", "target": "nav:الأدوات", "title": "الأدوات",
      "body": "• برمجة: يشتغل على مشروع كود كامل\n• لوحة: كود وصفحات مع معاينة\n• مهام: شغل يتكرر بجدول أو لما يوصل ملف جديد\n"
              "• مهمة سريعة بالخلفية\n• سجل: كل اللي سواه على جهازك\n• غرفة نقاش: كذا خبيلان يتناقشون ويشتغلون كفريق"},
+    {"id": "apk", "target": "nav:الأدوات", "title": "فك تطبيقات أندرويد",
+     "body": "أرفق ملف APK وخبيلان يقولك على طول: اسم التطبيق، إصداره، صلاحياته، شاشاته، وبأي تقنية انبنى.\n"
+             "وإذا تبي تشوف الكود: قل له «فكه»، أو من «الأدوات ← فك تطبيق APK». يحوّله لكود Java مقروء ويفتح لك متصفح فيه شجرة الملفات وبحث في كل الكود."},
     {"id": "account", "target": "nav:حسابي", "title": "حسابي",
      "body": "• ذاكرة: أشياء عنك يتذكرها في كل محادثة (قل له «تذكّر إن…»)\n• صرف: كم صرفت اليوم والأسبوع وأغلى المحادثات"},
     {"id": "connect", "target": "nav:الربط والدعم", "title": "الربط والدعم",
@@ -13573,6 +14104,7 @@ class App(QMainWindow):
               ("مهام", "مهام تشتغل لوحدها بجدول أو عند ظهور ملف جديد", self.open_tasks),
               ("مهمة سريعة", "اكتب طلب واحد وشغّله الحين بالخلفية داخل هذي المحادثة وتكمل شغلك (بدون حفظ أو جدول)", self.new_bg_task),
               ("سجل", "كل اللي سواه خبيلان على جهازك", self.open_activity),
+              ("فك تطبيق APK", "اختر ملف APK: خبيلان يفكه لكود Java مقروء ويفتح لك متصفح الكود", lambda: self.open_apk_tool()),
               ("غرفة نقاش", "افتح شاشة تجهيز غرفة جديدة: العنوان والبرومتات والأعضاء والمجموعات، وبعدها تصير محادثة", self.new_room_screen))),
             ("حسابي",
              (("ذاكرة", "ملاحظات عنك يقرأها خبيلان بكل محادثة", self.open_memory),
@@ -15360,6 +15892,7 @@ class App(QMainWindow):
                     "journal": (c.get("journal") or [])[-300:],
                     "archived": bool(c.get("archived")),
                     "todos": (c.get("todos") or [])[:40],
+                    "extra_roots": (c.get("extra_roots") or [])[-10:],
                     "msgs": [strip_for_save(m) for m in c["msgs"]],
                 }
             )
@@ -16427,6 +16960,58 @@ class App(QMainWindow):
         self.send()
 
     # ---------- background tasks, schedule, folder watch, activity, sources ----------
+    # ---------- Android apps ----------
+    def open_apk_browser(self, folder, title=""):
+        if not os.path.isdir(folder):
+            return
+        dlg = ApkBrowser(self, folder, title)
+        self.__dict__.setdefault("_apk_windows", []).append(dlg)
+        dlg.show()
+
+    def open_apk_tool(self, path=None):
+        """«الأدوات ← فك تطبيق APK»: pick an app, (once, after asking) get jadx, decompile in the background, open the code browser."""
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "اختر تطبيق أندرويد", self.default_dir(),
+                                                  "تطبيقات أندرويد (*.apk *.xapk *.apks *.aab *.apkm);;كل الملفات (*.*)")
+        if not path:
+            return
+        h = hashlib.sha1(("%s|%s" % (os.path.abspath(path), os.path.getmtime(path))).encode()).hexdigest()[:8]
+        out = os.path.join(DATA_DIR, "apk", "%s_%s" % (re.sub(r"[^\w.\-]+", "_", os.path.splitext(os.path.basename(path))[0])[:40], h))
+        if os.path.isdir(os.path.join(out, "sources")) or os.path.isdir(os.path.join(out, "resources")):
+            self.open_apk_browser(out, os.path.basename(path))
+            return
+        self.statusBar().showMessage("أجهّز فك التطبيق…", 5000)
+
+        def go(need, err):
+            if err:
+                QMessageBox.warning(self, "فك التطبيق", "ما قدرت أجهّز الأداة: %s" % err)
+                return
+            if need:
+                total = sum(pl["mb"] for _e, pl in need)
+                if QMessageBox.question(self, "تنزيل أداة فك التطبيقات",
+                                        "عشان أفك التطبيق أحتاج أنزّل مرة وحدة بس:\n%s\n\nمن المصدر الرسمي مع فحص البصمة، تقريباً %d ميغا. أنزّلها؟"
+                                        % ("\n".join("- " + pl["name"] for _e, pl in need), total)) != YES:
+                    return
+            self.statusBar().showMessage("أفك التطبيق بالخلفية… أعلمك أول ما يخلص", 0)
+
+            def work():
+                try:
+                    apk_install_needed(need)
+                    decompile_apk_to(path, out)
+                    self.q.put(("apkdone", (out, os.path.basename(path), "")))
+                except Exception as e:
+                    self.q.put(("apkdone", (out, os.path.basename(path), str(e))))
+            threading.Thread(target=work, daemon=True).start()
+        run_later(self, apk_needed_downloads, go)
+
+    def on_apk_done(self, out, title, err):
+        self.statusBar().clearMessage()
+        if err:
+            QMessageBox.warning(self, "فك التطبيق", "ما قدرت أفك التطبيق: %s" % err[:600])
+            return
+        self.statusBar().showMessage("انفك التطبيق: " + title, 8000)
+        self.open_apk_browser(out, title)
+
     # ---------- the welcome tour ----------
     def maybe_tour(self):
         """First start: the whole tour. After an update: only the steps that are new since the last tour."""
@@ -18662,6 +19247,7 @@ class App(QMainWindow):
 
         roots = [d for d in self.allowed_dirs if os.path.isdir(d)] if self.tools_enabled else []
         wroots = [d for d in self.writable_dirs if os.path.isdir(d)] if (roots and self.write_enabled) else []
+        roots = roots + [d for d in (self.current.get("extra_roots") or []) if os.path.isdir(d) and d not in roots]  # read-only (decompiled apps)
         shell_mode = self.shell_mode if self.shell_mode in ("ask", "free") else "off"
         allow_computer = bool(self.computer_enabled)
         if self.browser_enabled and not self.web_ok:
@@ -18694,6 +19280,9 @@ class App(QMainWindow):
             runner.terminal_preapprove = bool(getattr(self, "terminal_preapprove", False))
             runner.image_cfg = {"key": self.cfg.get("img_key") or "", "model": self.cfg.get("img_model") or "zimage"}
             runner.show_image = lambda p_, r_=run: self.q.put(("image", p_, r_))
+            runner.show_apk = lambda p_, t_, r_=run: self.q.put(("apkview", (p_, t_), r_))
+            runner.add_root = lambda p_, ch_=self.current: (ch_.setdefault("extra_roots", []).append(p_)
+                                                            if p_ not in (ch_.get("extra_roots") or []) else None)
             web_ = self.cfg.get("ds_web_search", True) is not False
             runner.web_builtin = web_ and think != "off"
             runner.web_fn = web_ and think == "off"
@@ -19159,6 +19748,10 @@ class App(QMainWindow):
                 if L is not None:
                     L.setdefault("images", []).append(val)
                     R.live_dirty = True
+            elif kind == "apkview":
+                self.open_apk_browser(*val)
+            elif kind == "apkdone":
+                self.on_apk_done(*val)
             elif kind == "dssync":
                 self.on_ds_sync(*val)
             elif kind == "speech":
