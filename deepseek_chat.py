@@ -6683,7 +6683,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.44.0"
+APP_VERSION = "2.44.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -12128,6 +12128,8 @@ TG_COMMANDS = [
     ("chats", "محادثاتك: اختر وحدة وكمّل عليها"),
     ("new", "محادثة جديدة"),
     ("read", "آخر رسائل المحادثة المختارة"),
+    ("files", "كل مرفقات المحادثة المختارة"),
+    ("export", "المحادثة المختارة كاملة كملف"),
     ("where", "أي محادثة مختارة الحين"),
     ("stop", "أوقف الرد اللي يشتغل"),
     ("search", "دوّر في محادثاتك: /search كلمة"),
@@ -18437,26 +18439,135 @@ class App(QMainWindow):
                 ("<b>%s</b>" % tg_esc(tg_one(tgt.get("title"), 40))) if tgt else "ولا وحدة (رسالتك الجاية تبدأ محادثة جديدة)")
         return head, rows
 
-    def _tg_show(self, chat, upto=None, n=2):
-        """Send messages [upto-n, upto) of a chat as they are in the app, formatted; a button reaches the older ones."""
+    def _tg_files(self, chat):
+        """Every attachment of a chat, oldest first: what you sent, files and pictures the replies made, and work files a reply names."""
+        out, seen = [], set()
         ms = [m for m in chat.get("msgs", []) if isinstance(m, dict)]
-        upto = len(ms) if upto is None else max(0, min(int(upto), len(ms)))
-        lo = max(0, upto - n)
-        if upto <= lo:
-            self.tg_bridge.say_html("(ما فيه رسائل أقدم)")
-            return
-        for i in range(lo, upto):
-            m = ms[i]
-            btn = None
-            if i == upto - 1:
-                btn = [([("📖 رسائل أقدم", "r:%s:%d" % (chat["id"], lo))] if lo > 0 else []) + [("📂 المحادثات", "m")]]
+        for i, m in enumerate(ms):
             if m.get("role") == "user":
-                t = m.get("shown") or (m.get("content") if isinstance(m.get("content"), str) else "")
-                names = [str(x) for x in (m.get("names") or [])][:6]
-                t = _cut(str(t), 1500) + (("\n📎 " + "، ".join(names)) if names else "")
-                self.tg_bridge.say(t or "(مرفقات)", head="🧑 <b>أنت:</b>\n", buttons=btn)
+                for f in m.get("files") or []:
+                    p = str(f.get("path") or "")
+                    out.append({"name": f.get("name") or os.path.basename(p), "path": p, "who": "🧑", "mi": i + 1})
+                    seen.add(os.path.normcase(os.path.abspath(p)))
+                continue
+            for p in m.get("images") or []:
+                out.append({"name": os.path.basename(str(p)), "path": str(p), "who": "🖼", "mi": i + 1})
+                seen.add(os.path.normcase(os.path.abspath(str(p))))
+            for kind, name, body in extract_files(str(m.get("content", ""))):
+                if kind == "file":
+                    out.append({"name": name, "body": body, "who": "🤖", "mi": i + 1})
+        try:
+            wd = os.path.join(self.chat_dir(chat), "work")
+            said = "\n".join(str(m.get("content", "")) for m in ms if m.get("role") == "assistant").lower()
+            for root, dirs, files in os.walk(wd):
+                dirs[:] = [d for d in dirs if d not in ("attachments", "__pycache__")]
+                for fn in sorted(files):
+                    fp = os.path.join(root, fn)
+                    if fn.startswith("_run_") or fn.endswith((".pyc", ".tmp")) or fn.lower() not in said or os.path.normcase(os.path.abspath(fp)) in seen:
+                        continue
+                    out.append({"name": fn, "path": fp, "who": "🤖", "mi": 0})
+        except OSError:
+            pass
+        for f in out:
+            try:
+                f["size"] = len(f["body"].encode("utf-8")) if "body" in f else os.path.getsize(f["path"])
+            except OSError:
+                f["size"] = -1  # the file is no longer on the computer
+        return out[:60]
+
+    def _tg_files_menu(self, chat):
+        fs = self._tg_files(chat)
+        title = tg_esc(tg_one(chat.get("title") or "محادثة", 50))
+        if not fs:
+            self.tg_bridge.say_html("📎 ما فيه مرفقات في «%s»." % title)
+            return
+        lines = ["📎 <b>مرفقات «%s»</b> (%d)" % (title, len(fs)), "<i>🧑 أرسلتها أنت · 🤖 سواها خبيلان · 🖼 صورة سواها</i>", ""]
+        for i, f in enumerate(fs, 1):
+            lines.append("%d. %s %s · %s%s" % (i, f["who"], tg_esc(tg_one(f["name"], 60)),
+                                               human_size(f["size"]) if f["size"] >= 0 else "ما عاد موجود بالجهاز",
+                                               (" · رسالة %d" % f["mi"]) if f["mi"] else ""))
+        lines += ["", "اضغط رقم الملف وأرسله لك."]
+        nums = [(str(i), "g:%s:%d" % (chat["id"], i)) for i, f in enumerate(fs, 1) if f["size"] >= 0]
+        rows = [nums[k:k + 6] for k in range(0, len(nums), 6)]
+        if 1 < len(nums) <= 10:
+            rows.append([("⬇️ أرسلها كلها", "g:%s:all" % chat["id"])])
+        self.tg_bridge.say_html("\n".join(lines)[:4000], buttons=rows)
+
+    def _tg_send_file(self, f):
+        if "body" in f:
+            os.makedirs(TG_OUT_DIR, exist_ok=True)
+            p = os.path.join(TG_OUT_DIR, f["name"])
+            with open(p, "w", encoding="utf-8", newline="") as fh:
+                fh.write(f["body"])
+        else:
+            p = f["path"]
+        if not self.tg_bridge.send_file(p, caption=f["name"]):
+            self.tg_bridge.say_html("⚠️ ما قدرت أرسل «%s» (غير موجود أو أكبر من 49 ميقا)." % tg_esc(f["name"]))
+
+    def _tg_chat_md(self, chat):
+        """The whole chat as one readable file."""
+        out = ["# %s" % (chat.get("title") or "محادثة"), "",
+               "محادثة من خبيلان · %d رسالة · آخر تحديث %s" % (len(chat.get("msgs") or []), time.strftime("%Y-%m-%d %H:%M", time.localtime(chat.get("updated") or time.time()))), ""]
+        for i, m in enumerate([m for m in chat.get("msgs", []) if isinstance(m, dict)], 1):
+            if m.get("role") == "user":
+                out.append("## %d. أنت" % i)
+                if m.get("names"):
+                    out.append("*(مرفقات: %s)*" % "، ".join(str(x) for x in m["names"]))
+                out.append(str(m.get("shown") or (m.get("content") if isinstance(m.get("content"), str) else "")))
             else:
-                self.tg_bridge.say(_cut(clean_reply(str(m.get("content", ""))).strip() or "(بدون نص)", 3200), head="🤖 <b>خبيلان:</b>\n", buttons=btn)
+                out.append("## %d. خبيلان" % i)
+                out.append(clean_reply(str(m.get("content") or "")))
+                if m.get("images"):
+                    out.append("*(صور: %s)*" % "، ".join(os.path.basename(str(p)) for p in m["images"]))
+            out.append("")
+        return "\n".join(out)
+
+    def _tg_nav(self, chat, start, n):
+        total = len([m for m in chat.get("msgs", []) if isinstance(m, dict)])
+        row = []
+        if start > 0:
+            row.append(("⬆️ أقدم", "w:%s:%d" % (chat["id"], max(0, start - 6))))
+        if start + n < total:
+            row.append(("⬇️ أحدث", "w:%s:%d" % (chat["id"], start + n)))
+        nf = len(self._tg_files(chat))
+        return [row, [("📎 المرفقات (%d)" % nf, "a:" + chat["id"]), ("📄 كاملة كملف", "f:" + chat["id"])], [("📂 المحادثات", "m")]]
+
+    def _tg_show(self, chat, start=None, n=6):
+        """Send messages [start, start+n) of a chat exactly as they are in the app: whole text, formatted, numbered, with what was
+        attached to each; buttons under the last one move through the history, list the attachments or send the whole chat as a file."""
+        ms = [m for m in chat.get("msgs", []) if isinstance(m, dict)]
+        total = len(ms)
+        start = max(0, total - n) if start is None else max(0, min(int(start), max(0, total - 1)))
+        end = min(total, start + n)
+        if not ms:
+            self.tg_bridge.say_html("(المحادثة فاضية)")
+            return
+        for i in range(start, end):
+            m = ms[i]
+            btn = self._tg_nav(chat, start, end - start) if i == end - 1 else None
+            num = " · %d/%d" % (i + 1, total)
+            if m.get("role") == "user":
+                t = str(m.get("shown") or (m.get("content") if isinstance(m.get("content"), str) else "") or "")
+                names = [str(x) for x in (m.get("names") or [])][:10]
+                if len(t) > 6000:
+                    t = t[:6000] + "\n\n…(الباقي في «كاملة كملف»)"
+                t += ("\n\n📎 " + "، ".join(names)) if names else ""
+                self.tg_bridge.say(t or "(مرفقات)", head="🧑 <b>أنت</b>%s\n" % num, buttons=btn)
+            else:
+                t = clean_reply(str(m.get("content", ""))).strip() or "(بدون نص)"
+                if len(t) > 9000:
+                    t = t[:9000] + "\n\n…(الباقي في «كاملة كملف»)"
+                made = [name for kind, name, _b in extract_files(str(m.get("content", ""))) if kind == "file"]
+                extra = []
+                if made:
+                    extra.append("📎 " + "، ".join(made[:8]))
+                if m.get("images"):
+                    extra.append("🖼 %d صورة" % len(m["images"]))
+                tools = len([x for x in (m.get("activity") or []) if isinstance(x, dict) and x.get("k") == "tool"])
+                if tools:
+                    extra.append("🔧 %d خطوة" % tools)
+                t += ("\n\n" + " · ".join(extra)) if extra else ""
+                self.tg_bridge.say(t, head="🤖 <b>خبيلان</b>%s\n" % num, buttons=btn)
 
     def _tg_open(self, chat):
         self._tg_set_target(chat["id"])
@@ -18464,11 +18575,18 @@ class App(QMainWindow):
             chat["unread"] = False
             self.persist()
             self.refresh_list()
-        info = "✅ <b>%s</b>\n%d رسالة · آخر تحديث %s" % (tg_esc(tg_one(chat.get("title") or "بدون عنوان", 60)), len(chat.get("msgs") or []), tg_ago(chat.get("updated")))
+        total = len([m for m in chat.get("msgs", []) if isinstance(m, dict)])
+        nf = len(self._tg_files(chat))
+        st = chat.get("settings") or {}
+        info = "✅ <b>%s</b>\n%d رسالة · آخر تحديث %s%s%s" % (
+            tg_esc(tg_one(chat.get("title") or "بدون عنوان", 60)), total, tg_ago(chat.get("updated")),
+            (" · 📎 %d مرفق" % nf) if nf else "", ("\nالنموذج: %s" % tg_esc(st.get("model"))) if st.get("model") else "")
+        if total > 6:
+            info += "\nهذي آخر 6 رسائل، والأزرار تحت آخر رسالة توديك للأقدم."
+        info += "\nأي شي تكتبه الحين يكمل هذي المحادثة، وينحفظ فيها بالتطبيق."
         R = self.runs.get(chat["id"])
-        info += "\nأي شي تكتبه الحين يكمل هذي المحادثة."
         self.tg_bridge.say_html(info)
-        self._tg_show(chat, n=2)
+        self._tg_show(chat)
         if R is not None and R.tg_wait is None:  # it is answering right now (started on the computer): follow it from here
             self._tg_watch(R)
 
@@ -18634,6 +18752,7 @@ class App(QMainWindow):
             self.tg_bridge.say_html("⚠️ ما قدرت أرسل للمحادثة%s" % ((": " + tg_esc(self._tg_err)) if self._tg_err else " (تأكد من المفتاح والإعدادات)."))
             return False
         self._tg_watch(R_)
+        self.statusBar().showMessage("وصلت رسالة من تليقرام في محادثة «%s»" % tg_one(chat.get("title") or "", 40), 8000)
         return True
 
     # ----- what arrives from Telegram -----
@@ -18744,7 +18863,9 @@ class App(QMainWindow):
                "اكتب أي شي ويروح للمحادثة المختارة، والرد يجيك هنا مع ملفاته وصوره. تقدر ترسل صور وملفات ورسائل صوتية.\n\n"
                "/chats محادثاتك اللي بالتطبيق: اضغط وحدة وكمّل عليها\n"
                "/new محادثة جديدة (أو /new وبعدها رسالتك)\n"
-               "/read آخر رسائل المحادثة المختارة (مثال: /read 6)\n"
+               "/read آخر رسائل المحادثة المختارة (مثال: /read 10)\n"
+               "/files كل مرفقات المحادثة المختارة، وتضغط رقم الملف وأرسله لك\n"
+               "/export المحادثة المختارة كاملة كملف واحد\n"
                "/where أي محادثة مختارة الحين\n"
                "/stop أوقف الرد اللي يشتغل\n"
                "/search كلمة: دوّر في محادثاتك\n"
@@ -18776,7 +18897,16 @@ class App(QMainWindow):
             if chat is None:
                 say("ما فيه محادثة مختارة. اضغط /chats واختر وحدة.")
             else:
-                self._tg_show(chat, n=max(1, min(int(arg) if arg.isdigit() else 4, 10)))
+                n_ = max(1, min(int(arg) if arg.isdigit() else 6, 20))
+                self._tg_show(chat, start=max(0, len(chat.get("msgs") or []) - n_), n=n_)
+        elif cmd in ("/files", "/export"):
+            chat = self._tg_target_chat()
+            if chat is None:
+                say("ما فيه محادثة مختارة. اضغط /chats واختر وحدة.")
+            elif cmd == "/files":
+                self._tg_files_menu(chat)
+            else:
+                self._tg_send_file({"name": safe_name(tg_one(chat.get("title") or "chat", 40)) + ".md", "body": self._tg_chat_md(chat)})
         elif cmd == "/where":
             chat = self._tg_target_chat()
             if chat is None:
@@ -18784,7 +18914,7 @@ class App(QMainWindow):
             else:
                 say("المختارة: <b>%s</b>\n%d رسالة · آخر تحديث %s%s" % (
                     tg_esc(tg_one(chat.get("title") or "بدون عنوان", 60)), len(chat.get("msgs") or []), tg_ago(chat.get("updated")),
-                    "\n⏳ تشتغل على رد الحين" if chat["id"] in self.runs else ""), buttons=[[("📖 اقرأها", "r:%s:%d" % (chat["id"], len(chat.get("msgs") or []))), ("📂 المحادثات", "m")]])
+                    "\n⏳ تشتغل على رد الحين" if chat["id"] in self.runs else ""), buttons=[[("📖 اقرأها", "w:%s:%d" % (chat["id"], max(0, len(chat.get("msgs") or []) - 6))), ("📎 المرفقات", "a:" + chat["id"])], [("📂 المحادثات", "m")]])
         elif cmd == "/stop":
             tgt = self._tg_target_chat()
             rs = [self.runs[tgt["id"]]] if (tgt and tgt["id"] in self.runs) else [r for r in self.runs.values() if r.tg_wait]
@@ -18847,7 +18977,28 @@ class App(QMainWindow):
             chat = self._tg_chat_by_id(cid)
             if chat is None:
                 return "هذي المحادثة ما عادت موجودة"
-            self._tg_show(chat, upto=int(lo), n=4)
+            self._tg_show(chat, start=max(0, int(lo) - 6))  # buttons of messages sent by 2.44.0
+            return ""
+        if data[:2] in ("w:", "a:", "f:", "g:"):
+            bits = data.split(":")
+            chat = self._tg_chat_by_id(bits[1])
+            if chat is None:
+                return "هذي المحادثة ما عادت موجودة"
+            if data[0] == "w":
+                self._tg_show(chat, start=int(bits[2]))
+            elif data[0] == "a":
+                self._tg_files_menu(chat)
+            elif data[0] == "f":
+                self._tg_send_file({"name": safe_name(tg_one(chat.get("title") or "chat", 40)) + ".md", "body": self._tg_chat_md(chat)})
+                return "أرسلها لك"
+            else:
+                fs = [f for f in self._tg_files(chat)]
+                pick = [f for f in fs if f["size"] >= 0][:10] if bits[2] == "all" else fs[int(bits[2]) - 1:int(bits[2])]
+                if not pick:
+                    return "الملف ما عاد موجود"
+                for f in pick:
+                    self._tg_send_file(f)
+                return "أرسله لك"
             return ""
         if data.startswith("s:"):
             R = self.runs.get(data[2:])
