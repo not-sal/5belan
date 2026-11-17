@@ -6683,7 +6683,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.43.1"
+APP_VERSION = "2.44.0"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
@@ -12121,14 +12121,66 @@ def page_text(url, limit=30000):
 
 
 # ---------- Telegram bot link ----------
-def tg_call(token, method, params=None, timeout=35):
-    url = "https://api.telegram.org/bot%s/%s" % (token, method)
-    data = urllib.parse.urlencode(params or {}).encode("utf-8")
-    with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", errors="replace"))
+TG_API = (os.environ.get("BELAN_TG_API") or "https://api.telegram.org").rstrip("/")
+TG_IN_DIR = os.path.join(DATA_DIR, "tg_in")
+TG_OUT_DIR = os.path.join(DATA_DIR, "tg_out")
+TG_COMMANDS = [
+    ("chats", "محادثاتك: اختر وحدة وكمّل عليها"),
+    ("new", "محادثة جديدة"),
+    ("read", "آخر رسائل المحادثة المختارة"),
+    ("where", "أي محادثة مختارة الحين"),
+    ("stop", "أوقف الرد اللي يشتغل"),
+    ("search", "دوّر في محادثاتك: /search كلمة"),
+    ("tasks", "مهامك وتشغيلها"),
+    ("status", "حالة التطبيق"),
+    ("help", "شرح الأوامر"),
+]
+TG_PHOTO_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+class TgError(RuntimeError):
+    def __init__(self, code, desc, retry=0):
+        super().__init__("%s %s" % (code, desc))
+        self.code, self.desc, self.retry = int(code or 0), str(desc or ""), int(retry or 0)
+
+
+def tg_call(token, method, params=None, timeout=35, files=None):
+    """One Bot API call. Lists/dicts go as JSON; `files` ({field: path}) switches to a multipart upload."""
+    url = "%s/bot%s/%s" % (TG_API, token, method)
+    fields = {}
+    for k, v in (params or {}).items():
+        if v is None:
+            continue
+        fields[k] = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list, bool)) else str(v)
+    if files:
+        bnd = "----belan" + uuid.uuid4().hex
+        body = io.BytesIO()
+        for k, v in fields.items():
+            body.write(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n' % (bnd, k)).encode("utf-8") + v.encode("utf-8") + b"\r\n")
+        for k, path in files.items():
+            fn = os.path.basename(path).replace('"', "'")
+            body.write(('--%s\r\nContent-Disposition: form-data; name="%s"; filename="%s"\r\nContent-Type: application/octet-stream\r\n\r\n'
+                        % (bnd, k, fn)).encode("utf-8"))
+            with open(path, "rb") as f:
+                body.write(f.read())
+            body.write(b"\r\n")
+        body.write(("--%s--\r\n" % bnd).encode("utf-8"))
+        req = urllib.request.Request(url, data=body.getvalue(), headers={"Content-Type": "multipart/form-data; boundary=" + bnd})
+    else:
+        req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            d = json.loads(e.read().decode("utf-8", errors="replace"))
+        except Exception:
+            d = {}
+        raise TgError(e.code, d.get("description") or e.reason, (d.get("parameters") or {}).get("retry_after") or 0)
 
 
 def tg_send(token, chat_id, text):
+    """A plain message sent right now (the «رسالة تجربة» button); everything else goes through TgBridge's ordered queue."""
     text = str(text or "").strip() or "(فاضي)"
     for i in range(0, len(text), 3900):
         try:
@@ -12139,11 +12191,152 @@ def tg_send(token, chat_id, text):
     return True
 
 
+def tg_download(token, file_id, name=""):
+    """Download a file the user sent to the bot (the Bot API allows up to 20 MB) and return its path."""
+    r = tg_call(token, "getFile", {"file_id": file_id}, timeout=30)
+    fp = (r.get("result") or {}).get("file_path") or ""
+    if not fp:
+        raise RuntimeError("no file path")
+    os.makedirs(TG_IN_DIR, exist_ok=True)
+    dst = unique_path(TG_IN_DIR, safe_name(name or os.path.basename(fp)))
+    with urllib.request.urlopen("%s/file/bot%s/%s" % (TG_API, token, urllib.parse.quote(fp)), timeout=180) as r, open(dst, "wb") as f:
+        shutil.copyfileobj(r, f)
+    return dst
+
+
+def tg_esc(s):
+    return html.escape(str(s or ""), quote=False)
+
+
+def tg_one(s, n=40):
+    s = " ".join(str(s or "").split())
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def tg_ago(ts):
+    try:
+        d = max(0, time.time() - float(ts or 0))
+    except Exception:
+        return ""
+    if d < 90:
+        return "الحين"
+    if d < 3600:
+        return "قبل %d د" % (d // 60)
+    if d < 86400:
+        return "قبل %d س" % (d // 3600)
+    if d < 86400 * 30:
+        return "قبل %d يوم" % (d // 86400)
+    return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+
+
+def tg_keys(rows):
+    """[[(label, callback_data), ...], ...] → an inline keyboard."""
+    return {"inline_keyboard": [[{"text": str(t)[:60], "callback_data": str(d)[:64]} for t, d in row] for row in rows if row]}
+
+
+def tg_plain(html_):
+    return html.unescape(re.sub(r"<[^>]+>", "", str(html_ or "")))
+
+
+def _tg_inline(s):
+    keep = []
+
+    def stash(h):
+        keep.append(h)
+        return "\x00%d\x00" % (len(keep) - 1)
+
+    s = re.sub(r"`([^`\n]+)`", lambda m: stash("<code>%s</code>" % html.escape(m.group(1), quote=False)), s)
+    s = re.sub(r"!?\[([^\]\n]+)\]\((https?://[^)\s]+)\)",
+               lambda m: stash('<a href="%s">%s</a>' % (html.escape(m.group(2), quote=True), html.escape(m.group(1), quote=False))), s)
+    s = html.escape(s, quote=False)
+    s = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![\w*])", r"<i>\1</i>", s)
+    s = re.sub(r"~~(?=\S)(.+?)(?<=\S)~~", r"<s>\1</s>", s)
+    return re.sub(r"\x00(\d+)\x00", lambda m: keep[int(m.group(1))], s)
+
+
+def tg_md_html(md):
+    """Markdown of a reply → the small HTML subset Telegram shows (bold, italic, code, links, quotes); tables become plain rows."""
+    lines = str(md or "").replace("\r\n", "\n").split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        ln = lines[i]
+        st = ln.strip()
+        if st.startswith("```"):
+            lang = re.sub(r"[^\w+#-]", "", st[3:])[:20]
+            buf, j = [], i + 1
+            while j < len(lines) and not lines[j].strip().startswith("```"):
+                buf.append(lines[j])
+                j += 1
+            code = html.escape("\n".join(buf), quote=False)
+            if code.strip():
+                out.append(('<pre><code class="language-%s">%s</code></pre>' % (lang, code)) if lang else "<pre>%s</pre>" % code)
+            i = j + 1
+            continue
+        if st.startswith("|") and st.count("|") >= 2:
+            first = True
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                i += 1
+                if all(re.fullmatch(r":?-+:?", c or "-") for c in cells):
+                    continue
+                row = " — ".join(_tg_inline(c.replace("**", "")) for c in cells if c)
+                out.append(("<b>%s</b>" % row) if first else "▫️ " + row)
+                first = False
+            continue
+        if st.startswith(">"):
+            buf = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                buf.append(_tg_inline(lines[i].strip().lstrip(">").strip()))
+                i += 1
+            out.append("<blockquote>%s</blockquote>" % "\n".join(buf))
+            continue
+        i += 1
+        m = re.match(r"#{1,6}\s+(.*)", st)
+        if m:
+            out.append("<b>%s</b>" % _tg_inline(m.group(1).strip("# ").replace("**", "")))
+            continue
+        if re.fullmatch(r"(-{3,}|\*{3,}|_{3,})", st):
+            out.append("———")
+            continue
+        m = re.match(r"(\s*)[-*+]\s+(.*)", ln)
+        if m:
+            body = m.group(2)
+            mark = "• "
+            if body[:4].lower() in ("[ ] ", "[x] "):
+                mark, body = ("☑ " if body[1].lower() == "x" else "☐ "), body[4:]
+            out.append(" " * min(len(m.group(1)), 8) + mark + _tg_inline(body))
+            continue
+        out.append(_tg_inline(ln))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
+def tg_split(md, limit=3500):
+    """Cut a long reply into messages on line borders; a code block that crosses a cut is closed and reopened."""
+    parts, cur, size, fence = [], [], 0, ""
+    for ln in str(md or "").split("\n"):
+        for pc in ([ln[k:k + limit] for k in range(0, len(ln), limit)] or [""]):
+            if cur and size + len(pc) + 1 > limit:
+                if fence:
+                    cur.append("```")
+                parts.append("\n".join(cur))
+                cur = [fence] if fence else []
+                size = len(fence)
+            cur.append(pc)
+            size += len(pc) + 1
+            if pc.strip().startswith("```"):
+                fence = "" if fence else pc.strip()
+    if cur:
+        parts.append("\n".join(cur))
+    return [p for p in parts if p.strip()] or ["(فاضي)"]
+
+
 class TgBridge(QObject):
-    """Receives Telegram messages on a background thread and hands them to the GUI thread."""
-    got = Signal(int, str)
+    """Telegram in both directions: one thread receives (long polling) and hands updates to the GUI thread,
+    one thread sends, in order, so messages never overtake each other."""
+    got = Signal(object)  # an update (dict) from the paired account
     paired = Signal(int, str)
-    reply = Signal(str)
+    ready = Signal(object)  # (text, [paths], [notes], [heard]) once the attachments of a message are downloaded
 
     def __init__(self, get_cfg):
         super().__init__()
@@ -12152,12 +12345,15 @@ class TgBridge(QObject):
         self.offset = 0
         self.stop = False
         self.state = ""
+        self.out = queue.Queue()
 
     def start(self):
         threading.Thread(target=self.loop, daemon=True).start()
+        threading.Thread(target=self.send_loop, daemon=True).start()
 
+    # ----- receiving -----
     def loop(self):
-        fails = 0
+        fails, first, prepared = 0, True, ""
         while not self.stop:
             tg = self.get_cfg() or {}
             token = (tg.get("token") or "").strip()
@@ -12165,29 +12361,139 @@ class TgBridge(QObject):
                 time.sleep(1)
                 continue
             try:
-                res = tg_call(token, "getUpdates", {"offset": self.offset, "timeout": 25, "allowed_updates": '["message"]'}, timeout=40)
+                if prepared != token:
+                    prepared = token
+                    try:  # a webhook left on the bot would block polling; the command menu shows next to the message box
+                        tg_call(token, "deleteWebhook", {}, timeout=15)
+                        tg_call(token, "setMyCommands", {"commands": [{"command": c, "description": d} for c, d in TG_COMMANDS]}, timeout=15)
+                    except Exception as e:
+                        log_event("telegram setup: %s" % e)
+                res = tg_call(token, "getUpdates", {"offset": self.offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]}, timeout=40)
                 fails = 0
                 self.state = "ok"
+                old = 0
                 for u in res.get("result") or []:
                     self.offset = max(self.offset, int(u.get("update_id", 0)) + 1)
-                    m = u.get("message") or {}
-                    text = (m.get("text") or "").strip()
+                    cq = u.get("callback_query")
+                    m = u.get("message") or (cq or {}).get("message") or {}
                     cid = (m.get("chat") or {}).get("id")
-                    if not text or cid is None:
+                    if cid is None:
                         continue
+                    text = "" if cq else (m.get("text") or "").strip()
                     paired_id = tg.get("chat_id")
                     p = self.pair
-                    if p and time.time() < p[1] and text.split()[-1:] == [p[0]] and text.split()[0] in ("/start", "/pair"):
+                    if p and text and time.time() < p[1] and text.split()[-1:] == [p[0]] and text.split()[0] in ("/start", "/pair"):
                         self.pair = None
                         name = ((m.get("from") or {}).get("first_name") or "") + " " + ((m.get("from") or {}).get("username") or "")
                         self.paired.emit(int(cid), name.strip())
                     elif paired_id and int(cid) == int(paired_id):
-                        self.got.emit(int(cid), text)
+                        if first and not cq and time.time() - float(m.get("date") or time.time()) > 900:
+                            old += 1  # sent long ago while the app was closed: not run by surprise now
+                            continue
+                        self.got.emit(u)
                     # anyone else is ignored completely
+                first = False
+                if old:
+                    self.say("وصلتني %d %s والتطبيق مقفّل، وما نفذتها. أرسلها من جديد لو لسه تبيها." % (old, "رسالة" if old == 1 else "رسائل"))
             except Exception as e:
                 fails += 1
-                self.state = "err: %s" % str(e)[:80]
+                code = getattr(e, "code", 0)
+                self.state = "conflict" if code == 409 else ("badtoken" if code in (401, 404) else "err: %s" % str(e)[:80])
                 time.sleep(min(60, 3 * fails))
+
+    # ----- sending -----
+    def send_loop(self):
+        while not self.stop:
+            job = self.out.get()
+            tg = self.get_cfg() or {}
+            token = (tg.get("token") or "").strip()
+            params = dict(job.get("params") or {})
+            if job["method"] != "answerCallbackQuery":
+                params["chat_id"] = job.get("chat_id") or tg.get("chat_id")
+                if not params["chat_id"]:
+                    continue
+            if not token:
+                continue
+            res = None
+            tries = 1 if job.get("once") else 3
+            for attempt in range(tries):
+                try:
+                    res = tg_call(token, job["method"], params, timeout=job.get("timeout", 25), files=job.get("files"))
+                    break
+                except TgError as e:
+                    if e.code == 429 and attempt < tries - 1:
+                        time.sleep(min(30, e.retry + 1))
+                        continue
+                    if e.code == 400 and params.get("parse_mode") and job.get("plain") is not None and "not modified" not in e.desc:
+                        params.pop("parse_mode", None)  # Telegram refused the formatting: the same words as plain text
+                        params["caption" if "caption" in params else "text"] = job["plain"][:4096]
+                        if attempt == tries - 1:
+                            try:
+                                res = tg_call(token, job["method"], params, timeout=25, files=job.get("files"))
+                            except Exception as e2:
+                                log_event("telegram %s failed: %s" % (job["method"], e2))
+                        continue
+                    if "not modified" not in e.desc and "message to delete not found" not in e.desc:
+                        log_event("telegram %s failed: %s" % (job["method"], e))
+                    break
+                except Exception as e:
+                    if attempt < tries - 1:
+                        time.sleep(2)
+                        continue
+                    log_event("telegram %s failed: %s" % (job["method"], e))
+            cb = job.get("done")
+            if cb:
+                try:
+                    cb(res)
+                except Exception as e:
+                    log_event("telegram callback: %s" % e)
+
+    def post(self, method, params=None, **kw):
+        self.out.put(dict(kw, method=method, params=params or {}))
+
+    def say(self, md, buttons=None, head="", done=None, chat_id=None):
+        """Send Markdown text (a reply): formatted, cut into as many messages as needed, buttons under the last one."""
+        parts = tg_split(str(md or "").strip() or "(فاضي)")
+        for i, p in enumerate(parts):
+            last = i == len(parts) - 1
+            h = head if i == 0 else ""
+            prm = {"text": h + tg_md_html(p), "parse_mode": "HTML", "disable_web_page_preview": True}
+            if last and buttons:
+                prm["reply_markup"] = tg_keys(buttons)
+            self.post("sendMessage", prm, plain=tg_plain(h) + p, done=done if last else None, chat_id=chat_id)
+
+    def say_html(self, html_, buttons=None, done=None, chat_id=None):
+        prm = {"text": html_[:4096], "parse_mode": "HTML", "disable_web_page_preview": True}
+        if buttons:
+            prm["reply_markup"] = tg_keys(buttons)
+        self.post("sendMessage", prm, plain=tg_plain(html_), done=done, chat_id=chat_id)
+
+    def edit(self, mid, html_, buttons=None):
+        prm = {"message_id": mid, "text": html_[:4096], "parse_mode": "HTML", "disable_web_page_preview": True}
+        if buttons:
+            prm["reply_markup"] = tg_keys(buttons)
+        self.post("editMessageText", prm, plain=tg_plain(html_), once=True)
+
+    def delete(self, mid):
+        self.post("deleteMessage", {"message_id": mid}, once=True)
+
+    def typing(self):
+        self.post("sendChatAction", {"action": "typing"}, once=True, timeout=10)
+
+    def answer(self, cb_id, text=""):
+        self.post("answerCallbackQuery", {"callback_query_id": cb_id, "text": text or None}, once=True, timeout=10)
+
+    def send_file(self, path, caption=""):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return False
+        if size <= 0 or size > 49 * 1024 * 1024:
+            return False
+        photo = path.lower().endswith(TG_PHOTO_EXTS) and size < 9 * 1024 * 1024
+        prm = {"caption": caption[:1000]} if caption else {}
+        self.post("sendPhoto" if photo else "sendDocument", prm, files={"photo" if photo else "document": path}, timeout=180)
+        return True
 
 
 class TelegramDialog(QDialog):
@@ -12196,10 +12502,10 @@ class TelegramDialog(QDialog):
         self.setWindowTitle("ربط تليقرام")
         self.tg = tg
         self.bridge = bridge
-        self.resize(520, 430)
+        self.resize(520, 520)
         lay = QVBoxLayout(self)
         info = QLabel(
-            "تربط خبيلان ببوت تليقرام خاص فيك: يوصلك إشعار لما تخلص مهمة، وتقدر تسولف معه وتشغّل مهامك من جوالك.\n"
+            "تربط خبيلان ببوت تليقرام خاص فيك: تكمل محادثاتك اللي بالتطبيق من جوالك، ترسل صور وملفات وصوت، ويجيك الرد بملفاته، وتشغّل مهامك.\n"
             "1) افتح @BotFather في تليقرام، أرسل /newbot، وخذ التوكن.\n"
             "2) الصق التوكن تحت واضغط «حفظ وتحقق».\n"
             "3) اضغط «ابدأ الربط»، وافتح الرابط (أو أرسل للبوت الأمر اللي يظهر) من حسابك.\n"
@@ -12221,10 +12527,18 @@ class TelegramDialog(QDialog):
         lay.addLayout(row)
         self.notify = QCheckBox("أرسل لي إشعار لما تخلص أو تفشل مهمة خلفية")
         self.notify.setChecked(tg.get("notify", True) is not False)
-        self.chat_on = QCheckBox("اسمح لي أسولف مع خبيلان من تليقرام (بدون صلاحيات على ملفات الجهاز)")
+        self.chat_on = QCheckBox("اسمح لي أسولف مع خبيلان من تليقرام")
+        self.chat_on.setToolTip("المحادثات اللي تبدأها من تليقرام ما لها صلاحيات على ملفات الجهاز. المحادثات اللي تختارها من التطبيق تشتغل بإعداداتها.")
         self.chat_on.setChecked(tg.get("chat", True) is not False)
-        lay.addWidget(self.notify)
-        lay.addWidget(self.chat_on)
+        self.follow = QCheckBox("أرسل لي ردود المحادثة المختارة حتى لو كتبت من الكمبيوتر")
+        self.follow.setChecked(tg.get("follow", True) is not False)
+        self.all_replies = QCheckBox("بلّغني برد أي محادثة ثانية إذا أنا مو على البرنامج")
+        self.all_replies.setChecked(bool(tg.get("all_replies")))
+        self.approve = QCheckBox("اسألني في تليقرام قبل تنفيذ أمر يحتاج موافقة")
+        self.approve.setToolTip("للرسائل اللي أرسلتها من تليقرام فقط. لو طفيتها يطلع السؤال على شاشة الكمبيوتر مثل العادة.")
+        self.approve.setChecked(tg.get("approve", True) is not False)
+        for w_ in (self.notify, self.chat_on, self.follow, self.all_replies, self.approve):
+            lay.addWidget(w_)
         self.status = QLabel("")
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
@@ -12248,8 +12562,11 @@ class TelegramDialog(QDialog):
 
     def refresh(self):
         if self.tg.get("chat_id"):
-            self.status.setText("مربوط بحسابك" + (" (%s)" % self.tg.get("who") if self.tg.get("who") else "") + ". الاتصال: " +
-                                ("شغال" if self.bridge.state == "ok" else (self.bridge.state or "…")))
+            st_ = self.bridge.state
+            self.status.setText("مربوط بحسابك" + (" (%s)" % self.tg.get("who") if self.tg.get("who") else "") + ". الاتصال: " + (
+                "شغال" if st_ == "ok" else
+                "فيه جهاز ثاني شغال على نفس البوت، والرسائل تتوزع بينهم وتضيع. سكّر خبيلان في الجهاز الثاني أو سوّ له بوت خاص." if st_ == "conflict" else
+                "التوكن مرفوض، تأكد منه." if st_ == "badtoken" else (st_ or "…")))
         elif self.bridge.pair:
             code, _ = self.bridge.pair
             self.status.setText("بانتظار الربط… افتح هذا الرابط وضغط Start:\n%s\nأو أرسل للبوت: /start %s" % (self.link(code), code))
@@ -12305,6 +12622,9 @@ class TelegramDialog(QDialog):
     def tg_changed(self):
         self.tg["notify"] = self.notify.isChecked()
         self.tg["chat"] = self.chat_on.isChecked()
+        self.tg["follow"] = self.follow.isChecked()
+        self.tg["all_replies"] = self.all_replies.isChecked()
+        self.tg["approve"] = self.approve.isChecked()
         p = getattr(self, "app", None) or self.parent()
         if hasattr(p, "save_cfg"):
             p.cfg["tg"] = self.tg
@@ -13850,6 +14170,10 @@ TOUR_STEPS = [
      "body": "• ذاكرة: أشياء عنك يتذكرها في كل محادثة (قل له «تذكّر إن…»)\n• صرف: كم صرفت اليوم والأسبوع وأغلى المحادثات"},
     {"id": "connect", "target": "nav:الربط والدعم", "title": "الربط والدعم",
      "body": "• تليقرام: كلّم خبيلان من جوالك وتجيك إشعاراته\n• مشكلة: تقرير جاهز تنسخه لو صار خطأ\n• الجولة التعريفية: تعيد هذي الجولة"},
+    {"id": "tg2", "target": "nav:الربط والدعم", "title": "تليقرام صار يكمل محادثاتك",
+     "body": "من «تليقرام» تربط بوتك، وبعدها من جوالك:\n• /chats يعرض محادثاتك اللي بالتطبيق بأزرار، تضغط وحدة وتكمل عليها\n"
+             "• تشوف خبيلان وهو يشتغل خطوة بخطوة، وتقدر توقفه\n• ترسل صور وملفات ورسائل صوتية، ويرجع لك الرد منسّق مع ملفاته وصوره\n"
+             "• لو يحتاج موافقة على أمر، يسألك هناك بزرين"},
     {"id": "settings", "target": "settings_btn", "title": "إعدادات التطبيق",
      "body": "المفتاح والمظهر، بحث الويب، صوت القراءة، مفتاح الصور، قاموس المصطلحات، الشبكة والبروكسي، المهارات، زر خالد، "
              "و«حفظ كل المحادثات» بملف واحد."},
@@ -14094,7 +14418,8 @@ class Run:
         self.last_quotes = []
         self.queued = None
         self.interrupt = None
-        self.tg_wait = None
+        self.tg_wait = None  # set when this reply is reported to Telegram (see App._tg_watch)
+        self.err_text = ""
         self.last_ckpt = 0.0
 
 
@@ -14718,13 +15043,23 @@ class App(QMainWindow):
         QTimer.singleShot(12000, self.tick_followups)
         self.refresh_projects()
         self.proj_box.currentIndexChanged.connect(self.on_project_changed)
-        self._tg_busy = False
+        self._tg_q = []  # (chat id, text, files) sent from Telegram while that chat was still answering
+        self._tg_confirms = {}
+        self._tg_inbox = []
+        self._tg_sending = False
+        self._tg_err = ""
         self.setup_tray()
         self.tg_bridge = TgBridge(lambda: self.cfg.get("tg") or {})
-        self.tg_bridge.got.connect(self.on_tg_msg)
+        self.tg_bridge.got.connect(self.on_tg_update)
         self.tg_bridge.paired.connect(self.on_tg_paired)
-        self.tg_bridge.reply.connect(self.on_tg_reply)
+        self.tg_bridge.ready.connect(self.on_tg_ready)
         self.tg_bridge.start()
+        self.tg_timer = QTimer(self)
+        self.tg_timer.timeout.connect(self.tg_tick)
+        self.tg_timer.start(5000)
+        self.tg_in_timer = QTimer(self)
+        self.tg_in_timer.setSingleShot(True)
+        self.tg_in_timer.timeout.connect(self._tg_flush_inbox)
         self.inp.setFocus()
 
     # ---------- reply to a part of a message ----------
@@ -16094,13 +16429,19 @@ class App(QMainWindow):
     def ask_confirm(self, title, detail, run=None):
         """Called from the worker thread; the dialog is shown by the main thread."""
         slot = {"ok": False, "event": threading.Event()}
-        self.q.put(("confirm", (title, detail, slot), run))
+        tg_key = self._tg_confirm(run, title, detail, slot)  # asked from Telegram: the question goes there
+        if not tg_key:
+            self.q.put(("confirm", (title, detail, slot), run))
         stop = run.stop_event if run is not None else self.stop_event
         end = time.time() + 900
-        while time.time() < end and not slot["event"].wait(0.3):
-            if stop.is_set():
-                return False
-        return bool(slot["ok"])
+        try:
+            while time.time() < end and not slot["event"].wait(0.3):
+                if stop.is_set():
+                    return False
+            return bool(slot["ok"])
+        finally:
+            if tg_key:
+                self._tg_confirms.pop(tg_key, None)
 
     # ---------- chat list ----------
     def persist(self):
@@ -16828,7 +17169,7 @@ class App(QMainWindow):
         sb.setValue(sb.maximum() if at_bottom else keep)
 
     def request_suggestions(self, chat, idx):
-        if self.cfg.get("suggest", True) is False or chat is None or chat.get("id") == "telegram":
+        if self.cfg.get("suggest", True) is False or chat is None or chat.get("id") == "telegram":  # the old single Telegram chat
             return
         try:
             m = chat["msgs"][idx]
@@ -18027,203 +18368,524 @@ class App(QMainWindow):
         return tg if (tg.get("token") and tg.get("chat_id")) else None
 
     def tg_notify_force(self, text):
-        tg = self.tg_ready()
-        if tg:
-            threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], text), daemon=True).start()
+        if self.tg_ready():
+            self.tg_bridge.say(text)
 
     def tg_notify(self, text):
         tg = self.tg_ready()
         if tg and tg.get("notify", True) is not False:
-            threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], text), daemon=True).start()
+            self.tg_bridge.say(text)
 
     def on_tg_paired(self, cid, who):
         tg = self.cfg.setdefault("tg", {})
         tg["chat_id"] = cid
         tg["who"] = who
         self.save_cfg()
-        threading.Thread(target=tg_send, args=(tg.get("token", ""), cid, "تم الربط. اكتب /help لقائمة الأوامر."), daemon=True).start()
+        self.tg_bridge.say_html("✅ <b>تم الربط.</b>\nاكتب أي شي وتبدأ محادثة، أو اضغط «المحادثات» وكمّل على وحدة من محادثاتك.",
+                                buttons=[[("📂 المحادثات", "m"), ("❔ الأوامر", "h")]], chat_id=cid)
         self.statusBar().showMessage("تم ربط تليقرام", 5000)
 
-    def tg_chat(self):
-        for c in self.chats:
-            if c.get("id") == "telegram":
-                return c
-        c = {"id": "telegram", "title": "تليقرام", "updated": time.time(), "msgs": [], "project": "",
-             "settings": clean_settings({"tools_enabled": False}, restrictive_settings())}
+    # ----- which chat Telegram is talking to -----
+    def _tg_chats(self):
+        return sorted([c for c in self.chats if c.get("msgs") and not c.get("room") and not c.get("archived") and len(str(c.get("id"))) <= 60],
+                      key=lambda c: -float(c.get("updated") or 0))
+
+    def _tg_chat_by_id(self, cid):
+        return next((c for c in self.chats if c.get("id") == cid), None) if cid else None
+
+    def _tg_target_chat(self):
+        return self._tg_chat_by_id((self.cfg.get("tg") or {}).get("target") or "")
+
+    def _tg_set_target(self, cid):
+        self.cfg.setdefault("tg", {})["target"] = cid or ""
+        self.save_cfg()
+
+    def tg_new_chat(self, text=""):
+        """A chat started from Telegram: a real chat of the app, with no access to the computer until you open its settings."""
+        c = {"id": "tg" + uuid.uuid4().hex, "title": tg_one(text, 40) or "من تليقرام", "updated": time.time(), "msgs": [], "project": "",
+             "settings": clean_settings({"tools_enabled": False}, restrictive_settings(self.def_model, self.def_think))}
         self.chats.append(c)
         return c
 
-    def on_tg_msg(self, cid, text):
-        tg = self.tg_ready()
-        if not tg or int(cid) != int(tg["chat_id"]):
-            return
-        send = lambda t: threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], t), daemon=True).start()
-        cmd = text.split()[0].lower() if text.startswith("/") else ""
-        if getattr(self, "_tg_pick", False):
-            if text.strip().isdigit():
-                text, cmd = "/open " + text.strip(), "/open"  # right after the list, just the number picks a chat
-            else:
-                self._tg_pick = False
-        if cmd in ("/help", "/start"):
-            send("الأوامر:\n/chats محادثاتك اللي بالتطبيق\n/open عرض المحادثات ثم اكتب رقم وحدة منها بس\n/read [عدد] قراءة آخر رسائل المحادثة المختارة\n"
-                 "/where أي محادثة مختارة الحين\n/new محادثة تليقرام جديدة (منفصلة)\n/status حالة التطبيق\n/tasks مهامك\n/run رقم_أو_اسم تشغيل مهمة\n"
-                 "وأي نص ثاني يروح للمحادثة المختارة (بدون اختيار: محادثة تليقرام الخاصة).")
-            return
-        if cmd in ("/chats", "/open") and not (cmd == "/open" and text[5:].strip()):
-            lst = sorted([c for c in self.chats if c.get("id") != "telegram" and c.get("msgs")], key=lambda c: -float(c.get("updated", 0)))[:12]
-            self._tg_map = [c["id"] for c in lst]
-            self._tg_pick = bool(lst)
-            send(("\n".join("%d) %s" % (i + 1, (c.get("title") or "بدون عنوان")[:45]) for i, c in enumerate(lst))
-                  + "\n\nاكتب رقم المحادثة بس عشان تختارها.") if lst else "ما فيه محادثات.")
-            return
-        if cmd == "/open":
-            arg = text[5:].strip()
-            m_ = getattr(self, "_tg_map", None) or [c["id"] for c in sorted([c for c in self.chats if c.get("id") != "telegram" and c.get("msgs")], key=lambda c: -float(c.get("updated", 0)))[:12]]
-            if not arg.isdigit() or not (1 <= int(arg) <= len(m_)):
-                send("رقم غلط. اكتب /open لعرض المحادثات.")
-                return
-            ch_ = next((c for c in self.chats if c["id"] == m_[int(arg) - 1]), None)
-            if ch_ is None:
-                send("المحادثة ما عادت موجودة.")
-                return
-            self._tg_target = ch_["id"]
-            self._tg_pick = False
-            send("اخترت: %s\n\n%s\n\nأي رسالة تكتبها الحين تكمل هذي المحادثة." % (ch_.get("title") or "", self._tg_tail(ch_, 2)))
-            return
-        if cmd == "/read":
-            arg = text[5:].strip()
-            n_ = int(arg) if arg.isdigit() else 4
-            send(self._tg_tail(self._tg_target_chat(), max(1, min(n_, 10))))
-            return
-        if cmd == "/where":
-            ch_ = self._tg_target_chat()
-            send("المختارة: " + ("محادثة تليقرام الخاصة" if ch_.get("id") == "telegram" else (ch_.get("title") or "بدون عنوان")))
-            return
-        if cmd == "/status":
-            send("التطبيق شغال. %s. مهام تشتغل: %d. %s" % (("مشغول بـ %d رد" % len(self.runs)) if self.runs else "فاضي", len(self._bg_running),
-                                                         self.peak_label.text() if self.peak_label.isVisible() else "ماهو وقت الذروة"))
-            return
-        if cmd == "/tasks":
-            ts = self.cfg.get("tasks") or []
-            send("\n".join("%d) %s%s" % (i + 1, t["name"], "" if t.get("enabled", True) else " (متوقفة)") for i, t in enumerate(ts)) or "ما عندك مهام.")
-            return
-        if cmd == "/run":
-            arg = text[4:].strip()
-            ts = self.cfg.get("tasks") or []
-            t = None
-            if arg.isdigit() and 1 <= int(arg) <= len(ts):
-                t = ts[int(arg) - 1]
-            else:
-                for x in ts:
-                    if arg and arg in x["name"]:
-                        t = x
-                        break
-            if not t:
-                send("ما لقيت المهمة. اكتب /tasks.")
-            else:
-                self.start_bg(t, manual=True)
-                send("بدأت: " + t["name"] + ". أبلغك لما تخلص.")
-            return
-        if cmd == "/new":
-            self._tg_target = "telegram"
-            self.tg_chat()["msgs"] = []
-            self.persist()
-            send("بدأنا محادثة جديدة.")
-            return
-        if tg.get("chat", True) is False:
-            send("المحادثة من تليقرام مطفية بإعدادات الربط.")
-            return
-        key = self.key_edit.text().strip()
-        if not key:
-            send("مفتاح DeepSeek غير مكتوب بالتطبيق.")
-            return
+    def _tg_menu(self, page=0, q=""):
+        """The chat list as it is right now (built again on every press), newest first, one button per chat."""
+        lst = self._tg_chats()
+        if q:
+            lst = [c for c in lst if self._chat_matches(c, q.lower())]
+        per = 8
+        pages = max(1, (len(lst) + per - 1) // per)
+        page = max(0, min(int(page), pages - 1))
         tgt = self._tg_target_chat()
-        if tgt.get("id") != "telegram":
-            self.tg_continue(tgt, text, send)
+        rows = []
+        for c in lst[page * per:(page + 1) * per]:
+            mark = "⏳ " if c["id"] in self.runs else ("✅ " if c is tgt else ("🔵 " if c.get("unread") else ""))
+            rows.append([(mark + tg_one(c.get("title") or "بدون عنوان", 34) + " · " + tg_ago(c.get("updated")), "o:" + c["id"])])
+        nav = []
+        if not q and page > 0:
+            nav.append(("▶ الأحدث", "p:%d" % (page - 1)))
+        if not q and page < pages - 1:
+            nav.append(("الأقدم ◀", "p:%d" % (page + 1)))
+        rows.append(nav)
+        rows.append([("➕ محادثة جديدة", "n"), ("🔄 تحديث", "p:%d" % page)] if not q else [("📂 كل المحادثات", "p:0")])
+        if q:
+            head = "🔎 <b>%s</b>: %s" % (tg_esc(tg_one(q, 40)), ("%d نتيجة" % len(lst)) if lst else "ما لقيت شي")
+        elif not lst:
+            head = "ما عندك محادثات بعد. اكتب أي شي وتبدأ وحدة."
+        else:
+            head = "📂 <b>محادثاتك</b> (%d)%s\nالمختارة: %s\n<i>✅ المختارة · ⏳ تشتغل · 🔵 فيها رد ما قريته</i>" % (
+                len(lst), (" · صفحة %d من %d" % (page + 1, pages)) if pages > 1 else "",
+                ("<b>%s</b>" % tg_esc(tg_one(tgt.get("title"), 40))) if tgt else "ولا وحدة (رسالتك الجاية تبدأ محادثة جديدة)")
+        return head, rows
+
+    def _tg_show(self, chat, upto=None, n=2):
+        """Send messages [upto-n, upto) of a chat as they are in the app, formatted; a button reaches the older ones."""
+        ms = [m for m in chat.get("msgs", []) if isinstance(m, dict)]
+        upto = len(ms) if upto is None else max(0, min(int(upto), len(ms)))
+        lo = max(0, upto - n)
+        if upto <= lo:
+            self.tg_bridge.say_html("(ما فيه رسائل أقدم)")
             return
-        if self._tg_busy:
-            send("لسه أرد على رسالتك السابقة، انتظر شوي.")
-            return
-        self._tg_busy = True
-        ch = self.tg_chat()
-        ch["msgs"].append({"role": "user", "content": text, "shown": text, "names": []})
-        hist = [{"role": m["role"], "content": m.get("content", "")} for m in ch["msgs"][-20:] if isinstance(m.get("content"), str)]
-        model = self.model_box.currentText()
-        system = (SYSTEM_PROMPT + "\n" + memory_prompt() +
-                  "\nYou are answering through a Telegram bot: keep replies short and plain text. You have no access to files or tools here.")
-
-        def work():
-            try:
-                msg, usage = api_chat(key, model, [{"role": "system", "content": system}] + hist, think="off", timeout=300)
-                out = (msg.get("content") or "").strip() or "(بدون رد)"
-            except Exception as e:
-                out = "تعذّر الرد: %s" % str(e)[:200]
-            self.tg_bridge.reply.emit(out)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _tg_target_chat(self):
-        tid = getattr(self, "_tg_target", "telegram")
-        for c in self.chats:
-            if c.get("id") == tid:
-                return c
-        return self.tg_chat()
-
-    @staticmethod
-    def _tg_tail(chat, n):
-        out = []
-        for m in [m for m in chat.get("msgs", []) if isinstance(m, dict)][-n * 2:][-max(n, 1) * 2:]:
+        for i in range(lo, upto):
+            m = ms[i]
+            btn = None
+            if i == upto - 1:
+                btn = [([("📖 رسائل أقدم", "r:%s:%d" % (chat["id"], lo))] if lo > 0 else []) + [("📂 المحادثات", "m")]]
             if m.get("role") == "user":
                 t = m.get("shown") or (m.get("content") if isinstance(m.get("content"), str) else "")
-                out.append("أنت: " + _cut(str(t), 600))
+                names = [str(x) for x in (m.get("names") or [])][:6]
+                t = _cut(str(t), 1500) + (("\n📎 " + "، ".join(names)) if names else "")
+                self.tg_bridge.say(t or "(مرفقات)", head="🧑 <b>أنت:</b>\n", buttons=btn)
             else:
-                out.append("خبيلان: " + _cut(clean_reply(str(m.get("content", ""))), 1200))
-        return "\n\n".join(out) or "(المحادثة فاضية)"
+                self.tg_bridge.say(_cut(clean_reply(str(m.get("content", ""))).strip() or "(بدون نص)", 3200), head="🤖 <b>خبيلان:</b>\n", buttons=btn)
 
-    def tg_continue(self, chat, text, send):
-        """A Telegram message continues a real chat of the app, with that chat's own settings; the reply goes back to Telegram."""
+    def _tg_open(self, chat):
+        self._tg_set_target(chat["id"])
+        if chat.get("unread") and chat is not self.current:
+            chat["unread"] = False
+            self.persist()
+            self.refresh_list()
+        info = "✅ <b>%s</b>\n%d رسالة · آخر تحديث %s" % (tg_esc(tg_one(chat.get("title") or "بدون عنوان", 60)), len(chat.get("msgs") or []), tg_ago(chat.get("updated")))
+        R = self.runs.get(chat["id"])
+        info += "\nأي شي تكتبه الحين يكمل هذي المحادثة."
+        self.tg_bridge.say_html(info)
+        self._tg_show(chat, n=2)
+        if R is not None and R.tg_wait is None:  # it is answering right now (started on the computer): follow it from here
+            self._tg_watch(R)
+
+    # ----- a reply being produced: live status, then the result -----
+    def _tg_status(self, R):
+        L = R.live or {}
+        steps = [s for s in (L.get("steps") or []) if isinstance(s, dict)]
+        tools = [s for s in steps if s.get("k") == "tool"]
+        el = int(time.time() - float(L.get("t0") or time.time()))
+        out = "⏳ <b>%s</b> · %d:%02d" % (tg_esc(tg_one(R.chat.get("title") or "محادثة", 40)), el // 60, el % 60)
+        body = clean_reply(str(L.get("body") or "")).strip()
+        if tools:
+            out += "\n🔧 %s (%d خطوة)" % (tg_esc(tg_one(tools[-1].get("text") or tools[-1].get("name") or "", 140)), len(tools))
+        elif not body:
+            out += "\n💭 يفكر…"
+        if body:
+            out += "\n\n✍️ " + tg_esc(("…" if len(body) > 500 else "") + body[-500:])
+        return out
+
+    def _tg_watch(self, R):
+        """This run reports to Telegram: a status message that is edited while it works, then the reply."""
+        w = {"chat": R.chat, "n": len(R.chat["msgs"]), "t0": time.time(), "mid": 0, "last": "", "gone": False}
+        R.tg_wait = w
+        w["last"] = self._tg_status(R)
+
+        def got(res, w=w):
+            w["mid"] = int(((res or {}).get("result") or {}).get("message_id") or 0)
+            if w["gone"] and w["mid"]:
+                self.tg_bridge.delete(w["mid"])
+
+        self.tg_bridge.say_html(w["last"], buttons=[[("⏹ إيقاف", "s:" + R.chat["id"])]], done=got)
+
+    def tg_tick(self):
+        if not self.tg_ready() or self.tg_bridge.out.qsize() >= 3:
+            return
+        active = False
+        for R in list(self.runs.values()):
+            w = R.tg_wait
+            if not w:
+                continue
+            active = True
+            if w.get("mid"):
+                txt = self._tg_status(R)
+                if txt != w["last"]:
+                    w["last"] = txt
+                    self.tg_bridge.edit(w["mid"], txt, buttons=[[("⏹ إيقاف", "s:" + R.chat["id"])]])
+        if active:
+            self.tg_bridge.typing()
+
+    def _tg_send_made(self, chat, m, t0):
+        """Pictures and files the reply produced go to Telegram as real files."""
+        left = 8
+        for p in (m.get("images") or []):
+            if left and os.path.isfile(str(p)) and self.tg_bridge.send_file(str(p)):
+                left -= 1
+        content = str(m.get("content", ""))
+        try:
+            for kind, name, body in extract_files(content):
+                if kind != "file" or not left:
+                    continue
+                os.makedirs(TG_OUT_DIR, exist_ok=True)
+                p = os.path.join(TG_OUT_DIR, name)
+                with open(p, "w", encoding="utf-8", newline="") as f:
+                    f.write(body)
+                if self.tg_bridge.send_file(p):
+                    left -= 1
+            wd = os.path.join(self.chat_dir(chat), "work")
+            low = content.lower()
+            for root, dirs, files in os.walk(wd):
+                dirs[:] = [d for d in dirs if d not in ("attachments", "__pycache__")]
+                for fn in sorted(files):
+                    fp = os.path.join(root, fn)
+                    if (not left or fn.startswith("_run_") or fn.endswith((".pyc", ".tmp")) or fn.lower() not in low
+                            or os.path.getmtime(fp) < t0 - 2 or str(fp) in [str(x) for x in (m.get("images") or [])]):
+                        continue
+                    if self.tg_bridge.send_file(fp):
+                        left -= 1
+        except Exception as e:
+            log_event("telegram files: %s" % e)
+
+    def tg_after_run(self, R, failed):
+        """Called when any reply ends: deliver it to Telegram if it was asked from there (or is being followed), then send what waited."""
+        tg = self.tg_ready()
+        chat = R.chat
+        ms = chat.get("msgs", [])
+        title = tg_esc(tg_one(chat.get("title") or "محادثة", 50))
+        got_reply = bool(ms) and ms[-1].get("role") == "assistant" and not failed
+        w = R.tg_wait
+        if tg and w:
+            w["gone"] = True
+            if w.get("mid"):
+                self.tg_bridge.delete(w["mid"])
+            if got_reply and len(ms) > w["n"]:
+                m = ms[-1]
+                self.tg_bridge.say(clean_reply(str(m.get("content", ""))).strip() or "(بدون نص)", head="💬 <b>%s</b>\n" % title)
+                self._tg_send_made(chat, m, w["t0"])
+            else:
+                why = str(getattr(R, "err_text", "") or "")
+                self.tg_bridge.say_html("⚠️ ما قدر يرد على رسالتك في «%s».%s" % (title, ("\n<i>%s</i>" % tg_esc(_cut(why, 300))) if why else ""))
+        elif tg and got_reply and not chat.get("room"):
+            if chat.get("id") == tg.get("target") and tg.get("follow", True) is not False:
+                q_ = next((x for x in reversed(ms[:-1]) if x.get("role") == "user"), {})
+                asked = tg_one(q_.get("shown") or (q_.get("content") if isinstance(q_.get("content"), str) else ""), 300)
+                self.tg_bridge.say(clean_reply(str(ms[-1].get("content", ""))).strip() or "(بدون نص)",
+                                   head="🖥 <b>%s</b> · من التطبيق\n🧑 %s\n\n" % (title, tg_esc(asked)))
+            elif tg.get("all_replies") and not (self.isActiveWindow() and not self.isMinimized()):
+                self.tg_bridge.say_html("🔔 خلص رد في «%s»\n%s" % (title, tg_esc(tg_one(clean_reply(str(ms[-1].get("content", ""))), 300))),
+                                        buttons=[[("افتحها هنا", "o:" + chat["id"])]])
+        waiting = [x for x in self._tg_q if x[0] == chat["id"]]
+        if waiting:
+            self._tg_q = [x for x in self._tg_q if x[0] != chat["id"]]
+            text = "\n\n".join(x[1] for x in waiting if x[1])
+            files = [p for x in waiting for p in x[2]]
+            if chat in self.chats:
+                QTimer.singleShot(500, lambda: self.tg_dispatch(chat, text, files))
+
+    def tg_dispatch(self, chat, text, files=None):
+        """A Telegram message continues a real chat of the app, with that chat's own settings, through the normal send path.
+        The window goes back to the chat it was showing: the reply is produced in the background and reported to Telegram."""
         if not self.key_edit.text().strip():
-            send("مفتاح DeepSeek غير مكتوب بالتطبيق.")
-            return
+            self.tg_bridge.say_html("مفتاح DeepSeek غير مكتوب بالتطبيق.")
+            return False
         if chat["id"] in self.runs:
-            send("هذي المحادثة تشتغل على رد الحين، انتظر يخلص وارسل من جديد.")
-            return
-        prev_txt, prev_att, prev_q = self.inp.toPlainText(), self.attachments, self.quotes
-        self.attachments, self.quotes = [], []
+            self._tg_q.append((chat["id"], text, list(files or [])))
+            self.tg_bridge.say_html("⏳ هذي المحادثة تشتغل على رد الحين. رسالتك بالطابور وتنرسل أول ما يخلص.",
+                                    buttons=[[("⏹ أوقف الرد الحالي", "s:" + chat["id"])]])
+            return True
+        prev = self.current
+        prev_att, prev_q = self.attachments, self.quotes
+        self._stash_draft()  # whatever is being typed on the computer stays with its chat
+        kept = dict(self.drafts)
+        self.attachments, self.quotes = [p for p in (files or []) if os.path.isfile(p)], []
         self.current = chat
         self.apply_settings(self.chat_settings(chat))
-        self.title_label.setText(chat.get("title", ""))
-        self.refresh_list()
-        self.render_chat()
-        n_before = len(chat["msgs"])
+        self._tg_sending, self._tg_err = True, ""
         self.inp.setPlainText(text)
         try:
             self.send()
+        except Exception as e:
+            self._tg_err = str(e)[:200]
+            log_event("telegram dispatch: %s" % e)
         finally:
+            self._tg_sending = False
             self.attachments, self.quotes = prev_att, prev_q
-            self.refresh_quotes()
-            self.refresh_files_label()
-            if prev_txt and not self.inp.toPlainText().strip():
-                self.inp.setPlainText(prev_txt)
+            for k_, v_ in kept.items():
+                self.drafts.setdefault(k_, v_)
         R_ = self.runs.get(chat["id"])
-        if R_ is None:
-            send("ما قدرت أرسل للمحادثة (تأكد من المفتاح والإعدادات).")
-        else:
-            R_.tg_wait = {"chat": chat, "n": n_before}
-            send("وصلت للمحادثة «%s»، أنتظر الرد…" % _cut(chat.get("title") or "", 40))
-
-    def on_tg_reply(self, out):
-        self._tg_busy = False
-        ch = self.tg_chat()
-        out2, _ = apply_memory_marks(out)
-        out2, _offer = extract_skill_offer(out2)
-        ch["msgs"].append({"role": "assistant", "content": out2, "reasoning": ""})
-        ch["updated"] = time.time()
-        self.persist()
+        if prev is not chat:  # back to what the window was showing
+            self.current = prev if (prev is None or prev in self.chats) else None
+            if self.current is not None:
+                self.apply_settings(self.chat_settings(self.current))
+                self.title_label.setText(self.current.get("title", ""))
+            else:
+                self.apply_project_defaults()
         self.refresh_list()
+        self.render_chat()
+        self.refresh_quotes()
+        self.refresh_files_label()
+        self._restore_draft()
+        self.sync_run_ui()
+        self.update_todo_bar()
+        if R_ is None:
+            self.tg_bridge.say_html("⚠️ ما قدرت أرسل للمحادثة%s" % ((": " + tg_esc(self._tg_err)) if self._tg_err else " (تأكد من المفتاح والإعدادات)."))
+            return False
+        self._tg_watch(R_)
+        return True
+
+    # ----- what arrives from Telegram -----
+    def on_tg_update(self, u):
         tg = self.tg_ready()
-        if tg:
-            threading.Thread(target=tg_send, args=(tg["token"], tg["chat_id"], out2), daemon=True).start()
+        if not tg:
+            return
+        cq = u.get("callback_query")
+        if cq:
+            try:
+                note = self._tg_callback(cq)
+            except Exception as e:
+                log_event("telegram button: %s" % e)
+                note = "صار خطأ"
+            self.tg_bridge.answer(cq.get("id"), note or "")
+            return
+        m = u.get("message") or {}
+        text = (m.get("text") or m.get("caption") or "").strip()
+        media = []
+        if m.get("photo"):
+            ph = m["photo"][-1]
+            media.append((ph.get("file_id"), "photo_%s.jpg" % time.strftime("%H%M%S"), "file", ph.get("file_size") or 0))
+        if m.get("document"):
+            d_ = m["document"]
+            media.append((d_.get("file_id"), d_.get("file_name") or "file", "file", d_.get("file_size") or 0))
+        if m.get("voice"):
+            media.append((m["voice"].get("file_id"), "voice_%s.ogg" % time.strftime("%H%M%S"), "voice", m["voice"].get("file_size") or 0))
+        if m.get("audio"):
+            a_ = m["audio"]
+            nm = a_.get("file_name") or "audio.mp3"
+            media.append((a_.get("file_id"), nm, "voice" if nm.lower().endswith((".ogg", ".oga", ".wav")) else "file", a_.get("file_size") or 0))
+        if not media and not text:
+            self.tg_bridge.say_html("هذا النوع ما أدعمه من تليقرام. أرسل نص، صورة، ملف، أو رسالة صوتية.")
+            return
+        if text.startswith("/") and not media:
+            cmd = text.split()[0].split("@")[0].lower()
+            try:
+                self._tg_cmd(cmd, text[len(text.split()[0]):].strip())
+            except Exception as e:
+                log_event("telegram command: %s" % e)
+                self.tg_bridge.say_html("صار خطأ بتنفيذ الأمر.")
+            return
+        if tg.get("chat", True) is False:
+            self.tg_bridge.say_html("المحادثة من تليقرام مطفية بإعدادات الربط.")
+            return
+        if not media:
+            self._tg_text(text, [])
+            return
+        self._tg_inbox.append((text, media))  # an album arrives as several messages: wait a moment and take them together
+        self.tg_in_timer.start(1300)
+        self.tg_bridge.typing()
+
+    def _tg_flush_inbox(self):
+        items, self._tg_inbox = self._tg_inbox, []
+        tg = self.tg_ready()
+        if not items or not tg:
+            return
+        text = "\n".join(t for t, _m in items if t)
+        media = [x for _t, ms_ in items for x in ms_]
+        token = tg["token"]
+
+        def work():
+            paths, notes, heard = [], [], []
+            for fid, name, kind, size in media:
+                if size and size > 20 * 1024 * 1024:
+                    notes.append("«%s» أكبر من 20 ميقا، وتليقرام ما يخلّي البوت ينزّله." % name)
+                    continue
+                try:
+                    p = tg_download(token, fid, name)
+                    if kind == "voice":
+                        t_ = ds_asr(p)
+                        if t_:
+                            heard.append(t_)
+                        else:
+                            notes.append("ما سمعت شي واضح بالرسالة الصوتية.")
+                    else:
+                        paths.append(p)
+                except Exception as e:
+                    notes.append("ما قدرت %s «%s»: %s" % ("أسمع" if kind == "voice" else "أنزّل", name, str(e)[:120]))
+            self.tg_bridge.ready.emit((text, paths, notes, heard))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_tg_ready(self, val):
+        text, paths, notes, heard = val
+        for n_ in notes:
+            self.tg_bridge.say_html("⚠️ " + tg_esc(n_))
+        if heard:
+            said = " ".join(heard)
+            self.tg_bridge.say_html("🎤 <i>%s</i>" % tg_esc(_cut(said, 1500)))
+            text = (text + "\n" + said).strip()
+        if text or paths:
+            self._tg_text(text, paths)
+
+    def _tg_text(self, text, files):
+        chat = self._tg_target_chat()
+        made = chat is None
+        if made:
+            chat = self.tg_new_chat(text or (os.path.basename(files[0]) if files else ""))
+            self._tg_set_target(chat["id"])
+        ok = self.tg_dispatch(chat, text, files)
+        if made and not ok and not chat["msgs"]:
+            self.chats = [c for c in self.chats if c is not chat]
+            self._tg_set_target("")
+            self.refresh_list()
+
+    TG_HELP = ("<b>خبيلان في تليقرام</b>\n"
+               "اكتب أي شي ويروح للمحادثة المختارة، والرد يجيك هنا مع ملفاته وصوره. تقدر ترسل صور وملفات ورسائل صوتية.\n\n"
+               "/chats محادثاتك اللي بالتطبيق: اضغط وحدة وكمّل عليها\n"
+               "/new محادثة جديدة (أو /new وبعدها رسالتك)\n"
+               "/read آخر رسائل المحادثة المختارة (مثال: /read 6)\n"
+               "/where أي محادثة مختارة الحين\n"
+               "/stop أوقف الرد اللي يشتغل\n"
+               "/search كلمة: دوّر في محادثاتك\n"
+               "/tasks مهامك وتشغيلها\n"
+               "/status حالة التطبيق\n\n"
+               "<i>المحادثات اللي تبدأها من هنا ما لها صلاحيات على ملفات جهازك. المحادثات اللي تختارها من التطبيق تشتغل بإعداداتها هي.</i>")
+
+    def _tg_cmd(self, cmd, arg):
+        say = self.tg_bridge.say_html
+        if cmd in ("/help", "/start"):
+            say(self.TG_HELP, buttons=[[("📂 المحادثات", "m"), ("➕ جديدة", "n")]])
+        elif cmd in ("/chats", "/open", "/list"):
+            head, rows = self._tg_menu(0)
+            say(head, buttons=rows)
+        elif cmd == "/search":
+            if not arg:
+                say("اكتب الكلمة بعد الأمر، مثال: <code>/search فاتورة</code>")
+            else:
+                head, rows = self._tg_menu(0, arg)
+                say(head, buttons=rows)
+        elif cmd == "/new":
+            self._tg_set_target("")
+            if arg:
+                self._tg_text(arg, [])
+            else:
+                say("تمام. اكتب رسالتك وتبدأ بها محادثة جديدة.")
+        elif cmd == "/read":
+            chat = self._tg_target_chat()
+            if chat is None:
+                say("ما فيه محادثة مختارة. اضغط /chats واختر وحدة.")
+            else:
+                self._tg_show(chat, n=max(1, min(int(arg) if arg.isdigit() else 4, 10)))
+        elif cmd == "/where":
+            chat = self._tg_target_chat()
+            if chat is None:
+                say("ما فيه محادثة مختارة: رسالتك الجاية تبدأ محادثة جديدة.", buttons=[[("📂 المحادثات", "m")]])
+            else:
+                say("المختارة: <b>%s</b>\n%d رسالة · آخر تحديث %s%s" % (
+                    tg_esc(tg_one(chat.get("title") or "بدون عنوان", 60)), len(chat.get("msgs") or []), tg_ago(chat.get("updated")),
+                    "\n⏳ تشتغل على رد الحين" if chat["id"] in self.runs else ""), buttons=[[("📖 اقرأها", "r:%s:%d" % (chat["id"], len(chat.get("msgs") or []))), ("📂 المحادثات", "m")]])
+        elif cmd == "/stop":
+            tgt = self._tg_target_chat()
+            rs = [self.runs[tgt["id"]]] if (tgt and tgt["id"] in self.runs) else [r for r in self.runs.values() if r.tg_wait]
+            for r in rs:
+                r.stop_event.set()
+            self._tg_q = []
+            say("⏹ أوقفته." if rs else "ما فيه رد يشتغل الحين.")
+        elif cmd == "/status":
+            names = "، ".join("«%s»" % tg_one(r.chat.get("title") or "", 30) for r in self.runs.values())
+            say("التطبيق شغال (إصدار %s).\n%s\nمهام خلفية تشتغل: %d\n%s" % (
+                APP_VERSION, ("يرد الحين في: " + tg_esc(names)) if self.runs else "ما فيه رد يشتغل.", len(self._bg_running),
+                tg_esc(self.peak_label.text()) if self.peak_label.isVisible() else "ماهو وقت الذروة"))
+        elif cmd == "/tasks":
+            ts = self.cfg.get("tasks") or []
+            if not ts:
+                say("ما عندك مهام.")
+            else:
+                say("<b>مهامك</b>: اضغط مهمة عشان تشغّلها الحين.",
+                    buttons=[[("▶ " + tg_one(t["name"], 40) + ("" if t.get("enabled", True) else " (متوقفة)"), "t:%d" % i)] for i, t in enumerate(ts[:20])])
+        elif cmd == "/run":
+            ts = self.cfg.get("tasks") or []
+            t = ts[int(arg) - 1] if (arg.isdigit() and 1 <= int(arg) <= len(ts)) else next((x for x in ts if arg and arg in x["name"]), None)
+            if not t:
+                say("ما لقيت المهمة. اكتب /tasks.")
+            else:
+                self.start_bg(t, manual=True)
+                say("بدأت: %s. أبلغك لما تخلص." % tg_esc(t["name"]))
+        else:
+            say("أمر ما أعرفه. اكتب /help.")
+
+    def _tg_callback(self, cq):
+        """A button was pressed. Returns the short note shown on top of the Telegram screen."""
+        data = str(cq.get("data") or "")
+        mid = (cq.get("message") or {}).get("message_id")
+        say = self.tg_bridge.say_html
+        if data.startswith("o:"):
+            chat = self._tg_chat_by_id(data[2:])
+            if chat is None:
+                return "هذي المحادثة ما عادت موجودة"
+            self._tg_open(chat)
+            return "اخترتها"
+        if data.startswith("p:"):
+            head, rows = self._tg_menu(int(data[2:] or 0))
+            if mid:
+                self.tg_bridge.edit(mid, head, buttons=rows)
+            return "تحدّثت"
+        if data == "m":
+            head, rows = self._tg_menu(0)
+            say(head, buttons=rows)
+            return ""
+        if data == "h":
+            say(self.TG_HELP)
+            return ""
+        if data == "n":
+            self._tg_set_target("")
+            say("تمام. اكتب رسالتك وتبدأ بها محادثة جديدة.")
+            return ""
+        if data.startswith("r:"):
+            _r, cid, lo = data.split(":", 2)
+            chat = self._tg_chat_by_id(cid)
+            if chat is None:
+                return "هذي المحادثة ما عادت موجودة"
+            self._tg_show(chat, upto=int(lo), n=4)
+            return ""
+        if data.startswith("s:"):
+            R = self.runs.get(data[2:])
+            self._tg_q = [x for x in self._tg_q if x[0] != data[2:]]
+            if R is None:
+                return "ما فيه رد يشتغل"
+            R.stop_event.set()
+            return "أوقفه الحين"
+        if data[:2] in ("y:", "x:"):
+            slot = self._tg_confirms.pop(data[2:], None)
+            if slot is None:
+                return "هذا الطلب انتهى وقته"
+            slot["ok"] = data[0] == "y"
+            slot["event"].set()
+            if mid:
+                self.tg_bridge.edit(mid, slot.get("html", "") + ("\n\n✅ <b>سمحت</b>" if slot["ok"] else "\n\n❌ <b>رفضت</b>"))
+            return "تم" if slot["ok"] else "انرفض"
+        if data.startswith("t:"):
+            ts = self.cfg.get("tasks") or []
+            i = int(data[2:] or -1)
+            if not (0 <= i < len(ts)):
+                return "المهمة ما عادت موجودة"
+            self.start_bg(ts[i], manual=True)
+            say("بدأت: %s. أبلغك لما تخلص." % tg_esc(ts[i]["name"]))
+            return "بدأت"
+        return ""
+
+    def _tg_confirm(self, run, title, detail, slot):
+        """An approval for a reply that was asked from Telegram is asked there (you are not at the computer). Worker thread."""
+        tg = self.tg_ready()
+        if not tg or tg.get("approve", True) is False or run is None or not run.tg_wait:
+            return ""
+        key = uuid.uuid4().hex[:12]
+        slot["html"] = "🔐 <b>موافقة قبل التنفيذ</b> · %s\n%s\n<pre>%s</pre>" % (
+            tg_esc(tg_one(run.chat.get("title") or "", 40)), tg_esc(_cut(title, 300)), tg_esc(_cut(detail or "", 1500)))
+        self._tg_confirms[key] = slot
+        self.tg_bridge.say_html(slot["html"], buttons=[[("✅ اسمح", "y:" + key), ("❌ ارفض", "x:" + key)]])
+        return key
 
     def page_worker(self, t):
         """Background thread: downloads the page and compares it with the last copy."""
@@ -19455,7 +20117,8 @@ class App(QMainWindow):
         model = self.model_box.currentText()
         think = self.think_box.currentText()
         if not key:
-            QMessageBox.warning(self, "5belan", "اكتب مفتاح API أول.")
+            if not self._tg_sending:
+                QMessageBox.warning(self, "5belan", "اكتب مفتاح API أول.")
             return
         quotes = [dict(q) for q in self.quotes if q.get("q")]
         if not text and not self.attachments and not quotes:
@@ -19468,7 +20131,10 @@ class App(QMainWindow):
         try:
             content, names = self.build_user_content(self.compose_text(api_text, quotes), model)
         except RuntimeError as e:
-            QMessageBox.warning(self, "5belan", str(e))
+            if self._tg_sending:
+                self._tg_err = str(e)[:300]
+            else:
+                QMessageBox.warning(self, "5belan", str(e))
             return
 
         self.def_model, self.def_think = model, think
@@ -20254,7 +20920,7 @@ class App(QMainWindow):
                 msg = {"role": "assistant", "content": content, "reasoning": reasoning}
                 if digest:
                     msg["resume_digest"] = digest
-                if offer_ and ch_.get("id") != "telegram":
+                if offer_ and not str(ch_.get("id")).startswith("tg"):
                     msg["skill_offer"] = offer_
                 if R.cut or "⏹ أوقفتّه بطلبك" in content:
                     msg["cut"] = True
@@ -20296,6 +20962,7 @@ class App(QMainWindow):
             elif kind == "err":
                 ch_ = R.chat
                 cur = R is self.cur_run
+                R.err_text = str(val)
                 if cur and L is not None:
                     self.redraw_live()
                 R.live = None
@@ -20528,13 +21195,10 @@ class App(QMainWindow):
                 QApplication.alert(self, 5000)
             except Exception:
                 pass
-        w_ = R.tg_wait
-        if w_:
-            ms_ = w_["chat"].get("msgs", [])
-            if len(ms_) > w_["n"] and ms_[-1].get("role") == "assistant":
-                self.tg_notify_force("خبيلان:\n" + clean_reply(str(ms_[-1].get("content", ""))))
-            else:
-                self.tg_notify_force("صار خطأ ولا قدر يرد على هذي الرسالة.")
+        try:
+            self.tg_after_run(R, failed)
+        except Exception as ex_:
+            log_event("telegram after run: %s" % ex_)
         keep = []
         for t_, c_ in self._bg_pending:
             if t_["id"] in self.runs:
