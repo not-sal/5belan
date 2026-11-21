@@ -87,6 +87,7 @@ MODELS = ["deepseek-flash", "deepseek-v4-pro"]
 VISION_MODELS = {"deepseek-flash"}
 # DeepSeek prices, USD per 1M tokens at PEAK time: (input cache hit, input cache miss, output). Off-peak is half.
 # Peak: 01:00-04:00 and 06:00-10:00 UTC, Monday-Friday (source: api-docs.deepseek.com pricing page).
+SERVER_TOOL_FREE_FROM = 1794974400  # 2026-11-18 12:00 Beijing time
 PRICES = {"deepseek-flash": (0.006, 0.30, 1.20), "deepseek-v4-pro": (0.044, 1.32, 3.96)}
 USD_SAR = 3.75
 
@@ -108,7 +109,8 @@ def usage_cost(model, u, ts=None):
     out = int(u.get("completion_tokens") or 0)
     usd = (hit * h + miss * m + out * o) / 1e6 * (1.0 if is_peak(ts) else 0.5)
     stu = u.get("server_tool_use") or {}
-    if isinstance(stu, dict):  # web searches and page reads are billed per use, on top of tokens
+    # web searches and page reads were billed per use until 2026-11-18 04:00 UTC; after that they are only token cost
+    if isinstance(stu, dict) and (ts if ts else time.time()) < SERVER_TOOL_FREE_FROM:
         usd += sum(int(stu.get(k) or 0) for k in ("tool_search", "tool_fetch", "tool_image_search")) * WEB_SEARCH_USD
     return usd, pt, out, hit
 THINKING_LEVELS = ["off", "low", "high", "max"]
@@ -6683,7 +6685,7 @@ def rtl_direction_option():
     return opt
 
 
-APP_VERSION = "2.44.1"
+APP_VERSION = "2.44.2"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/not-sal/5belan/main/update.json"  # set once, e.g. https://raw.githubusercontent.com/OWNER/REPO/main/update.json
 UPDATE_ALLOWED_EXT = {".py", ".png", ".ico", ".txt", ".json", ".md"}
 UPDATE_SOURCE_FILE = os.path.join(BASE_DIR, "update_source.txt")
